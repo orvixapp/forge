@@ -10,7 +10,8 @@ mod unix {
     use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
     use proto_ghostty_vt::{DirtyState, GhosttyLibrary, GhosttyTerminal};
     use proto_ipc::{
-        ClientMessage, FrameKind, PROTOCOL_VERSION, ServerMessage, read_message, write_message,
+        ClientMessage, FrameKind, PROTOCOL_VERSION, Rgb, ScreenCell, ScreenRow, ServerMessage,
+        read_message, write_message,
     };
     use std::{
         collections::{HashMap, VecDeque},
@@ -32,11 +33,12 @@ mod unix {
     #[derive(Debug, Clone)]
     enum SessionEvent {
         Output(Vec<u8>),
-        ScreenUpdated {
+        ScreenPatch {
             revision: u64,
             cols: u16,
             rows: u16,
-            text: String,
+            full: bool,
+            dirty_rows: Vec<ScreenRow>,
         },
         Exited(Option<u32>),
     }
@@ -117,11 +119,36 @@ mod unix {
                 .revision
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
-            let _ = self.events.send(SessionEvent::ScreenUpdated {
+            let _ = self.events.send(SessionEvent::ScreenPatch {
                 revision,
                 cols: frame.cols,
                 rows: frame.rows,
-                text: frame.text.unwrap_or_default(),
+                full: frame.dirty == DirtyState::Full,
+                dirty_rows: frame
+                    .dirty_rows
+                    .into_iter()
+                    .map(|row| ScreenRow {
+                        y: row.y,
+                        cells: row
+                            .cells
+                            .into_iter()
+                            .map(|cell| ScreenCell {
+                                text: cell.text,
+                                foreground: cell.foreground.map(|color| Rgb {
+                                    r: color.r,
+                                    g: color.g,
+                                    b: color.b,
+                                }),
+                                background: cell.background.map(|color| Rgb {
+                                    r: color.r,
+                                    g: color.g,
+                                    b: color.b,
+                                }),
+                                styled: cell.styled,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
             });
             Ok(())
         }
@@ -520,17 +547,19 @@ mod unix {
             loop {
                 let message = match events.recv().await {
                     Ok(SessionEvent::Output(data)) => ServerMessage::Output { session_id, data },
-                    Ok(SessionEvent::ScreenUpdated {
+                    Ok(SessionEvent::ScreenPatch {
                         revision,
                         cols,
                         rows,
-                        text,
-                    }) => ServerMessage::ScreenUpdated {
+                        full,
+                        dirty_rows,
+                    }) => ServerMessage::ScreenPatch {
                         session_id,
                         revision,
                         cols,
                         rows,
-                        text,
+                        full,
+                        dirty_rows,
                     },
                     Ok(SessionEvent::Exited(exit_code)) => {
                         let _ = forwarding

@@ -10,11 +10,14 @@ use thiserror::Error;
 
 const GHOSTTY_SUCCESS: i32 = 0;
 const GHOSTTY_OUT_OF_SPACE: i32 = -3;
+const GHOSTTY_INVALID_VALUE: i32 = -2;
 const GHOSTTY_FORMATTER_FORMAT_PLAIN: i32 = 0;
 
 type RawTerminal = *mut c_void;
 type RawFormatter = *mut c_void;
 type RawRenderState = *mut c_void;
+type RawRowIterator = *mut c_void;
+type RawRowCells = *mut c_void;
 
 type TerminalNew = unsafe extern "C" fn(*const c_void, *mut RawTerminal, u16, u16) -> i32;
 type TerminalFree = unsafe extern "C" fn(RawTerminal);
@@ -33,6 +36,29 @@ type RenderStateFree = unsafe extern "C" fn(RawRenderState);
 type RenderStateUpdate = unsafe extern "C" fn(RawRenderState, RawTerminal) -> i32;
 type RenderStateGet = unsafe extern "C" fn(RawRenderState, i32, *mut c_void) -> i32;
 type RenderStateClean = unsafe extern "C" fn(RawRenderState) -> i32;
+type RowIteratorNew = unsafe extern "C" fn(*const c_void, *mut RawRowIterator) -> i32;
+type RowIteratorFree = unsafe extern "C" fn(RawRowIterator);
+type RowIteratorNextDirty = unsafe extern "C" fn(RawRowIterator, *mut u16) -> bool;
+type RowGet = unsafe extern "C" fn(RawRowIterator, i32, *mut c_void) -> i32;
+type RowCellsNew = unsafe extern "C" fn(*const c_void, *mut RawRowCells) -> i32;
+type RowCellsFree = unsafe extern "C" fn(RawRowCells);
+type RowCellsNext = unsafe extern "C" fn(RawRowCells) -> bool;
+type RowCellsGet = unsafe extern "C" fn(RawRowCells, i32, *mut c_void) -> i32;
+
+#[repr(C)]
+struct GhosttyBuffer {
+    ptr: *mut u8,
+    cap: usize,
+    len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GhosttyColorRgb {
+    r: u8,
+    g: u8,
+    b: u8,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -97,6 +123,14 @@ struct Api {
     render_state_update: RenderStateUpdate,
     render_state_get: RenderStateGet,
     render_state_clean: RenderStateClean,
+    row_iterator_new: RowIteratorNew,
+    row_iterator_free: RowIteratorFree,
+    row_iterator_next_dirty: RowIteratorNextDirty,
+    row_get: RowGet,
+    row_cells_new: RowCellsNew,
+    row_cells_free: RowCellsFree,
+    row_cells_next: RowCellsNext,
+    row_cells_get: RowCellsGet,
 }
 
 impl Api {
@@ -123,6 +157,20 @@ impl Api {
             render_state_update: symbol!(b"ghostty_render_state_update\0", RenderStateUpdate),
             render_state_get: symbol!(b"ghostty_render_state_get\0", RenderStateGet),
             render_state_clean: symbol!(b"ghostty_render_state_clean\0", RenderStateClean),
+            row_iterator_new: symbol!(b"ghostty_render_state_row_iterator_new\0", RowIteratorNew),
+            row_iterator_free: symbol!(
+                b"ghostty_render_state_row_iterator_free\0",
+                RowIteratorFree
+            ),
+            row_iterator_next_dirty: symbol!(
+                b"ghostty_render_state_row_iterator_next_dirty\0",
+                RowIteratorNextDirty
+            ),
+            row_get: symbol!(b"ghostty_render_state_row_get\0", RowGet),
+            row_cells_new: symbol!(b"ghostty_render_state_row_cells_new\0", RowCellsNew),
+            row_cells_free: symbol!(b"ghostty_render_state_row_cells_free\0", RowCellsFree),
+            row_cells_next: symbol!(b"ghostty_render_state_row_cells_next\0", RowCellsNext),
+            row_cells_get: symbol!(b"ghostty_render_state_row_cells_get\0", RowCellsGet),
             _library: library,
         })
     }
@@ -224,10 +272,10 @@ impl GhosttyTerminal {
         let rows = self.render_value::<u16>(2, "render_state_get(rows)")?;
         let dirty_raw = self.render_value::<i32>(3, "render_state_get(dirty)")?;
         let dirty = DirtyState::try_from(dirty_raw)?;
-        let text = if dirty == DirtyState::Clean {
-            None
+        let dirty_rows = if dirty == DirtyState::Clean {
+            Vec::new()
         } else {
-            Some(self.snapshot_text()?)
+            self.read_dirty_rows()?
         };
         // SAFETY: the state is valid and the complete prototype frame was read.
         let result = unsafe { (self.api.render_state_clean)(self.render_state) };
@@ -236,8 +284,108 @@ impl GhosttyTerminal {
             cols,
             rows,
             dirty,
-            text,
+            dirty_rows,
         })
+    }
+
+    fn read_dirty_rows(&self) -> Result<Vec<RenderRow>, GhosttyError> {
+        let mut iterator = ptr::null_mut();
+        let result = unsafe { (self.api.row_iterator_new)(ptr::null(), &raw mut iterator) };
+        check("render_state_row_iterator_new", result)?;
+        if iterator.is_null() {
+            return Err(GhosttyError::NullHandle("render_state_row_iterator_new"));
+        }
+        let mut iterator = RowIteratorGuard {
+            api: Arc::clone(&self.api),
+            raw: iterator,
+        };
+        let result = unsafe {
+            (self.api.render_state_get)(self.render_state, 4, (&raw mut iterator.raw).cast())
+        };
+        check("render_state_get(row iterator)", result)?;
+
+        let mut cells = ptr::null_mut();
+        let result = unsafe { (self.api.row_cells_new)(ptr::null(), &raw mut cells) };
+        check("render_state_row_cells_new", result)?;
+        if cells.is_null() {
+            return Err(GhosttyError::NullHandle("render_state_row_cells_new"));
+        }
+        let mut cells = RowCellsGuard {
+            api: Arc::clone(&self.api),
+            raw: cells,
+        };
+        let mut rows = Vec::new();
+        loop {
+            let mut y = 0;
+            if !unsafe { (self.api.row_iterator_next_dirty)(iterator.raw, &raw mut y) } {
+                break;
+            }
+            let result =
+                unsafe { (self.api.row_get)(iterator.raw, 3, (&raw mut cells.raw).cast()) };
+            check("render_state_row_get(cells)", result)?;
+            let mut row_cells = Vec::new();
+            while unsafe { (self.api.row_cells_next)(cells.raw) } {
+                row_cells.push(RenderCell {
+                    text: self.cell_text(cells.raw)?,
+                    foreground: self.cell_color(cells.raw, 6)?,
+                    background: self.cell_color(cells.raw, 5)?,
+                    styled: self.cell_value::<bool>(cells.raw, 8, "cell has styling")?,
+                });
+            }
+            rows.push(RenderRow {
+                y,
+                cells: row_cells,
+            });
+        }
+        Ok(rows)
+    }
+
+    fn cell_text(&self, cells: RawRowCells) -> Result<String, GhosttyError> {
+        let mut buffer = GhosttyBuffer {
+            ptr: ptr::null_mut(),
+            cap: 0,
+            len: 0,
+        };
+        let query = unsafe { (self.api.row_cells_get)(cells, 9, (&raw mut buffer).cast()) };
+        if buffer.len == 0 && query == GHOSTTY_SUCCESS {
+            return Ok(String::new());
+        }
+        if query != GHOSTTY_OUT_OF_SPACE {
+            check("render_state_row_cells_get(text size)", query)?;
+        }
+        let mut bytes = vec![0; buffer.len];
+        buffer.ptr = bytes.as_mut_ptr();
+        buffer.cap = bytes.len();
+        let result = unsafe { (self.api.row_cells_get)(cells, 9, (&raw mut buffer).cast()) };
+        check("render_state_row_cells_get(text)", result)?;
+        bytes.truncate(buffer.len);
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn cell_color(&self, cells: RawRowCells, data: i32) -> Result<Option<Rgb>, GhosttyError> {
+        let mut color = GhosttyColorRgb::default();
+        let result = unsafe { (self.api.row_cells_get)(cells, data, (&raw mut color).cast()) };
+        if result == GHOSTTY_INVALID_VALUE {
+            return Ok(None);
+        }
+        check("render_state_row_cells_get(color)", result)?;
+        Ok(Some(Rgb {
+            r: color.r,
+            g: color.g,
+            b: color.b,
+        }))
+    }
+
+    fn cell_value<T: Default>(
+        &self,
+        cells: RawRowCells,
+        data: i32,
+        operation: &'static str,
+    ) -> Result<T, GhosttyError> {
+        let mut value = T::default();
+        let result = unsafe { (self.api.row_cells_get)(cells, data, (&raw mut value).cast()) };
+        check(operation, result)?;
+        Ok(value)
     }
 
     fn render_value<T: Default>(
@@ -344,8 +492,48 @@ pub struct RenderSnapshot {
     pub cols: u16,
     pub rows: u16,
     pub dirty: DirtyState,
-    /// Temporary text transport until the renderer consumes row/cell data.
-    pub text: Option<String>,
+    pub dirty_rows: Vec<RenderRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderRow {
+    pub y: u16,
+    pub cells: Vec<RenderCell>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderCell {
+    pub text: String,
+    pub foreground: Option<Rgb>,
+    pub background: Option<Rgb>,
+    pub styled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+struct RowIteratorGuard {
+    api: Arc<Api>,
+    raw: RawRowIterator,
+}
+impl Drop for RowIteratorGuard {
+    fn drop(&mut self) {
+        unsafe { (self.api.row_iterator_free)(self.raw) };
+    }
+}
+
+struct RowCellsGuard {
+    api: Arc<Api>,
+    raw: RawRowCells,
+}
+impl Drop for RowCellsGuard {
+    fn drop(&mut self) {
+        unsafe { (self.api.row_cells_free)(self.raw) };
+    }
 }
 
 struct FormatterGuard {

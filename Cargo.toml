@@ -7,6 +7,7 @@ members = [
     "crates/proto-ipc",
     "crates/proto-term-client",
     "crates/proto-termd",
+    "crates/forge-gui",
 ]
 resolver = "3"
 
@@ -17,6 +18,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
+gpui = "0.2.2"
 libloading = "0.8"
 memmap2 = "0.9"
 portable-pty = "0.9"

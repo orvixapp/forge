@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const HEADER_BYTES: usize = 8;
 
@@ -208,12 +208,13 @@ pub enum ServerMessage {
         session_id: u64,
         data: Vec<u8>,
     },
-    ScreenUpdated {
+    ScreenPatch {
         session_id: u64,
         revision: u64,
         cols: u16,
         rows: u16,
-        text: String,
+        full: bool,
+        dirty_rows: Vec<ScreenRow>,
     },
     Exited {
         session_id: u64,
@@ -222,6 +223,28 @@ pub enum ServerMessage {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScreenRow {
+    pub y: u16,
+    pub cells: Vec<ScreenCell>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScreenCell {
+    /// Complete UTF-8 grapheme for this terminal cell; empty means blank.
+    pub text: String,
+    pub foreground: Option<Rgb>,
+    pub background: Option<Rgb>,
+    pub styled: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Rgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
 }
 
 #[cfg(test)]

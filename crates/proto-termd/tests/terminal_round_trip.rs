@@ -4,7 +4,11 @@ use proto_ipc::{
     ClientMessage, FrameKind, PROTOCOL_VERSION, ServerMessage, read_message, write_message,
 };
 use std::{path::PathBuf, process::Stdio, time::Duration};
-use tokio::{net::UnixStream, process::Command, time::timeout};
+use tokio::{
+    net::{UnixStream, unix::OwnedReadHalf},
+    process::Command,
+    time::timeout,
+};
 
 #[tokio::test]
 async fn command_output_crosses_the_daemon_boundary() {
@@ -80,47 +84,58 @@ async fn command_output_crosses_the_daemon_boundary() {
     .await
     .unwrap();
 
-    let (output, screen, screen_meta) = timeout(Duration::from_secs(5), async {
-        let mut output = Vec::new();
-        let mut screen = String::new();
-        let mut screen_meta = None;
-        loop {
-            match read_message::<_, ServerMessage>(&mut reader)
-                .await
-                .unwrap()
-                .1
-            {
-                ServerMessage::Attached { backlog, .. } => output.extend(backlog),
-                ServerMessage::Output { data, .. } => output.extend(data),
-                ServerMessage::ScreenUpdated {
-                    revision,
-                    cols,
-                    rows,
-                    text,
-                    ..
-                } => {
-                    screen = text;
-                    screen_meta = Some((revision, cols, rows));
-                }
-                ServerMessage::Exited { exit_code, .. } => {
-                    assert_eq!(exit_code, Some(0));
-                    return (output, screen, screen_meta);
-                }
-                ServerMessage::Error { message } => panic!("daemon error: {message}"),
-                _ => {}
-            }
-        }
-    })
-    .await
-    .expect("terminal command timed out");
+    let (output, screen, screen_meta, colored) =
+        timeout(Duration::from_secs(5), collect_output(&mut reader))
+            .await
+            .expect("terminal command timed out");
 
     assert_eq!(output, b"\x1b[31mforge-terminal-ok\x1b[0m");
     assert_eq!(screen, "forge-terminal-ok");
     let (revision, cols, rows) = screen_meta.expect("Ghostty render frame");
     assert!(revision > 0);
     assert_eq!((cols, rows), (80, 24));
+    assert!(colored, "ANSI foreground color was not resolved by Ghostty");
     daemon.kill().await.expect("stop daemon");
     let _ = std::fs::remove_file(socket);
+}
+
+async fn collect_output(
+    reader: &mut OwnedReadHalf,
+) -> (Vec<u8>, String, Option<(u64, u16, u16)>, bool) {
+    let mut output = Vec::new();
+    let mut screen = String::new();
+    let mut screen_meta = None;
+    let mut colored = false;
+    loop {
+        match read_message::<_, ServerMessage>(reader).await.unwrap().1 {
+            ServerMessage::Attached { backlog, .. } => output.extend(backlog),
+            ServerMessage::Output { data, .. } => output.extend(data),
+            ServerMessage::ScreenPatch {
+                revision,
+                cols,
+                rows,
+                dirty_rows,
+                ..
+            } => {
+                colored |= dirty_rows
+                    .iter()
+                    .flat_map(|row| &row.cells)
+                    .any(|cell| !cell.text.is_empty() && cell.foreground.is_some());
+                screen = dirty_rows
+                    .into_iter()
+                    .flat_map(|row| row.cells)
+                    .map(|cell| cell.text)
+                    .collect();
+                screen_meta = Some((revision, cols, rows));
+            }
+            ServerMessage::Exited { exit_code, .. } => {
+                assert_eq!(exit_code, Some(0));
+                return (output, screen, screen_meta, colored);
+            }
+            ServerMessage::Error { message } => panic!("daemon error: {message}"),
+            _ => {}
+        }
+    }
 }
 
 fn ghostty_library() -> Option<PathBuf> {
