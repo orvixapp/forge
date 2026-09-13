@@ -3,6 +3,15 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly headless benchmarks; every push only runs the rust matrix.
+    - cron: "0 6 * * 1"
+
+# A newer push to the same branch cancels the runs still in flight.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -51,6 +60,7 @@ jobs:
   # are calibrated for the hosted runner; the product targets live in
   # bench/thresholds.toml and are measured on the reference machines.
   bench:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
