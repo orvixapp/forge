@@ -1,0 +1,57 @@
+#!/usr/bin/env sh
+set -eu
+
+GHOSTTY_COMMIT=7aab0a0392369613472bd5dcfd66bef58e78c3ec
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PROJECT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+TOOLS_DIR="$PROJECT_DIR/target/forge-tools"
+SOURCE_DIR="$TOOLS_DIR/ghostty-$GHOSTTY_COMMIT"
+PREFIX_DIR="$PROJECT_DIR/target/ghostty"
+ARCHIVE="$TOOLS_DIR/ghostty-$GHOSTTY_COMMIT.tar.gz"
+
+if [ -n "${FORGE_ZIG:-}" ]; then
+    ZIG_BIN=$FORGE_ZIG
+else
+    ZIG_BIN=$(command -v zig || true)
+fi
+
+if [ -z "$ZIG_BIN" ]; then
+    echo "Zig 0.16.0 is required. Set FORGE_ZIG=/path/to/zig." >&2
+    exit 2
+fi
+
+if [ "$($ZIG_BIN version)" != "0.16.0" ]; then
+    echo "Expected Zig 0.16.0, found $($ZIG_BIN version)." >&2
+    exit 2
+fi
+
+mkdir -p "$TOOLS_DIR"
+if [ ! -d "$SOURCE_DIR" ]; then
+    if [ ! -f "$ARCHIVE" ]; then
+        curl -fL \
+            "https://github.com/ghostty-org/ghostty/archive/$GHOSTTY_COMMIT.tar.gz" \
+            -o "$ARCHIVE"
+    fi
+    tar -xzf "$ARCHIVE" -C "$TOOLS_DIR"
+fi
+
+"$ZIG_BIN" build \
+    --build-file "$SOURCE_DIR/build.zig" \
+    -Demit-lib-vt=true \
+    -Dapp-runtime=none \
+    -Doptimize=ReleaseFast \
+    --prefix "$PREFIX_DIR"
+
+case "$(uname -s)" in
+    Darwin) LIBRARY="$PREFIX_DIR/lib/libghostty-vt.dylib" ;;
+    Linux) LIBRARY="$PREFIX_DIR/lib/libghostty-vt.so" ;;
+    *) LIBRARY="$PREFIX_DIR/bin/ghostty-vt.dll" ;;
+esac
+
+if [ ! -f "$LIBRARY" ]; then
+    echo "Ghostty build completed but $LIBRARY was not produced." >&2
+    exit 1
+fi
+
+echo "$LIBRARY"
+

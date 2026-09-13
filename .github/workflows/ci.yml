@@ -21,3 +21,18 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  ghostty-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/bootstrap-ghostty.sh
+      - run: cargo test -p proto-termd --test terminal_round_trip
+        env:
+          FORGE_GHOSTTY_LIB: target/ghostty/lib/libghostty-vt.so

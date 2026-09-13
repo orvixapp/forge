@@ -8,6 +8,7 @@ fn main() {
 mod unix {
     use anyhow::{Context, Result, bail};
     use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+    use proto_ghostty_vt::{GhosttyLibrary, GhosttyTerminal};
     use proto_ipc::{
         ClientMessage, FrameKind, PROTOCOL_VERSION, ServerMessage, read_message, write_message,
     };
@@ -31,6 +32,12 @@ mod unix {
     #[derive(Debug, Clone)]
     enum SessionEvent {
         Output(Vec<u8>),
+        ScreenUpdated {
+            revision: u64,
+            cols: u16,
+            rows: u16,
+            text: String,
+        },
         Exited(Option<u32>),
     }
 
@@ -39,6 +46,10 @@ mod unix {
         master: Mutex<Box<dyn MasterPty + Send>>,
         child: Mutex<Box<dyn Child + Send + Sync>>,
         backlog: Mutex<VecDeque<u8>>,
+        terminal: Mutex<GhosttyTerminal>,
+        cols: std::sync::atomic::AtomicU16,
+        rows: std::sync::atomic::AtomicU16,
+        revision: std::sync::atomic::AtomicU64,
         exit_code: Mutex<Option<u32>>,
         events: broadcast::Sender<SessionEvent>,
     }
@@ -63,7 +74,17 @@ mod unix {
                     pixel_width: 0,
                     pixel_height: 0,
                 })
-                .context("resize PTY")
+                .context("resize PTY")?;
+            self.cols
+                .store(cols.max(1), std::sync::atomic::Ordering::Relaxed);
+            self.rows
+                .store(rows.max(1), std::sync::atomic::Ordering::Relaxed);
+            self.terminal
+                .lock()
+                .expect("terminal mutex poisoned")
+                .resize(cols, rows)
+                .context("resize Ghostty terminal")?;
+            self.emit_screen()
         }
 
         fn shutdown(&self) -> Result<()> {
@@ -73,15 +94,51 @@ mod unix {
                 .kill()
                 .context("kill PTY child")
         }
+
+        fn feed_vt(&self, data: &[u8]) -> Result<()> {
+            self.terminal
+                .lock()
+                .expect("terminal mutex poisoned")
+                .write(data);
+            self.emit_screen()
+        }
+
+        fn emit_screen(&self) -> Result<()> {
+            let text = self
+                .terminal
+                .lock()
+                .expect("terminal mutex poisoned")
+                .snapshot_text()
+                .context("format Ghostty screen")?;
+            let revision = self
+                .revision
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            let _ = self.events.send(SessionEvent::ScreenUpdated {
+                revision,
+                cols: self.cols.load(std::sync::atomic::Ordering::Relaxed),
+                rows: self.rows.load(std::sync::atomic::Ordering::Relaxed),
+                text,
+            });
+            Ok(())
+        }
     }
 
-    #[derive(Default)]
     struct Daemon {
+        ghostty: GhosttyLibrary,
         sessions: RwLock<HashMap<u64, Arc<Session>>>,
         next_session_id: std::sync::atomic::AtomicU64,
     }
 
     impl Daemon {
+        fn new(ghostty: GhosttyLibrary) -> Self {
+            Self {
+                ghostty,
+                sessions: RwLock::new(HashMap::new()),
+                next_session_id: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
         async fn create_session(
             &self,
             command: String,
@@ -107,11 +164,19 @@ mod unix {
             let mut writer = pair.master.take_writer().context("take PTY writer")?;
             let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(128);
             let (events, _) = broadcast::channel(256);
+            let terminal = self
+                .ghostty
+                .terminal(cols, rows)
+                .context("create Ghostty terminal")?;
             let session = Arc::new(Session {
                 input: input_tx,
                 master: Mutex::new(pair.master),
                 child: Mutex::new(child),
                 backlog: Mutex::new(VecDeque::with_capacity(64 * 1024)),
+                terminal: Mutex::new(terminal),
+                cols: std::sync::atomic::AtomicU16::new(cols.max(1)),
+                rows: std::sync::atomic::AtomicU16::new(rows.max(1)),
+                revision: std::sync::atomic::AtomicU64::new(0),
                 exit_code: Mutex::new(None),
                 events,
             });
@@ -132,6 +197,9 @@ mod unix {
                             Ok(count) => {
                                 let data = chunk[..count].to_vec();
                                 append_bounded(&read_session.backlog, &data);
+                                if let Err(error) = read_session.feed_vt(&data) {
+                                    warn!(session_id, %error, "Ghostty VT update failed");
+                                }
                                 let _ = read_session.events.send(SessionEvent::Output(data));
                             }
                             Err(error) => {
@@ -224,7 +292,14 @@ mod unix {
                     .unwrap_or_else(|_| "proto_termd=info".into()),
             )
             .init();
-        let socket = parse_socket()?;
+        let options = parse_options()?;
+        let ghostty = GhosttyLibrary::load(&options.ghostty_lib).with_context(|| {
+            format!(
+                "load libghostty-vt from {}; run scripts/bootstrap-ghostty.sh first",
+                options.ghostty_lib.display()
+            )
+        })?;
+        let socket = options.socket;
         if socket.exists() {
             if UnixStream::connect(&socket).await.is_ok() {
                 bail!(
@@ -239,7 +314,7 @@ mod unix {
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
             .context("restrict socket permissions")?;
         info!(path = %socket.display(), "terminal daemon listening");
-        let daemon = Arc::new(Daemon::default());
+        let daemon = Arc::new(Daemon::new(ghostty));
         loop {
             let (stream, _) = listener.accept().await?;
             let daemon = Arc::clone(&daemon);
@@ -251,13 +326,30 @@ mod unix {
         }
     }
 
-    fn parse_socket() -> Result<PathBuf> {
+    struct Options {
+        socket: PathBuf,
+        ghostty_lib: PathBuf,
+    }
+
+    fn parse_options() -> Result<Options> {
+        let mut socket = PathBuf::from("/tmp/forge-prototype.sock");
+        let mut ghostty_lib = std::env::var_os("FORGE_GHOSTTY_LIB")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| "target/ghostty/lib/libghostty-vt.so".into());
         let mut args = std::env::args().skip(1);
-        match (args.next().as_deref(), args.next()) {
-            (Some("--socket"), Some(path)) => Ok(path.into()),
-            (None, None) => Ok("/tmp/forge-prototype.sock".into()),
-            _ => bail!("usage: proto-termd [--socket PATH]"),
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--socket" => socket = args.next().context("--socket requires a path")?.into(),
+                "--ghostty-lib" => {
+                    ghostty_lib = args.next().context("--ghostty-lib requires a path")?.into();
+                }
+                _ => bail!("usage: proto-termd [--socket PATH] [--ghostty-lib PATH]"),
+            }
         }
+        Ok(Options {
+            socket,
+            ghostty_lib,
+        })
     }
 
     async fn handle_connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
@@ -400,6 +492,18 @@ mod unix {
             loop {
                 let message = match events.recv().await {
                     Ok(SessionEvent::Output(data)) => ServerMessage::Output { session_id, data },
+                    Ok(SessionEvent::ScreenUpdated {
+                        revision,
+                        cols,
+                        rows,
+                        text,
+                    }) => ServerMessage::ScreenUpdated {
+                        session_id,
+                        revision,
+                        cols,
+                        rows,
+                        text,
+                    },
                     Ok(SessionEvent::Exited(exit_code)) => {
                         let _ = forwarding
                             .send((

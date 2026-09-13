@@ -8,10 +8,16 @@ use tokio::{net::UnixStream, process::Command, time::timeout};
 
 #[tokio::test]
 async fn command_output_crosses_the_daemon_boundary() {
+    let Some(ghostty_lib) = ghostty_library() else {
+        eprintln!("skipping Ghostty integration test; set FORGE_GHOSTTY_LIB");
+        return;
+    };
     let socket = unique_socket();
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_proto-termd"))
         .arg("--socket")
         .arg(&socket)
+        .arg("--ghostty-lib")
+        .arg(ghostty_lib)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true)
@@ -71,8 +77,9 @@ async fn command_output_crosses_the_daemon_boundary() {
     .await
     .unwrap();
 
-    let output = timeout(Duration::from_secs(5), async {
+    let (output, screen) = timeout(Duration::from_secs(5), async {
         let mut output = Vec::new();
+        let mut screen = String::new();
         loop {
             match read_message::<_, ServerMessage>(&mut reader)
                 .await
@@ -81,9 +88,10 @@ async fn command_output_crosses_the_daemon_boundary() {
             {
                 ServerMessage::Attached { backlog, .. } => output.extend(backlog),
                 ServerMessage::Output { data, .. } => output.extend(data),
+                ServerMessage::ScreenUpdated { text, .. } => screen = text,
                 ServerMessage::Exited { exit_code, .. } => {
                     assert_eq!(exit_code, Some(0));
-                    return output;
+                    return (output, screen);
                 }
                 ServerMessage::Error { message } => panic!("daemon error: {message}"),
                 _ => {}
@@ -94,8 +102,15 @@ async fn command_output_crosses_the_daemon_boundary() {
     .expect("terminal command timed out");
 
     assert_eq!(output, b"forge-terminal-ok");
+    assert!(screen.contains("forge-terminal-ok"));
     daemon.kill().await.expect("stop daemon");
     let _ = std::fs::remove_file(socket);
+}
+
+fn ghostty_library() -> Option<PathBuf> {
+    std::env::var_os("FORGE_GHOSTTY_LIB")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
 }
 
 async fn connect_when_ready(socket: &PathBuf) -> std::io::Result<UnixStream> {

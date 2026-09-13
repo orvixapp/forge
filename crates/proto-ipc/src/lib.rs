@@ -208,6 +208,13 @@ pub enum ServerMessage {
         session_id: u64,
         data: Vec<u8>,
     },
+    ScreenUpdated {
+        session_id: u64,
+        revision: u64,
+        cols: u16,
+        rows: u16,
+        text: String,
+    },
     Exited {
         session_id: u64,
         exit_code: Option<u32>,

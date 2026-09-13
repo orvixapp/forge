@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 portable-pty.workspace = true
+proto-ghostty-vt = { path = "../proto-ghostty-vt" }
 proto-ipc = { path = "../proto-ipc" }
 tokio.workspace = true
 tracing.workspace = true
@@ -14,4 +15,3 @@ tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
-
