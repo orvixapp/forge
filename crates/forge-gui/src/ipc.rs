@@ -9,11 +9,15 @@ use proto_ipc::ServerMessage;
 use std::{path::PathBuf, sync::mpsc::Sender};
 use tokio::sync::mpsc as async_mpsc;
 
+// Without a daemon (non-Unix builds) the messages are only ever sent, never
+// produced, so the compiler sees the payloads as unused.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub enum UiEvent {
     Message { tab_id: u64, message: ServerMessage },
     Status { tab_id: u64, status: String },
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 pub enum IpcCommand {
     Input(Vec<u8>),
     Resize { cols: u16, rows: u16 },
@@ -21,6 +25,7 @@ pub enum IpcCommand {
 
 /// Everything needed to create one daemon session.
 #[derive(Clone)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub struct SessionSpec {
     pub socket: PathBuf,
     pub command: String,
@@ -55,9 +60,10 @@ pub fn spawn_ipc_worker(
         .expect("spawn GUI IPC worker");
 }
 
-/// Phase 1 targets Windows as "build only": the daemon needs ConPTY and named
-/// pipes, which arrive with the terminal phase.
+/// Phase 1 targets Windows as "build only": the daemon needs `ConPTY` and
+/// named pipes, which arrive with the terminal phase.
 #[cfg(not(unix))]
+#[allow(clippy::needless_pass_by_value)]
 pub fn spawn_ipc_worker(
     _spec: SessionSpec,
     tab_id: u64,
