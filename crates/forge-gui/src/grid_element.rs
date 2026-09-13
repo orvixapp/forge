@@ -323,12 +323,23 @@ impl ColorCache {
 /// Element that paints a [`TerminalSurface`] owned by view `V`.
 pub struct TerminalGridElement<V: 'static> {
     view: Entity<V>,
-    surface: fn(&mut V) -> &mut TerminalSurface,
+    index: usize,
+    surface: fn(&mut V, usize) -> &mut TerminalSurface,
 }
 
 impl<V: 'static> TerminalGridElement<V> {
-    pub fn new(view: Entity<V>, surface: fn(&mut V) -> &mut TerminalSurface) -> Self {
-        Self { view, surface }
+    /// Selects one surface from a view. Keeping the index in the element (and
+    /// not in a closure) lets one Forge window paint several live terminals.
+    pub fn new(
+        view: Entity<V>,
+        index: usize,
+        surface: fn(&mut V, usize) -> &mut TerminalSurface,
+    ) -> Self {
+        Self {
+            view,
+            index,
+            surface,
+        }
     }
 }
 
@@ -360,8 +371,9 @@ impl<V: 'static> Element for TerminalGridElement<V> {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let surface = self.surface;
+        let index = self.index;
         let grid_size = self.view.update(cx, |view, _| {
-            let surface = surface(view);
+            let surface = surface(view, index);
             let (cols, rows) = surface.grid.dimensions();
             surface.metrics.grid_size(cols, rows)
         });
@@ -394,8 +406,10 @@ impl<V: 'static> Element for TerminalGridElement<V> {
         cx: &mut App,
     ) {
         let surface = self.surface;
-        self.view
-            .update(cx, |view, _| paint_grid(surface(view), bounds, window));
+        let index = self.index;
+        self.view.update(cx, |view, _| {
+            paint_grid(surface(view, index), bounds, window)
+        });
     }
 }
 

@@ -3,9 +3,11 @@ mod grid_element;
 use anyhow::{Context as _, Result, bail};
 use forge_gui::{
     KeyModifiers, Selection, TerminalGrid,
-    config::{Config, resolve_font_family},
+    config::{Config, Language, resolve_font_family},
     encode_terminal_key,
-    shell::{ShellCommand, ShellContext, ShellKeymap, ShellKeystroke},
+    shell::{
+        ShellCommand, ShellContext, ShellKeymap, ShellKeystroke, SplitDirection, search_commands,
+    },
 };
 use gpui::{
     App, Application, AssetSource, Bounds, ClipboardItem, Context,
@@ -38,8 +40,8 @@ use tokio::{
 };
 
 enum UiEvent {
-    Message(ServerMessage),
-    Status(String),
+    Message { tab_id: u64, message: ServerMessage },
+    Status { tab_id: u64, status: String },
 }
 
 enum IpcCommand {
@@ -97,9 +99,10 @@ struct WindowFactory {
 impl WindowFactory {
     fn open(&self, cx: &mut App, start_ipc: bool) -> anyhow::Result<WindowHandle<ForgeWindow>> {
         let (event_tx, event_rx) = mpsc::channel();
+        let event_tx_for_view = event_tx.clone();
         let (input_tx, input_rx) = async_mpsc::unbounded_channel();
+        let resize_targets = Arc::new(Mutex::new(vec![(1_u64, input_tx.clone())]));
         let factory = self.clone();
-        let resize_tx = input_tx.clone();
         let last_resize = Arc::new(Mutex::new(None));
         let bounds = Bounds::centered(None, self.window_size, cx);
         let window = cx.open_window(
@@ -116,26 +119,38 @@ impl WindowFactory {
                 ..Default::default()
             },
             move |window, cx| {
-                let resize_tx = resize_tx.clone();
+                let resize_targets = Arc::clone(&resize_targets);
                 let last_resize = Arc::clone(&last_resize);
                 let view = cx.new(|cx| {
-                    let resize_tx = resize_tx.clone();
+                    let resize_targets = Arc::clone(&resize_targets);
                     let last_resize = Arc::clone(&last_resize);
                     let metrics = factory.metrics;
                     let chrome_height = factory.chrome_height;
+                    let observer_resize_targets = Arc::clone(&resize_targets);
+                    let observer_last_resize = Arc::clone(&last_resize);
                     cx.observe_window_bounds(window, move |_, window, _| {
                         let (cols, rows) =
                             grid_dimensions(window.bounds().size, metrics, chrome_height);
-                        let mut last = last_resize.lock().expect("resize state mutex poisoned");
+                        let mut last = observer_last_resize
+                            .lock()
+                            .expect("resize state mutex poisoned");
                         if *last != Some((cols, rows)) {
                             *last = Some((cols, rows));
-                            let _ = resize_tx.send(IpcCommand::Resize { cols, rows });
+                            observer_resize_targets
+                                .lock()
+                                .expect("resize targets mutex poisoned")
+                                .retain(|(_, input)| {
+                                    input.send(IpcCommand::Resize { cols, rows }).is_ok()
+                                });
                         }
                     })
                     .detach();
                     ForgeWindow::new(
                         event_rx,
+                        event_tx_for_view.clone(),
                         input_tx,
+                        Arc::clone(&resize_targets),
+                        Arc::clone(&last_resize),
                         Arc::clone(&factory.render_count),
                         metrics,
                         Arc::clone(&factory.config),
@@ -154,7 +169,7 @@ impl WindowFactory {
             let cwd = self.cwd.clone();
             window.update(cx, |_, window, _| {
                 window.on_next_frame(move |_, _| {
-                    spawn_ipc_worker(socket, shell, cwd, event_tx, input_rx);
+                    spawn_ipc_worker(socket, shell, cwd, 1, event_tx, input_rx);
                 });
             })?;
         }
@@ -163,23 +178,48 @@ impl WindowFactory {
 }
 
 struct ForgeWindow {
-    terminal: TerminalSurface,
+    tabs: Vec<TerminalTab>,
+    active_tab: usize,
+    next_tab_id: u64,
+    event_tx: Sender<UiEvent>,
+    resize_targets: Arc<Mutex<Vec<(u64, async_mpsc::UnboundedSender<IpcCommand>)>>>,
+    last_resize: Arc<Mutex<Option<(u16, u16)>>>,
     config: Arc<Config>,
-    status: String,
-    input: async_mpsc::UnboundedSender<IpcCommand>,
     focus: FocusHandle,
     render_count: Arc<AtomicU64>,
     frame_probe: Option<FrameProbe>,
     factory: WindowFactory,
-    /// Cell where the current left-button drag started.
-    drag_anchor: Option<forge_gui::CellPos>,
     keymap: ShellKeymap,
+    palette_open: bool,
+    palette_query: String,
+    split: Option<ActiveSplit>,
+}
+
+#[derive(Clone, Copy)]
+struct ActiveSplit {
+    direction: SplitDirection,
+    first: usize,
+    second: usize,
+}
+
+/// A live terminal is intentionally owned by exactly one tab. This prevents a
+/// background session from overwriting the grid currently visible to the user.
+struct TerminalTab {
+    id: u64,
+    title: String,
+    terminal: TerminalSurface,
+    status: String,
+    input: async_mpsc::UnboundedSender<IpcCommand>,
+    drag_anchor: Option<forge_gui::CellPos>,
 }
 
 impl ForgeWindow {
     fn new(
         events: Receiver<UiEvent>,
+        event_tx: Sender<UiEvent>,
         input: async_mpsc::UnboundedSender<IpcCommand>,
+        resize_targets: Arc<Mutex<Vec<(u64, async_mpsc::UnboundedSender<IpcCommand>)>>>,
+        last_resize: Arc<Mutex<Option<(u16, u16)>>>,
         render_count: Arc<AtomicU64>,
         metrics: CellMetrics,
         config: Arc<Config>,
@@ -206,46 +246,166 @@ impl ForgeWindow {
         })
         .detach();
         let palette = Palette::from(&config.colors);
+        let keymap = ShellKeymap::default().with_overrides(&config.keybindings);
         Self {
-            terminal: TerminalSurface::new(TerminalGrid::new(80, 24), metrics, palette),
+            tabs: vec![TerminalTab {
+                id: 1,
+                title: "Terminal 1".into(),
+                terminal: TerminalSurface::new(TerminalGrid::new(80, 24), metrics, palette),
+                status: "Conectando a forge-termd…".into(),
+                input,
+                drag_anchor: None,
+            }],
+            active_tab: 0,
+            next_tab_id: 2,
+            event_tx,
+            resize_targets,
+            last_resize,
             config,
-            status: "Conectando a forge-termd…".into(),
-            input,
             focus: cx.focus_handle(),
             render_count,
             frame_probe: None,
             factory,
-            drag_anchor: None,
-            keymap: ShellKeymap::default(),
+            keymap,
+            palette_open: false,
+            palette_query: String::new(),
+            split: None,
         }
     }
 
     fn handle_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
         match event {
-            UiEvent::Message(ServerMessage::Exited { exit_code, .. }) => {
+            UiEvent::Message {
+                tab_id,
+                message: ServerMessage::Exited { exit_code, .. },
+            } => {
                 // Keep the window visible so other Forge windows remain usable.
-                self.status = format!("Sesión terminada ({})", exit_code.unwrap_or(0));
+                if let Some(tab) = self.tab_mut(tab_id) {
+                    tab.status = format!("Sesión terminada ({})", exit_code.unwrap_or(0));
+                }
                 cx.notify();
             }
-            UiEvent::Message(ServerMessage::Error { message }) => {
-                self.status = format!("Error del daemon: {message}");
-            }
-            UiEvent::Message(message) => {
-                let before = self.terminal.grid.dimensions();
-                match self.terminal.grid.apply_server_message(message) {
-                    Ok(true) => {
-                        if self.terminal.grid.dimensions() != before {
-                            self.terminal.selection = None;
-                        }
-                        self.status =
-                            format!("Sesión activa · revisión {}", self.terminal.grid.revision());
-                    }
-                    Ok(false) => {}
-                    Err(error) => self.status = format!("Patch inválido: {error}"),
+            UiEvent::Message {
+                tab_id,
+                message: ServerMessage::Error { message },
+            } => {
+                if let Some(tab) = self.tab_mut(tab_id) {
+                    tab.status = format!("Error del daemon: {message}");
                 }
             }
-            UiEvent::Status(status) => self.status = status,
+            UiEvent::Message { tab_id, message } => {
+                let Some(tab) = self.tab_mut(tab_id) else {
+                    return;
+                };
+                let before = tab.terminal.grid.dimensions();
+                match tab.terminal.grid.apply_server_message(message) {
+                    Ok(true) => {
+                        if tab.terminal.grid.dimensions() != before {
+                            tab.terminal.selection = None;
+                        }
+                        tab.status =
+                            format!("Sesión activa · revisión {}", tab.terminal.grid.revision());
+                    }
+                    Ok(false) => {}
+                    Err(error) => tab.status = format!("Patch inválido: {error}"),
+                }
+            }
+            UiEvent::Status { tab_id, status } => {
+                if let Some(tab) = self.tab_mut(tab_id) {
+                    tab.status = status;
+                }
+            }
         }
+    }
+
+    fn active_tab(&self) -> &TerminalTab {
+        &self.tabs[self.active_tab]
+    }
+
+    fn active_tab_mut(&mut self) -> &mut TerminalTab {
+        &mut self.tabs[self.active_tab]
+    }
+
+    fn tab_mut(&mut self, id: u64) -> Option<&mut TerminalTab> {
+        self.tabs.iter_mut().find(|tab| tab.id == id)
+    }
+
+    fn terminal_surface_at(&mut self, index: usize) -> &mut TerminalSurface {
+        &mut self.tabs[index].terminal
+    }
+
+    fn active_terminal_surface(&mut self) -> &mut TerminalSurface {
+        &mut self.active_tab_mut().terminal
+    }
+
+    fn create_terminal_tab(&mut self, cx: &mut Context<Self>) -> usize {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let (input, input_rx) = async_mpsc::unbounded_channel();
+        let tab_number = self.tabs.len() + 1;
+        let palette = Palette::from(&self.config.colors);
+        self.tabs.push(TerminalTab {
+            id,
+            title: format!("Terminal {tab_number}"),
+            terminal: TerminalSurface::new(
+                TerminalGrid::new(80, 24),
+                self.factory.metrics,
+                palette,
+            ),
+            status: "Conectando a forge-termd…".into(),
+            input,
+            drag_anchor: None,
+        });
+        self.resize_targets
+            .lock()
+            .expect("resize targets mutex poisoned")
+            .push((id, self.active_tab().input.clone()));
+        if let Some((cols, rows)) = *self
+            .last_resize
+            .lock()
+            .expect("resize state mutex poisoned")
+        {
+            let _ = self
+                .active_tab()
+                .input
+                .send(IpcCommand::Resize { cols, rows });
+        }
+        self.active_tab = self.tabs.len() - 1;
+        spawn_ipc_worker(
+            self.factory.socket.clone(),
+            self.factory.shell.clone(),
+            self.factory.cwd.clone(),
+            id,
+            self.event_tx.clone(),
+            input_rx,
+        );
+        cx.notify();
+        self.active_tab
+    }
+
+    fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.tabs.len() {
+            self.active_tab = index;
+            cx.notify();
+        }
+    }
+
+    fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.tabs.len() <= 1 || index >= self.tabs.len() {
+            return;
+        }
+        let closed = self.tabs.remove(index);
+        self.resize_targets
+            .lock()
+            .expect("resize targets mutex poisoned")
+            .retain(|(id, _)| *id != closed.id);
+        self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+        self.split = None;
+        cx.notify();
+    }
+
+    fn close_active_tab(&mut self, cx: &mut Context<Self>) {
+        self.close_tab(self.active_tab, cx);
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -262,14 +422,52 @@ impl ForgeWindow {
             modifiers.alt,
             modifiers.shift,
         );
+        if self.palette_open {
+            match keystroke.key.as_str() {
+                "escape" => self.palette_open = false,
+                "enter" => {
+                    let command = search_commands(&self.palette_query)
+                        .first()
+                        .map(|item| item.command);
+                    self.palette_open = false;
+                    if let Some(command) = command {
+                        self.run_shell_command(command, cx);
+                    }
+                    cx.notify();
+                    return;
+                }
+                "backspace" => {
+                    self.palette_query.pop();
+                }
+                _ if !modifiers.control && !modifiers.alt => {
+                    if let Some(text) = &keystroke.key_char {
+                        self.palette_query.push_str(text);
+                    }
+                }
+                _ => {}
+            }
+            self.active_tab_mut().status =
+                search_commands(&self.palette_query).first().map_or_else(
+                    || "Sin comandos coincidentes".into(),
+                    |item| format!("Palette · {}", item.command.title()),
+                );
+            cx.notify();
+            return;
+        }
         if self.keymap.resolve(&shell_key, ShellContext::Terminal)
-            == Some(ShellCommand::NewTerminalWindow)
+            == Some(ShellCommand::NewTerminalTab)
         {
-            let factory = self.factory.clone();
-            cx.spawn(async move |_this, cx| {
-                let _ = cx.update(|app| factory.open(app, true));
-            })
-            .detach();
+            self.run_shell_command(ShellCommand::NewTerminalTab, cx);
+            return;
+        }
+        if self.keymap.resolve(&shell_key, ShellContext::Terminal)
+            == Some(ShellCommand::ShowCommandPalette)
+        {
+            self.palette_open = true;
+            self.palette_query.clear();
+            self.active_tab_mut().status =
+                "Palette · escribe para buscar; Escape para cerrar".into();
+            cx.notify();
             return;
         }
         match keystroke.key.as_str() {
@@ -290,14 +488,63 @@ impl ForgeWindow {
         if let Some(bytes) =
             encode_terminal_key(&keystroke.key, keystroke.key_char.as_deref(), modifiers)
         {
-            self.terminal.selection = None;
-            let _ = self.input.send(IpcCommand::Input(bytes));
+            let tab = self.active_tab_mut();
+            tab.terminal.selection = None;
+            let _ = tab.input.send(IpcCommand::Input(bytes));
             cx.notify();
         }
     }
 
+    fn run_shell_command(&mut self, command: ShellCommand, cx: &mut Context<Self>) {
+        match command {
+            ShellCommand::NewTerminalTab => {
+                self.create_terminal_tab(cx);
+            }
+            ShellCommand::SplitHorizontal | ShellCommand::SplitVertical => {
+                let first = self.active_tab;
+                let second = self.create_terminal_tab(cx);
+                self.split = Some(ActiveSplit {
+                    direction: if command == ShellCommand::SplitHorizontal {
+                        SplitDirection::Horizontal
+                    } else {
+                        SplitDirection::Vertical
+                    },
+                    first,
+                    second,
+                });
+                self.active_tab = second;
+                self.active_tab_mut().status = "Split activo · Ctrl+Tab cambia el foco".into();
+                cx.notify();
+            }
+            // Keep the last terminal visible: closing a window remains a
+            // window-manager action, while Ctrl+W behaves like terminal apps
+            // and closes the focused tab when there is more than one.
+            ShellCommand::CloseWindow if self.tabs.len() > 1 => self.close_active_tab(cx),
+            ShellCommand::FocusNextPane => {
+                let next = self.split.map_or_else(
+                    || (self.active_tab + 1) % self.tabs.len(),
+                    |split| {
+                        if self.active_tab == split.first {
+                            split.second
+                        } else {
+                            split.first
+                        }
+                    },
+                );
+                self.activate_tab(next, cx);
+            }
+            command => {
+                self.active_tab_mut().status = format!(
+                    "{} estará disponible al completar su subfase",
+                    command.title()
+                )
+            }
+        }
+    }
+
     fn selected_text(&self) -> Option<String> {
-        let text = self.terminal.grid.selected_text(self.terminal.selection?);
+        let terminal = &self.active_tab().terminal;
+        let text = terminal.grid.selected_text(terminal.selection?);
         (!text.is_empty()).then_some(text)
     }
 
@@ -312,46 +559,47 @@ impl ForgeWindow {
     fn paste(&self, item: Option<ClipboardItem>) {
         if let Some(text) = item.and_then(|item| item.text()) {
             let bytes = text.replace("\r\n", "\r").replace('\n', "\r").into_bytes();
-            let _ = self.input.send(IpcCommand::Input(bytes));
+            let _ = self.active_tab().input.send(IpcCommand::Input(bytes));
         }
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        if !self.terminal.contains(event.position) {
+        if !self.active_tab().terminal.contains(event.position) {
             return;
         }
-        let Some(cell) = self.terminal.cell_at(event.position) else {
+        let Some(cell) = self.active_tab().terminal.cell_at(event.position) else {
             return;
         };
-        self.terminal.selection = match event.click_count {
-            2 => Some(self.terminal.grid.word_at(cell)),
-            n if n >= 3 => Some(self.terminal.grid.line_at(cell.y)),
+        let tab = self.active_tab_mut();
+        tab.terminal.selection = match event.click_count {
+            2 => Some(tab.terminal.grid.word_at(cell)),
+            n if n >= 3 => Some(tab.terminal.grid.line_at(cell.y)),
             _ => None,
         };
-        self.drag_anchor = Some(cell);
+        tab.drag_anchor = Some(cell);
         cx.notify();
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        let Some(anchor) = self.drag_anchor else {
+        let Some(anchor) = self.active_tab().drag_anchor else {
             return;
         };
         if event.pressed_button != Some(MouseButton::Left) {
-            self.drag_anchor = None;
+            self.active_tab_mut().drag_anchor = None;
             return;
         }
-        let Some(head) = self.terminal.cell_at(event.position) else {
+        let Some(head) = self.active_tab().terminal.cell_at(event.position) else {
             return;
         };
         let selection = Some(Selection { anchor, head });
-        if self.terminal.selection != selection {
-            self.terminal.selection = selection;
+        if self.active_tab().terminal.selection != selection {
+            self.active_tab_mut().terminal.selection = selection;
             cx.notify();
         }
     }
 
     fn on_mouse_up(&mut self, _event: &MouseUpEvent, cx: &mut Context<Self>) {
-        if self.drag_anchor.take().is_none() {
+        if self.active_tab_mut().drag_anchor.take().is_none() {
             return;
         }
         // Linux convention: a finished selection is available on middle click.
@@ -373,11 +621,63 @@ impl Render for ForgeWindow {
                     .send(probe.started.elapsed().as_secs_f64() * 1_000.0);
             });
         }
-        let palette = self.terminal.palette;
+        let palette = self.active_tab().terminal.palette;
         let config = &self.config;
         let chrome = rgb(0x171b24);
         let chrome_border = rgb(0x2a3140);
         let muted = rgb(0x7f8aa3);
+        let english = config.ui.language == Language::English;
+        let new_tab_hint = if english {
+            "Ctrl+T · new tab"
+        } else {
+            "Ctrl+T · nueva pestaña"
+        };
+        let terminal_area = if let Some(split) = self.split {
+            let horizontal = split.direction == SplitDirection::Horizontal;
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .flex()
+                .when(horizontal, |area| area.flex_col())
+                .when(!horizontal, |area| area.flex_row())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .min_h(px(0.0))
+                        .p(px(config.terminal.padding))
+                        .border_color(chrome_border)
+                        .when(horizontal, |pane| pane.border_b_1())
+                        .when(!horizontal, |pane| pane.border_r_1())
+                        .child(TerminalGridElement::new(
+                            cx.entity(),
+                            split.first,
+                            |view: &mut Self, index| view.terminal_surface_at(index),
+                        )),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .min_h(px(0.0))
+                        .p(px(config.terminal.padding))
+                        .child(TerminalGridElement::new(
+                            cx.entity(),
+                            split.second,
+                            |view: &mut Self, index| view.terminal_surface_at(index),
+                        )),
+                )
+        } else {
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .p(px(config.terminal.padding))
+                .child(TerminalGridElement::new(
+                    cx.entity(),
+                    self.active_tab,
+                    |view: &mut Self, index| view.terminal_surface_at(index),
+                ))
+        };
         window.set_client_inset(px(WINDOW_RESIZE_INSET));
         div()
             .id("forge-terminal")
@@ -452,14 +752,69 @@ impl Render for ForgeWindow {
                     .bg(chrome)
                     .border_b_1()
                     .border_color(chrome_border)
+                    .child(img("forge-logo.svg").size(px(19.0)))
+                    .children(self.tabs.iter().enumerate().map(|(index, tab)| {
+                        let title = tab.title.clone();
+                        let active = index == self.active_tab;
+                        div()
+                            .id(SharedString::from(format!("terminal-tab-{}", tab.id)))
+                            .h(px(28.0))
+                            .min_w(px(120.0))
+                            .max_w(px(210.0))
+                            .px(px(10.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .rounded(px(6.0))
+                            .bg(if active { rgb(0x252c3a) } else { chrome })
+                            .border_1()
+                            .border_color(if active { rgb(0x3b465c) } else { chrome })
+                            .text_size(px(12.0))
+                            .text_color(if active { palette.foreground } else { muted })
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x252c3a)))
+                            .on_click(
+                                cx.listener(move |view, _, _, cx| view.activate_tab(index, cx)),
+                            )
+                            .child(div().flex_1().overflow_hidden().child(title))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("terminal-tab-close-{index}")))
+                                    .size(px(16.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(3.0))
+                                    .hover(|style| style.bg(rgb(0x3b465c)))
+                                    .on_click(
+                                        cx.listener(move |view, _, _, cx| {
+                                            view.close_tab(index, cx)
+                                        }),
+                                    )
+                                    .child("×"),
+                            )
+                    }))
+                    .child(
+                        div()
+                            .id("new-terminal-tab")
+                            .size(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .text_color(muted)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x252c3a)))
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.create_terminal_tab(cx);
+                            }))
+                            .child("+"),
+                    )
                     .child(
                         div()
                             .id("forge-drag-region")
                             .h_full()
                             .flex_1()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
                             .cursor_default()
                             .on_mouse_down(MouseButton::Left, |event, window, _| {
                                 if event.click_count >= 2 {
@@ -469,16 +824,14 @@ impl Render for ForgeWindow {
                                 }
                             })
                             .on_mouse_down(MouseButton::Right, |event, window, _| {
-                                window.show_window_menu(event.position);
-                            })
-                            .child(img("forge-logo.svg").size(px(21.0)))
-                            .child(div().text_size(px(13.0)).child("Terminal")),
+                                window.show_window_menu(event.position)
+                            }),
                     )
                     .child(
                         div()
                             .text_size(px(12.0))
                             .text_color(muted)
-                            .child("Ctrl+T · nueva terminal"),
+                            .child(new_tab_hint),
                     )
                     .child(
                         div()
@@ -523,15 +876,56 @@ impl Render for ForgeWindow {
                             .child("×"),
                     ),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .p(px(config.terminal.padding))
-                    .child(TerminalGridElement::new(cx.entity(), |view: &mut Self| {
-                        &mut view.terminal
-                    })),
-            )
+            .child(terminal_area)
+            .when(self.palette_open, |root| {
+                let matches = search_commands(&self.palette_query);
+                root.child(
+                    div()
+                        .id("command-palette")
+                        .absolute()
+                        .top(px(64.0))
+                        .left(px(48.0))
+                        .w(px(440.0))
+                        .p(px(12.0))
+                        .rounded(px(8.0))
+                        .bg(rgb(0x202633))
+                        .border_1()
+                        .border_color(chrome_border)
+                        .shadow(vec![gpui::BoxShadow {
+                            color: gpui::transparent_black(),
+                            offset: point(px(0.0), px(8.0)),
+                            blur_radius: px(20.0),
+                            spread_radius: px(0.0),
+                        }])
+                        .child(
+                            div()
+                                .text_size(px(14.0))
+                                .text_color(palette.foreground)
+                                .child(format!("› {}", self.palette_query)),
+                        )
+                        .child(
+                            div()
+                                .mt(px(6.0))
+                                .text_size(px(11.0))
+                                .text_color(muted)
+                                .child(if english {
+                                    "Enter runs the first result · Esc closes"
+                                } else {
+                                    "Enter ejecutará el primer resultado · Esc cierra"
+                                }),
+                        )
+                        .children(matches.into_iter().take(6).map(|item| {
+                            div()
+                                .mt(px(7.0))
+                                .px(px(8.0))
+                                .py(px(5.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0x2a3140))
+                                .text_size(px(13.0))
+                                .child(item.command.title())
+                        })),
+                )
+            })
     }
 }
 
@@ -730,7 +1124,7 @@ fn spawn_grid_benchmark(iterations: usize, window: WindowHandle<ForgeWindow>, cx
                     let patch = synthetic_grid_patch(revision);
                     let started = Instant::now();
                     view.update(cx, |view, cx| {
-                        view.terminal
+                        view.active_terminal_surface()
                             .grid
                             .apply_server_message(patch)
                             .expect("synthetic grid patch");
@@ -750,7 +1144,7 @@ fn spawn_grid_benchmark(iterations: usize, window: WindowHandle<ForgeWindow>, cx
             }
         }
         let painted_cells = window
-            .update(cx, |view, _, _| view.terminal.painted_cells)
+            .update(cx, |view, _, _| view.active_tab().terminal.painted_cells)
             .ok()
             .and_then(|cells| u64::try_from(cells).ok());
         emit_metrics(&GuiMetrics {
@@ -770,6 +1164,7 @@ fn spawn_ipc_worker(
     socket: PathBuf,
     shell: (String, Vec<String>),
     cwd: PathBuf,
+    tab_id: u64,
     events: Sender<UiEvent>,
     input: async_mpsc::UnboundedReceiver<IpcCommand>,
 ) {
@@ -781,10 +1176,13 @@ fn spawn_ipc_worker(
                 .build()
                 .context("create IPC runtime")
                 .and_then(|runtime| {
-                    runtime.block_on(run_ipc(socket, shell, cwd, events.clone(), input))
+                    runtime.block_on(run_ipc(socket, shell, cwd, tab_id, events.clone(), input))
                 });
             if let Err(error) = result {
-                let _ = events.send(UiEvent::Status(format!("Sin conexión: {error:#}")));
+                let _ = events.send(UiEvent::Status {
+                    tab_id,
+                    status: format!("Sin conexión: {error:#}"),
+                });
             }
         })
         .expect("spawn GUI IPC worker");
@@ -794,6 +1192,7 @@ async fn run_ipc(
     socket: PathBuf,
     (command, args): (String, Vec<String>),
     cwd: PathBuf,
+    tab_id: u64,
     events: Sender<UiEvent>,
     mut input: async_mpsc::UnboundedReceiver<IpcCommand>,
 ) -> Result<()> {
@@ -837,7 +1236,10 @@ async fn run_ipc(
         &ClientMessage::Attach { session_id },
     )
     .await?;
-    let _ = events.send(UiEvent::Status(format!("Sesión {session_id} conectada")));
+    let _ = events.send(UiEvent::Status {
+        tab_id,
+        status: format!("Sesión {session_id} conectada"),
+    });
 
     // Reading and writing run as independent tasks: a `select!` over both
     // would cancel in-flight reads on every keystroke and desynchronize the
@@ -847,7 +1249,7 @@ async fn run_ipc(
             let message = reader.read_message::<ServerMessage>().await?.1;
             let exited = matches!(message, ServerMessage::Exited { .. });
             events
-                .send(UiEvent::Message(message))
+                .send(UiEvent::Message { tab_id, message })
                 .context("GUI closed")?;
             if exited {
                 return Ok::<(), anyhow::Error>(());

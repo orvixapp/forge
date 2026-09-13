@@ -11,7 +11,7 @@ use std::{fs, io, path::Path};
 /// Stable identifiers used by keymaps, the future command palette and CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShellCommand {
-    NewTerminalWindow,
+    NewTerminalTab,
     CloseWindow,
     ToggleMaximize,
     ShowCommandPalette,
@@ -22,14 +22,18 @@ pub enum ShellCommand {
 
 impl ShellCommand {
     pub const ALL: [Self; 7] = [
-        Self::NewTerminalWindow, Self::CloseWindow, Self::ToggleMaximize,
-        Self::ShowCommandPalette, Self::SplitHorizontal, Self::SplitVertical,
+        Self::NewTerminalTab,
+        Self::CloseWindow,
+        Self::ToggleMaximize,
+        Self::ShowCommandPalette,
+        Self::SplitHorizontal,
+        Self::SplitVertical,
         Self::FocusNextPane,
     ];
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
-            Self::NewTerminalWindow => "window.newTerminal",
+            Self::NewTerminalTab => "terminal.newTab",
             Self::CloseWindow => "window.close",
             Self::ToggleMaximize => "window.toggleMaximize",
             Self::ShowCommandPalette => "commandPalette.show",
@@ -42,7 +46,7 @@ impl ShellCommand {
     #[must_use]
     pub const fn title(self) -> &'static str {
         match self {
-            Self::NewTerminalWindow => "New terminal window",
+            Self::NewTerminalTab => "New terminal tab",
             Self::CloseWindow => "Close window",
             Self::ToggleMaximize => "Toggle maximized window",
             Self::ShowCommandPalette => "Show command palette",
@@ -51,25 +55,48 @@ impl ShellCommand {
             Self::FocusNextPane => "Focus next pane",
         }
     }
+
+    #[must_use]
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|command| command.id() == id)
+    }
+}
+
+/// User-owned binding declaration, accepted from `config.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserKeyBinding {
+    pub command: String,
+    pub keys: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PaletteMatch { pub command: ShellCommand, pub score: usize }
+pub struct PaletteMatch {
+    pub command: ShellCommand,
+    pub score: usize,
+}
 
 #[must_use]
 pub fn search_commands(query: &str) -> Vec<PaletteMatch> {
     let query = query.trim().to_ascii_lowercase();
-    let mut matches: Vec<_> = ShellCommand::ALL.into_iter().filter_map(|command| {
-        fuzzy_score(&query, command.title()).or_else(|| fuzzy_score(&query, command.id()))
-            .map(|score| PaletteMatch { command, score })
-    }).collect();
+    let mut matches: Vec<_> = ShellCommand::ALL
+        .into_iter()
+        .filter_map(|command| {
+            fuzzy_score(&query, command.title())
+                .or_else(|| fuzzy_score(&query, command.id()))
+                .map(|score| PaletteMatch { command, score })
+        })
+        .collect();
     matches.sort_by_key(|item| (item.score, item.command.title()));
     matches
 }
 
 fn fuzzy_score(query: &str, candidate: &str) -> Option<usize> {
-    if query.is_empty() { return Some(0); }
-    let mut chars = candidate.to_ascii_lowercase().chars();
+    if query.is_empty() {
+        return Some(0);
+    }
+    let lowercase = candidate.to_ascii_lowercase();
+    let mut chars = lowercase.chars();
     let mut skipped = 0;
     for wanted in query.chars() {
         loop {
@@ -413,7 +440,7 @@ impl Default for ShellKeymap {
         use ShellContext::*;
         Self {
             bindings: vec![
-                binding("t", true, false, false, Terminal, NewTerminalWindow),
+                binding("t", true, false, false, Terminal, NewTerminalTab),
                 binding("p", true, false, true, Window, ShowCommandPalette),
                 binding("w", true, false, false, Window, CloseWindow),
                 binding("\\", true, false, false, Window, SplitVertical),
@@ -425,6 +452,23 @@ impl Default for ShellKeymap {
 }
 
 impl ShellKeymap {
+    #[must_use]
+    pub fn with_overrides(mut self, overrides: &[UserKeyBinding]) -> Self {
+        for override_ in overrides {
+            let Some(command) = ShellCommand::from_id(&override_.command) else {
+                continue;
+            };
+            let Some(keystroke) = parse_keybinding(&override_.keys) else {
+                continue;
+            };
+            self.bindings.push(KeyBinding {
+                keystroke,
+                context: ShellContext::Window,
+                command,
+            });
+        }
+        self
+    }
     #[must_use]
     pub fn resolve(
         &self,
@@ -457,6 +501,27 @@ impl ShellKeymap {
     }
 }
 
+fn parse_keybinding(value: &str) -> Option<ShellKeystroke> {
+    let mut control = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut key = None;
+    for part in value
+        .split('+')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        match part.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => control = true,
+            "alt" => alt = true,
+            "shift" => shift = true,
+            candidate if key.is_none() => key = Some(candidate.to_owned()),
+            _ => return None,
+        }
+    }
+    key.map(|key| ShellKeystroke::new(key, control, alt, shift))
+}
+
 fn binding(
     key: &str,
     control: bool,
@@ -484,9 +549,9 @@ mod tests {
                 &ShellKeystroke::new("T", true, false, false),
                 ShellContext::Terminal
             ),
-            Some(ShellCommand::NewTerminalWindow)
+            Some(ShellCommand::NewTerminalTab)
         );
-        assert_eq!(ShellCommand::NewTerminalWindow.id(), "window.newTerminal");
+        assert_eq!(ShellCommand::NewTerminalTab.id(), "terminal.newTab");
     }
 
     #[test]
@@ -518,6 +583,21 @@ mod tests {
                 ShellContext::Terminal
             ),
             Some(ShellCommand::ShowCommandPalette)
+        );
+    }
+
+    #[test]
+    fn user_keybinding_overrides_the_default() {
+        let keymap = ShellKeymap::default().with_overrides(&[UserKeyBinding {
+            command: "terminal.newTab".into(),
+            keys: "ctrl+n".into(),
+        }]);
+        assert_eq!(
+            keymap.resolve(
+                &ShellKeystroke::new("n", true, false, false),
+                ShellContext::Terminal
+            ),
+            Some(ShellCommand::NewTerminalTab)
         );
     }
 
@@ -561,7 +641,10 @@ mod tests {
 
     #[test]
     fn palette_fuzzy_search_finds_new_terminal() {
-        assert_eq!(search_commands("new term").first().map(|item| item.command), Some(ShellCommand::NewTerminalWindow));
+        assert_eq!(
+            search_commands("new term").first().map(|item| item.command),
+            Some(ShellCommand::NewTerminalTab)
+        );
         assert!(search_commands("not a command").is_empty());
     }
 }

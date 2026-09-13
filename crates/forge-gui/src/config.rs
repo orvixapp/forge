@@ -4,6 +4,7 @@
 //! `$XDG_CONFIG_HOME/forge/config.toml` (`~/.config/forge/config.toml`).
 //! Every key is optional; a missing file yields the defaults below.
 
+use crate::shell::UserKeyBinding;
 use proto_ipc::Rgb;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,29 @@ pub struct Config {
     pub font: FontConfig,
     pub colors: ColorConfig,
     pub terminal: TerminalConfig,
+    pub ui: UiConfig,
+    pub keybindings: Vec<UserKeyBinding>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    Spanish,
+    English,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiConfig {
+    pub language: Language,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            language: Language::Spanish,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

@@ -44,15 +44,24 @@ en la Fase 2.
 
 - [x] Registro de comandos con IDs estables y títulos para window, palette y layout.
 - [x] Keymap con contextos `window`/`terminal`, precedencia determinista y pruebas.
-- [x] `Ctrl+T` usa el registro para abrir una nueva ventana terminal.
+- [x] `Ctrl+T` usa el registro para abrir una pestaña terminal real en la
+  misma ventana; cada pestaña crea su propia sesión, entrada y grid.
+- [x] `Ctrl+W` cierra la pestaña enfocada cuando hay más de una y `Ctrl+Tab`
+  cambia la pestaña activa.
 - [ ] Ejecutar el resto de comandos desde el estado de shell; la palette y el
   árbol de layout se incorporan en 1.2 y 1.5.
 
-### 1.2 — Núcleo completado; UI pendiente
+### 1.2 — En curso
 
 - [x] Árbol serializable de panes, tabs y splits H/V.
 - [x] Operaciones de dividir panel enfocado y recorrer el foco, con pruebas.
-- [ ] Renderer de árbol, pestañas visibles y comandos de layout conectados a la ventana.
+- [x] Barra de pestañas visible: activar, cerrar y crear con `+` sin abrir otra
+  ventana; la pestaña activa conserva la salida de su propia sesión.
+- [x] Los cambios de tamaño se distribuyen a todas las sesiones abiertas.
+- [x] Splits H/V renderizan dos sesiones reales; `Ctrl+\\` y `Ctrl+Shift+5`
+  crean el split y `Ctrl+Tab` alterna el foco entre sus paneles.
+- [ ] Renderer recursivo del árbol para más de dos paneles y cierre individual
+  de un panel sin desmontar el split.
 
 ### 1.3 — Núcleo completado; restauración al arranque pendiente
 
@@ -67,7 +76,38 @@ en la Fase 2.
 - [x] Loader JSONC por capas con precedencia defaults → usuario → workspace.
 - [x] Comentarios JSONC, merge profundo y rechazo de capas inválidas.
 - [x] `ShellSettings` inicial con tema, cubierto por prueba de precedencia.
+- [x] Configuración TOML de idioma de interfaz (`spanish`/`english`) y
+  sobrescritura de atajos por el usuario.
 - [ ] Schema publicado, watcher de recarga y aplicar tema/keymap activo sin reiniciar.
+
+Ejemplo para `~/.config/forge/config.toml` (o el archivo de `--config`):
+
+```toml
+[ui]
+language = "english" # o "spanish"
+
+[[keybindings]]
+command = "terminal.newTab"
+keys = "ctrl+n"
+
+[[keybindings]]
+command = "layout.splitVertical"
+keys = "ctrl+alt+v"
+```
+
+Los comandos disponibles son `terminal.newTab`, `window.close`,
+`window.toggleMaximize`, `commandPalette.show`, `layout.splitHorizontal`,
+`layout.splitVertical` y `layout.focusNextPane`. Una entrada inválida se ignora
+y conserva el atajo por defecto.
+
+### 1.5 — En curso
+
+- [x] Búsqueda fuzzy de comandos por título o ID, con prueba.
+- [x] `Ctrl+Shift+P` abre la palette; texto filtra y Escape la cierra.
+- [x] Overlay visible con consulta y hasta seis resultados fuzzy.
+- [x] Resultado de palette/notificaciones se comunica mediante la barra de estado.
+- [ ] Overlay navegable, ejecutar el comando seleccionado, diálogos nativos y
+  sistema de notificaciones con duración/prioridad.
 
 ## Convenciones de implementación
 
