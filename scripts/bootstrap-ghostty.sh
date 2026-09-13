@@ -26,9 +26,27 @@ if [ "$($ZIG_BIN version)" != "0.16.0" ]; then
 fi
 ZIG_BIN=$(command -v "$ZIG_BIN")
 
+STAMP="$PREFIX_DIR/.ghostty-commit"
+
+# A restored CI cache may contain the built library, or a half-pruned source
+# tree. Trust only a build stamped with this exact commit, and re-extract
+# whenever build.zig is missing.
+if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$GHOSTTY_COMMIT" ]; then
+    case "$(uname -s)" in
+        Darwin) EXISTING="$PREFIX_DIR/lib/libghostty-vt.dylib" ;;
+        Linux) EXISTING="$PREFIX_DIR/lib/libghostty-vt.so" ;;
+        *) EXISTING="$PREFIX_DIR/bin/ghostty-vt.dll" ;;
+    esac
+    if [ -f "$EXISTING" ]; then
+        echo "$EXISTING"
+        exit 0
+    fi
+fi
+
 mkdir -p "$TOOLS_DIR"
-if [ ! -d "$SOURCE_DIR" ]; then
-    if [ ! -f "$ARCHIVE" ]; then
+if [ ! -f "$SOURCE_DIR/build.zig" ]; then
+    rm -rf "$SOURCE_DIR"
+    if [ ! -f "$ARCHIVE" ] || ! tar -tzf "$ARCHIVE" >/dev/null 2>&1; then
         curl -fL \
             "https://github.com/ghostty-org/ghostty/archive/$GHOSTTY_COMMIT.tar.gz" \
             -o "$ARCHIVE"
@@ -63,4 +81,5 @@ if [ ! -f "$LIBRARY" ]; then
     exit 1
 fi
 
+echo "$GHOSTTY_COMMIT" > "$STAMP"
 echo "$LIBRARY"

@@ -600,7 +600,7 @@ impl ForgeWindow {
                 return;
             }
             "insert" if modifiers.shift && !modifiers.control => {
-                self.paste(cx.read_from_primary());
+                self.paste(read_primary(cx));
                 return;
             }
             _ => {}
@@ -817,7 +817,7 @@ impl ForgeWindow {
         }
         // Linux convention: a finished selection is available on middle click.
         if let Some(text) = self.selected_text() {
-            cx.write_to_primary(ClipboardItem::new_string(text));
+            write_primary(cx, ClipboardItem::new_string(text));
         }
     }
 
@@ -950,6 +950,25 @@ impl EntityInputHandler for ForgeWindow {
         None
     }
 }
+
+/// The X11/Wayland primary selection; other platforms have no equivalent.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn read_primary(cx: &App) -> Option<ClipboardItem> {
+    cx.read_from_primary()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+fn read_primary(cx: &App) -> Option<ClipboardItem> {
+    cx.read_from_clipboard()
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn write_primary(cx: &App, item: ClipboardItem) {
+    cx.write_to_primary(item);
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+fn write_primary(_cx: &App, _item: ClipboardItem) {}
 
 /// Theme from the factory's config, with config colour overrides applied.
 /// An unknown theme falls back to `forge-dark` and says so on stderr.

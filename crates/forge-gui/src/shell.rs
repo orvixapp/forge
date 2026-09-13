@@ -305,6 +305,15 @@ fn binding(
     }
 }
 
+/// Axis-aligned rectangle in logical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitDirection {
@@ -394,6 +403,55 @@ impl PaneTree {
                 }),
                 (remaining, None) | (None, remaining) => remaining,
             },
+        }
+    }
+
+    /// Rectangles of every leaf inside `area`, splitting each node in half
+    /// with `gap` pixels between the halves. Computed here rather than with
+    /// nested flex containers because flex layout cost grows with nesting
+    /// depth, and a terminal multiplexer wants explicit geometry anyway.
+    #[must_use]
+    pub fn layout(&self, area: Rect, gap: f32) -> Vec<(usize, Rect)> {
+        let mut out = Vec::new();
+        self.layout_into(area, gap, &mut out);
+        out
+    }
+
+    fn layout_into(&self, area: Rect, gap: f32, out: &mut Vec<(usize, Rect)>) {
+        match self {
+            Self::Leaf { index } => out.push((*index, area)),
+            Self::Split {
+                direction,
+                first,
+                second,
+            } => {
+                let (a, b) = match direction {
+                    SplitDirection::Vertical => {
+                        let width = ((area.width - gap) / 2.0).max(0.0);
+                        (
+                            Rect { width, ..area },
+                            Rect {
+                                x: area.x + width + gap,
+                                width,
+                                ..area
+                            },
+                        )
+                    }
+                    SplitDirection::Horizontal => {
+                        let height = ((area.height - gap) / 2.0).max(0.0);
+                        (
+                            Rect { height, ..area },
+                            Rect {
+                                y: area.y + height + gap,
+                                height,
+                                ..area
+                            },
+                        )
+                    }
+                };
+                first.layout_into(a, gap, out);
+                second.layout_into(b, gap, out);
+            }
         }
     }
 
@@ -631,6 +689,62 @@ mod tests {
         let restored: PaneTree = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(restored, tree);
         assert_eq!(PaneTree::leaf(0).remove(0), None);
+    }
+
+    #[test]
+    fn layout_halves_the_area_and_keeps_the_gap() {
+        let mut tree = PaneTree::leaf(0);
+        tree.split(0, 1, SplitDirection::Vertical);
+        tree.split(1, 2, SplitDirection::Horizontal);
+        let area = Rect {
+            x: 10.0,
+            y: 20.0,
+            width: 202.0,
+            height: 102.0,
+        };
+        let rects = tree.layout(area, 2.0);
+        assert_eq!(rects.len(), 3);
+        assert_eq!(
+            rects[0],
+            (
+                0,
+                Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 100.0,
+                    height: 102.0
+                }
+            )
+        );
+        assert_eq!(
+            rects[1],
+            (
+                1,
+                Rect {
+                    x: 112.0,
+                    y: 20.0,
+                    width: 100.0,
+                    height: 50.0
+                }
+            )
+        );
+        assert_eq!(
+            rects[2],
+            (
+                2,
+                Rect {
+                    x: 112.0,
+                    y: 72.0,
+                    width: 100.0,
+                    height: 50.0
+                }
+            )
+        );
+        let tiny = tree.layout(Rect::default(), 2.0);
+        assert!(
+            tiny.iter()
+                .all(|(_, rect)| rect.width >= 0.0 && rect.height >= 0.0)
+        );
     }
 
     #[test]

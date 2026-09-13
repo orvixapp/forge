@@ -353,6 +353,9 @@ pub struct TerminalGridElement<V: EntityInputHandler> {
     /// When set, this pane receives IME text (dead keys, CJK composition)
     /// through the view's [`EntityInputHandler`].
     input_focus: Option<FocusHandle>,
+    /// Space between the element's edge and the grid, painted here instead
+    /// of with a wrapping element.
+    padding: Pixels,
 }
 
 impl<V: EntityInputHandler> TerminalGridElement<V> {
@@ -369,7 +372,14 @@ impl<V: EntityInputHandler> TerminalGridElement<V> {
             index,
             surface,
             input_focus: None,
+            padding: px(0.0),
         }
+    }
+
+    #[must_use]
+    pub fn with_padding(mut self, padding: Pixels) -> Self {
+        self.padding = padding;
+        self
     }
 
     /// Registers the pane as the window's text input target while `focus`
@@ -408,14 +418,13 @@ impl<V: EntityInputHandler> Element for TerminalGridElement<V> {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        // Grow into the parent flex box instead of asking for 100%, which
-        // makes taffy resolve the parent first and re-measure nested splits.
-        let mut style = Style::default();
-        style.flex_grow = 1.0;
-        style.flex_shrink = 1.0;
-        style.flex_basis = px(0.0).into();
-        style.min_size.width = px(0.0).into();
-        style.min_size.height = px(0.0).into();
+        let style = Style {
+            flex_grow: 1.0,
+            flex_shrink: 1.0,
+            flex_basis: px(0.0).into(),
+            min_size: size(px(0.0).into(), px(0.0).into()),
+            ..Style::default()
+        };
         (window.request_layout(style, [], cx), ())
     }
 
@@ -442,15 +451,16 @@ impl<V: EntityInputHandler> Element for TerminalGridElement<V> {
     ) {
         let surface = self.surface;
         let index = self.index;
+        let inner = inset(bounds, self.padding);
         if let Some(focus) = &self.input_focus {
             window.handle_input(
                 focus,
-                ElementInputHandler::new(bounds, self.view.clone()),
+                ElementInputHandler::new(inner, self.view.clone()),
                 cx,
             );
         }
         self.view.update(cx, |view, _| {
-            paint_grid(surface(view, index, bounds), bounds, window);
+            paint_grid(surface(view, index, inner), inner, window);
         });
     }
 }
@@ -672,6 +682,13 @@ fn paint_glyphs(
             }
         });
     }
+}
+
+/// `bounds` shrunk by `padding` on every side, never below zero size.
+fn inset(bounds: Bounds<Pixels>, padding: Pixels) -> Bounds<Pixels> {
+    let width = (bounds.size.width - padding * 2.0).max(px(0.0));
+    let height = (bounds.size.height - padding * 2.0).max(px(0.0));
+    Bounds::new(bounds.origin + point(padding, padding), size(width, height))
 }
 
 /// Column and row ranges of the grid that intersect `visible`.

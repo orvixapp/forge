@@ -8,7 +8,7 @@ use crate::{
 };
 use forge_gui::{
     config::Language,
-    shell::{PaneTree, ShellCommand, SplitDirection, search_commands},
+    shell::{PaneTree, Rect, ShellCommand, search_commands},
 };
 use gpui::{
     AnyElement, Context, CursorStyle, ImageSource, MouseButton, ResizeEdge, Resource, SharedString,
@@ -54,7 +54,7 @@ pub fn render_window(
         .text_color(color(theme.foreground))
         .font_family(view.config.font.family.clone())
         .child(topbar(view, cx))
-        .child(panes(view, &tree, cx))
+        .child(panes(view, &tree, window, cx))
         .when(view.process_explorer, |root| {
             root.child(process_explorer(view, cx))
         })
@@ -174,18 +174,20 @@ fn tab_button(
         .hover(move |style| style.bg(color(theme.chrome_active)))
         .on_click(cx.listener(move |view, _, _, cx| view.activate_tab(index, cx)))
         .child(div().flex_1().overflow_hidden().child(title.to_string()))
-        .child(
-            div()
-                .id(SharedString::from(format!("terminal-tab-close-{id}")))
-                .size(px(16.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(3.0))
-                .hover(move |style| style.bg(color(theme.chrome_active_border)))
-                .on_click(cx.listener(move |view, _, _, cx| view.close_tab(index, cx)))
-                .child("×"),
-        )
+        .when(active, |tab| {
+            tab.child(
+                div()
+                    .id(SharedString::from(format!("terminal-tab-close-{id}")))
+                    .size(px(16.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(3.0))
+                    .hover(move |style| style.bg(color(theme.chrome_active_border)))
+                    .on_click(cx.listener(move |view, _, _, cx| view.close_tab(index, cx)))
+                    .child("×"),
+            )
+        })
 }
 
 /// Latest notification, or the new-tab hint when there is none.
@@ -241,28 +243,45 @@ fn chrome_button(
         .child(label)
 }
 
-fn panes(view: &ForgeWindow, tree: &PaneTree, cx: &mut Context<ForgeWindow>) -> AnyElement {
-    match tree {
-        PaneTree::Leaf { index } => pane_leaf(view, *index, cx),
-        PaneTree::Split {
-            direction,
-            first,
-            second,
-        } => div()
-            .flex()
-            .flex_1()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
-            .when(*direction == SplitDirection::Horizontal, |area| {
-                area.flex_col()
-            })
-            .child(panes(view, first, cx))
-            .child(panes(view, second, cx))
-            .into_any_element(),
-    }
+/// Gap between split panes, in pixels.
+const PANE_GAP: f32 = 2.0;
+
+/// Panes are absolutely positioned from geometry computed by `PaneTree`:
+/// one flat container instead of nested flex boxes, whose layout cost grows
+/// with the depth of the split tree.
+fn panes(
+    view: &ForgeWindow,
+    tree: &PaneTree,
+    window: &Window,
+    cx: &mut Context<ForgeWindow>,
+) -> AnyElement {
+    let viewport = window.viewport_size();
+    let area = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: f32::from(viewport.width),
+        height: (f32::from(viewport.height) - TOPBAR_HEIGHT).max(0.0),
+    };
+    let rects = tree.layout(area, PANE_GAP);
+    div()
+        .relative()
+        .flex_1()
+        .min_h(px(0.0))
+        .w_full()
+        .children(
+            rects
+                .into_iter()
+                .map(|(index, rect)| pane_leaf(view, index, rect, cx)),
+        )
+        .into_any_element()
 }
 
-fn pane_leaf(view: &ForgeWindow, index: usize, cx: &mut Context<ForgeWindow>) -> AnyElement {
+fn pane_leaf(
+    view: &ForgeWindow,
+    index: usize,
+    rect: Rect,
+    cx: &mut Context<ForgeWindow>,
+) -> AnyElement {
     let theme = view.theme;
     let active = index == view.active_tab;
     let tab = &view.tabs[index];
@@ -271,15 +290,18 @@ fn pane_leaf(view: &ForgeWindow, index: usize, cx: &mut Context<ForgeWindow>) ->
         Some(marked) if active => format!("{cols}×{rows} · {} · IME: {marked}", tab.status),
         _ => format!("{cols}×{rows} · {}", tab.status),
     };
-    let mut grid = TerminalGridElement::new(cx.entity(), index, ForgeWindow::pane_surface);
+    let mut grid = TerminalGridElement::new(cx.entity(), index, ForgeWindow::pane_surface)
+        .with_padding(px(view.config.terminal.padding));
     if active {
         grid = grid.with_input_focus(view.focus.clone());
     }
     div()
         .id(("pane", index))
-        .flex_1()
-        .min_w(px(0.0))
-        .min_h(px(0.0))
+        .absolute()
+        .left(px(rect.x))
+        .top(px(rect.y))
+        .w(px(rect.width))
+        .h(px(rect.height))
         .flex()
         .flex_col()
         .overflow_hidden()
@@ -290,17 +312,10 @@ fn pane_leaf(view: &ForgeWindow, index: usize, cx: &mut Context<ForgeWindow>) ->
             theme.chrome_border
         }))
         .cursor(CursorStyle::IBeam)
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h(px(0.0))
-                .overflow_hidden()
-                .p(px(view.config.terminal.padding))
-                .child(grid),
-        )
-        .when(view.config.terminal.show_status, |pane| {
+        .child(grid)
+        // The status line belongs to the focused pane; inactive panes keep
+        // every pixel for their grid.
+        .when(view.config.terminal.show_status && active, |pane| {
             pane.child(
                 div()
                     .h(px(STATUS_HEIGHT))

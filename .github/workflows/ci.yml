@@ -4,9 +4,13 @@ on:
   push:
   pull_request:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   rust:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -17,6 +21,12 @@ jobs:
           toolchain: 1.98.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Linux build dependencies (GPUI)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev \
+            libwayland-dev libx11-xcb-dev libvulkan-dev libasound2-dev libzstd-dev
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
@@ -36,3 +46,41 @@ jobs:
       - run: cargo test -p proto-termd --test terminal_round_trip
         env:
           FORGE_GHOSTTY_LIB: target/ghostty/lib/libghostty-vt.so
+
+  # Shell benchmarks under Xvfb + lavapipe. Budgets in bench/thresholds.ci.toml
+  # are calibrated for the hosted runner; the product targets live in
+  # bench/thresholds.toml and are measured on the reference machines.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-release
+      - name: Build and runtime dependencies (GPUI, Xvfb, software Vulkan)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev \
+            libwayland-dev libx11-xcb-dev libvulkan-dev libasound2-dev libzstd-dev \
+            xvfb mesa-vulkan-drivers libvulkan1 vulkan-tools fonts-dejavu-core
+      - run: cargo build --release -p forge-gui -p forge-bench
+      - name: Vulkan device visible to the runner
+        run: xvfb-run -a vulkaninfo --summary | grep -E "deviceName|driverName" || true
+      - name: startup_empty
+        run: xvfb-run -a -s "-screen 0 1600x900x24" target/release/forge-bench startup_empty --iterations 5 --check --thresholds bench/thresholds.ci.toml --output bench/results/ci-startup_empty.json
+      - name: panes_20
+        run: xvfb-run -a -s "-screen 0 1600x900x24" target/release/forge-bench panes_20 --iterations 120 --check --thresholds bench/thresholds.ci.toml --output bench/results/ci-panes_20.json
+      - name: grid_full
+        run: xvfb-run -a -s "-screen 0 1600x900x24" target/release/forge-bench grid_full --iterations 120 --check --thresholds bench/thresholds.ci.toml --output bench/results/ci-grid_full.json
+      - name: idle (60 s, must not redraw)
+        run: xvfb-run -a -s "-screen 0 1600x900x24" target/release/forge-bench idle --check --thresholds bench/thresholds.ci.toml --output bench/results/ci-idle.json
+      - name: ipc_round_trip
+        run: target/release/forge-bench ipc_round_trip --iterations 10000 --check --thresholds bench/thresholds.ci.toml --output bench/results/ci-ipc_round_trip.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: bench/results/ci-*.json
