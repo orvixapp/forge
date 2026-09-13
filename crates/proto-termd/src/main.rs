@@ -186,6 +186,7 @@ mod unix {
             &self,
             command: String,
             args: Vec<String>,
+            cwd: PathBuf,
             cols: u16,
             rows: u16,
         ) -> Result<u64> {
@@ -198,6 +199,7 @@ mod unix {
                 })
                 .context("open PTY")?;
             let mut builder = CommandBuilder::new(command);
+            builder.cwd(cwd);
             for arg in args {
                 builder.arg(arg);
             }
@@ -483,10 +485,13 @@ mod unix {
                 request_id,
                 command,
                 args,
+                cwd,
                 cols,
                 rows,
             } => {
-                let session_id = daemon.create_session(command, args, cols, rows).await?;
+                let session_id = daemon
+                    .create_session(command, args, cwd, cols, rows)
+                    .await?;
                 out_tx
                     .send((
                         FrameKind::Response,

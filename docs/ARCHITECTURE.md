@@ -1,6 +1,6 @@
 # Forge — Architecture & Engineering Plan
 
-**Versión:** 0.1 (borrador para revisión) · **Fecha:** 2026-09-13 · **Autor:** arquitectura (Claude, sesión de diseño) · **Estado:** sin código; solo decisiones, hipótesis y plan de validación.
+**Versión:** 0.2 (borrador para revisión) · **Fecha:** 2026-09-13 · **Autor:** arquitectura (Claude, sesión de diseño) · **Estado:** prototipo de Fase 0 en curso (`bench/results/`); decisiones, hipótesis y plan de validación. 0.2 añade la tesis humano + agente (§1, §17.7–§17.9).
 
 > Filosofía: **el usuario controla el entorno, los procesos se aíslan y nada se carga hasta que realmente se necesita.**
 
@@ -13,12 +13,15 @@ Cada decisión lleva una etiqueta:
 | **[DECIDIDO]** | Hay razones suficientes para comprometerse ya. Cambiarlo más tarde es caro. |
 | **[RECOMENDADO → prototipo]** | Hay una recomendación clara, pero se valida en Fase 0/1 antes de construir encima. |
 | **[ABIERTO]** | No hay que decidirlo todavía; decidirlo ahora sería adivinar. Ver la sección final. |
+| **[VERIFICAR]** | Afirmación sobre un tercero tomada de una fuente no contrastada (p. ej. una conversación con un modelo); comprobar contra su documentación antes de construir sobre ella. |
 
 Los números de rendimiento son **objetivos con método de medición**, no promesas. Los baselines reales de VS Code, Zed, Neovim, Helix, Alacritty, Kitty y Ghostty se miden en Fase 0 en las máquinas de referencia (§5.1) y se corrigen los objetivos si hace falta.
 
 ## 1. Resumen ejecutivo
 
 Forge es un entorno de desarrollo **terminal-first** para trabajo asistido por agentes: un emulador de terminal de primera clase, un editor de código rápido, integración nativa con agentes (Claude Code, Codex, OpenCode, Gemini CLI y cualquiera que hable ACP), soporte LSP y Git, y una capa de compatibilidad progresiva con extensiones de VS Code. No es un fork de VS Code ni usa Electron.
+
+**Tesis del producto:** Forge no es "un editor con IA" sino un **entorno de desarrollo para humano + agente**: el mejor sitio para trabajar con agentes de programación sin hacerle la vida incómoda al humano. Humano y agente ven **el mismo workspace, el mismo estado y las mismas herramientas** (archivos, buffers sin guardar, terminal, git, LSP, búsqueda); el humano conserva teclado, terminal, atajos y personalización; el agente recibe contexto y herramientas sin copiar y pegar. Forge **no compite con Codex ni con Claude Code**: les da el entorno. Se detalla en §17.7–§17.9.
 
 **Decisiones centrales (resumen):**
 
@@ -32,6 +35,7 @@ Forge es un entorno de desarrollo **terminal-first** para trabajo asistido por a
 8. **Extensiones VS Code en Node.js real** (bundled, versión fijada), con nuestra propia implementación TypeScript del namespace `vscode` guiada por un **escáner de uso de API** sobre las 1.000 extensiones más instaladas de Open VSX. Sin QuickJS ni V8 embebido para esto. **[DECIDIDO]** El registro es **Open VSX** (los ToS del Marketplace de Microsoft lo prohíben). **[DECIDIDO]**
 9. **Configuración como datos (JSONC + JSON Schema), no como código.** Sin lenguaje de scripting en v1. Las automatizaciones se expresan como comandos y macros. **[RECOMENDADO → confirmar antes de tener usuarios]**
 10. **Rendimiento como restricción continua, no como fase.** La suite de benchmarks es un crate del workspace desde la Fase 1 y corre en CI con umbrales. La "Fase 10: optimización extrema" del brief se elimina. **[DECIDIDO]**
+11. **Modelos intercambiables sin cliente LLM propio.** Las suscripciones existentes (ChatGPT → Codex, Anthropic → Claude Code), los gateways compatibles con OpenAI (p. ej. Token Harbor) y los modelos locales (llama.cpp) son **perfiles de proveedor** que Forge inyecta en la configuración de los agentes, y un **enrutador por clase de tarea** (trivial / normal / compleja / sin red) decide qué agente y qué perfil atienden cada petición. Forge no llama a APIs de modelos por sí mismo. **[RECOMENDADO → Fase 4]**
 
 **Coste honesto:** un equipo de 2–4 ingenieros senior con agentes de programación tarda del orden de **12–15 meses** en llegar a la Fase 8 (extension host con extensiones de lenguaje reales funcionando). La compatibilidad VS Code es una cola abierta que nunca llega al 100% y que hay que dimensionar con datos (§20.3), no con optimismo.
 
@@ -61,6 +65,8 @@ El brief es bueno. Estas son las partes que no aceptaría tal cual:
 | Terminal de primera clase, usable como emulador diario desde el primer mes | Dogfooding del equipo; paridad de vtebench con Alacritty ±20%; latencia de input <16 ms bajo flood |
 | Editor rápido en repos grandes | Abrir el kernel de Linux (~80k archivos) y editar con latencia de tecleo indistinguible de un archivo pequeño; archivo de 1 GB visible en <500 ms |
 | Agentes como ciudadanos de primera clase, desacoplados | Cualquier agente ACP funciona sin código específico; Claude Code, Codex, OpenCode y Gemini CLI probados en CI |
+| Humano y agente comparten estado y herramientas | Toda herramienta del humano (búsqueda, LSP, git, terminal, tareas) es un comando expuesto al agente por MCP; el agente ve buffers sin guardar; la traza de tool calls es visible y navegable; "investigar este error" llega al agente con archivo, línea, diagnóstico, diff y salida de terminal sin copiar nada |
+| Aprovechar suscripciones y modelos baratos | Codex con la cuenta de ChatGPT del usuario sin configuración extra; una tarea trivial enrutada a un modelo gratuito/local **no consume cuota** de la suscripción; el usuario ve qué ruta atendió cada petición |
 | Compatibilidad VS Code medible y creciente | Dashboard público de cobertura de API; top-50 extensiones de lenguaje funcionando en Fase 7 |
 | RAM baja y **predecible** | Presupuestos por componente con límites duros (§24); "process explorer" integrado |
 | Personalización profunda sin caos | Todo es un comando; todo comando es enlazable; toda opción tiene schema y aparece en el buscador de settings |
@@ -83,6 +89,8 @@ Explícitamente **fuera** de alcance para v1 (algunos para siempre):
 - **Renderer CPU propio.** Solo GPU vía wgpu + driver software de Mesa como degradado.
 - **Accesibilidad completa en v1.** No es aceptable ignorarla arquitectónicamente (se elige framework con camino a AccessKit) pero no bloquea el roadmap hasta Fase 8.
 - **Telemetría remota.** Métricas locales, opt-in, exportables por el usuario.
+- **Un agente propio que compita con Codex o Claude Code.** Forge orquesta agentes y les da el entorno; un agente interno mínimo solo se consideraría si un proveedor no tuviera ningún agente ACP, y como último recurso **[ABIERTO]**.
+- **Un cliente de APIs de LLM en el núcleo.** Los modelos se alcanzan a través de los agentes (§17.7).
 
 ---
 
@@ -113,7 +121,7 @@ Prioridad: **P0** = necesario para el MVP terminal-first (fases 1–4); **P1** =
 ### 4.4 LSP / Git / Agentes / MCP / Extensiones
 - LSP P1: multi-servidor por lenguaje, completion/hover/definition/references/rename/diagnostics (push y pull)/format/code actions/signature help/inlay/semantic tokens/workspace symbols/watched files, cancelación y coalescing, registro de servidores por lenguaje, instalación asistida (P2).
 - Git P1: status/diff en gutter, blame, log de archivo, staging por hunk, commit, branches, stash, conflictos con editor de 3 vías, **worktrees** (los agentes los usan).
-- Agentes P0: sesiones ACP, prompt con contexto (selección, archivo, @-menciones), streaming de respuesta, tool calls visibles, **permisos** con opciones recordables, **ediciones propuestas** revisables hunk a hunk antes de tocar disco, terminales creadas por el agente en `forge-termd` y visibles al usuario, cancelación, resume (`session/load`), modos (plan/edit/auto), varios agentes en paralelo (por worktree).
+- Agentes P0: sesiones ACP, prompt con contexto (selección, archivo, @-menciones), streaming de respuesta, tool calls visibles, **permisos** con opciones recordables, **ediciones propuestas** revisables hunk a hunk antes de tocar disco, terminales creadas por el agente en `forge-termd` y visibles al usuario, cancelación, resume (`session/load`), modos (plan/edit/auto), varios agentes en paralelo (por worktree). P1: perfiles de proveedor y enrutamiento por clase de tarea (§17.7), acciones contextuales `agent.ask`/`agent.investigate` desde selección, diagnóstico, terminal y diff (§17.8), línea de tiempo de herramientas (§17.9).
 - MCP P1: config de servidores (stdio/HTTP) por usuario/workspace, passthrough a agentes por ACP, Forge como servidor MCP (herramientas: archivos abiertos, contenido de buffers, diagnósticos, símbolos, git status, ejecutar comando en terminal con permiso).
 - Extensiones P1/P2: instalación desde Open VSX/VSIX, `contributes` declarativos (temas, gramáticas, snippets, comandos, configuración, keybindings, lenguajes), Node host, API `vscode` por tiers (§20), aislamiento, límites, reinicio.
 
@@ -705,6 +713,64 @@ Esto es lo que Zed y Cursor hacen; la diferencia es que aquí es un mecanismo ge
 
 Varias sesiones simultáneas; por defecto cada sesión con permisos de escritura recibe un **worktree** propio (opción `agent.isolation = worktree | shared`), lo que evita que dos agentes pisen el mismo árbol. Presupuesto de UI: el streaming de N sesiones se renderiza con virtualización (solo la sesión visible se pinta por token; las demás actualizan contadores).
 
+### 17.7 Proveedores de modelos y enrutamiento por clase de tarea **[RECOMENDADO → Fase 4]**
+
+El agente es el que habla con el modelo; Forge decide **qué agente con qué proveedor** atiende cada petición. Tres capas:
+
+```text
+  petición ("instálame ripgrep" · "refactoriza reports/" · Ctrl+K sobre una selección)
+      │
+      ▼
+  Router: clase de tarea ──► (agente, perfil de proveedor, modelo)
+      │        trivial  → agente barato + modelo gratuito/local
+      │        normal   → gateway con enrutado propio
+      │        compleja → Codex con la suscripción de ChatGPT / Claude Code
+      │        sin red  → modelo local
+      ▼
+  Agente ACP (Codex · Claude Code · OpenCode · …) lanzado con el perfil inyectado
+      │
+      ▼
+  Proveedor: ChatGPT/OpenAI · gateway OpenAI-compatible (Token Harbor…) · Anthropic · llama.cpp/ollama
+```
+
+- **Perfiles de proveedor** (`agents.jsonc`, §22.3): tipo (`chatgpt`, `openai-compatible`, `anthropic`, `local`), endpoint, credencial (por keyring del SO o `env`), modelo por defecto, coste declarado (`free | subscription | metered`) y límites conocidos. Forge **no** implementa clientes HTTP de modelos: traduce el perfil a lo que cada agente entiende (Codex: `model_providers` + login con ChatGPT; OpenCode: `provider`; Claude Code: `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` o su config de gateway) y lo pasa por env allowlist o archivo de config temporal al lanzar el proceso.
+- **Clases de tarea**: `trivial`, `normal`, `complex`, `offline` (extensible). La clase la fija, en este orden, (1) el usuario (`/trivial`, `/codex`, palette, atajo), (2) el comando que originó la petición (`agent.explain` es trivial; `agent.investigate` con diagnóstico + diff es normal; `agent.refactor` sobre varios archivos es compleja), (3) una heurística local barata (tamaño del contexto, número de archivos, presencia de tests). No hay un LLM clasificando peticiones en v1.
+- **Transparencia**: cada mensaje del panel muestra ruta, agente y coste declarado; el usuario puede reenviar la misma petición por otra ruta con un clic. Si el agente expone uso o cuota (Codex con plan de ChatGPT), se muestra.
+- **Fallback**: proveedor caído o cuota agotada → siguiente ruta compatible de la misma clase, avisando; `offline` es el último escalón.
+- **Token Harbor** como ejemplo de gateway: según la conversación que origina esta sección, ofrece una API compatible con OpenAI, rutas gratuitas seleccionadas, un modelo orquestador (`th-orchestra`) para fases de planificación/construcción/revisión y un conector oficial para Codex, Claude Code y OpenCode. **[VERIFICAR]** contra su documentación antes de la Fase 4; el diseño no depende de ello (cualquier endpoint compatible con OpenAI encaja en `openai-compatible`).
+
+### 17.8 Acciones contextuales: la IA en el flujo, no en un panel **[RECOMENDADO → Fase 4]**
+
+Sin "AI panel" omnipresente. El agente se invoca desde donde está el trabajo y llega como **una superficie más** (pane, dock o split; `Ctrl+Shift+A` lo abre o lo enfoca), no como una barra fija.
+
+| Origen | Comando (§6.1 principio 3) | Contexto que se adjunta solo |
+|---|---|---|
+| Selección en el editor + `Ctrl+K` | `agent.ask` (explicar / cambiar / preguntar) | archivo, rango, texto seleccionado, símbolos del rango vía LSP |
+| Diagnóstico LSP (gutter, hover, panel de problemas) | `agent.investigate` | archivo, línea, diagnóstico, definición/referencias del símbolo, `git diff` del archivo |
+| Error en la terminal (OSC 133: comando con exit ≠ 0) | `agent.investigate` | comando, salida limpia, cwd, diff del workspace |
+| Test fallido (tasks/`tasks.json`) | `agent.investigate` | salida del test, archivos tocados según el diff |
+| Hunk en diff review | `agent.ask` | hunk, archivo, propuesta original |
+| Palette / `forge --command agent.prompt` | `agent.prompt` | lo que el usuario escriba + @-menciones |
+
+Reglas: el usuario **ve exactamente** el contexto antes de enviarlo (§17.4) y puede quitar piezas; el contexto se construye con los mismos comandos que expone MCP (§18), así que no hay una segunda implementación; el comando fija la clase de tarea por defecto (§17.7). Las respuestas con ediciones entran en el overlay de ediciones propuestas (§17.5); las respuestas con acciones (ejecutar tests) pasan por `PermissionBroker`.
+
+### 17.9 Una sola caja de herramientas para humano y agente **[DECIDIDO]**
+
+Cada capacidad que Forge implementa para el humano es un comando con schema, y ese mismo comando es una tool para el agente vía `forge mcp-server` (§18). No existe una "API de herramientas para IA" separada.
+
+| Herramienta | Humano | Agente (MCP) | Fase |
+|---|---|---|---|
+| Archivos y buffers | explorador, editor | `forge/read_buffer` (incluye no guardado), `forge/propose_edit` | 4 |
+| Terminal | `forge-termd`, pestañas | `terminal/*` de ACP y `forge/run_in_terminal` con permiso | 4 |
+| Git | gutters, staging, worktrees | `forge/git_status`, `forge/git_diff`, worktree por sesión | 4 (status/diff), 6 |
+| Búsqueda | palette, buscar en workspace | `forge/search` (mismo índice) | 4 |
+| LSP | diagnósticos, navegación | `forge/diagnostics`, `forge/workspace_symbols`, definición/referencias | 5 |
+| Tareas y paquetes | `tasks.json`, gestor de paquetes detectado | `forge/run_task` con permiso | 5–7 |
+| Docker / navegador | **[ABIERTO]**: solo si un uso real lo justifica; antes, vía MCP servers de terceros | 9 |
+| MCP de terceros | config §18 | passthrough por ACP | 4 |
+
+Lo que el agente hace con esas herramientas se muestra como **línea de tiempo** en su superficie (leyó 12 archivos, modificó `reports/query.go`, tests en verde, "Revisar cambios"), con cada entrada navegable al archivo, hunk o terminal correspondiente. Es la misma información que la traza `session/update`, no una segunda fuente.
+
 ---
 
 ## 18. MCP
@@ -837,7 +903,26 @@ Cada valor resuelto sabe de qué capa viene (la UI lo muestra; "¿por qué está
 
 ### 22.3 Qué se configura
 
-`settings.jsonc` (comportamiento), `keymap.jsonc` (bindings con `when`, chords, modos), `layout.jsonc` (árbol de panes/docks por defecto y por workspace), `themes/*.jsonc`, `languages.jsonc` (registro §15), `agents.jsonc` (agentes y MCP servers), `tasks.jsonc` (compatible con `tasks.json` de VS Code), `profiles/`. El workspace puede aportar `.forge/{settings,keymap,tasks,agents}.jsonc` bajo trust.
+`settings.jsonc` (comportamiento), `keymap.jsonc` (bindings con `when`, chords, modos), `layout.jsonc` (árbol de panes/docks por defecto y por workspace), `themes/*.jsonc`, `languages.jsonc` (registro §15), `agents.jsonc` (agentes, proveedores de modelos, enrutamiento y MCP servers), `tasks.jsonc` (compatible con `tasks.json` de VS Code), `profiles/`. El workspace puede aportar `.forge/{settings,keymap,tasks,agents}.jsonc` bajo trust.
+
+Forma de `agents.jsonc` para proveedores y enrutamiento (§17.7):
+
+```jsonc
+{
+  "providers": {
+    "openai":      { "type": "chatgpt", "agent": "codex", "cost": "subscription" },
+    "tokenharbor": { "type": "openai-compatible", "endpoint": "https://…/v1",
+                     "credential": "keyring:tokenharbor", "model": "deepseek-v4-flash:free", "cost": "free" },
+    "local":       { "type": "local", "endpoint": "http://127.0.0.1:8080/v1", "cost": "free" }
+  },
+  "routing": {
+    "trivial": { "agent": "opencode", "provider": "tokenharbor" },
+    "normal":  { "agent": "opencode", "provider": "tokenharbor", "model": "th-orchestra" },
+    "complex": { "agent": "codex",    "provider": "openai" },
+    "offline": { "agent": "opencode", "provider": "local" }
+  }
+}
+```
 
 ### 22.4 Comandos, macros, workflows
 
@@ -1058,12 +1143,12 @@ Transversal desde Fase 1: presupuestos de rendimiento en CI, crash recovery, pro
 
 - **Objetivo**: el MVP terminal-first: agentes trabajando en el workspace con revisión.
 - **Arquitectura**: `forge-agent`, `forge-mcp`, overlay de ediciones propuestas en `forge-buffer`, `PermissionBroker`.
-- **Tareas**: cliente ACP completo (initialize/auth/new/load/prompt/cancel/set_mode/update); panel de sesión con streaming virtualizado, tool calls, planes; `fs/*` sobre buffers; `terminal/*` sobre termd con pestañas visibles; permisos con política y tarjetas; overlay + diff review + rebase; contexto (@archivo, selección, salida de terminal); registro de agentes + ACP registry; MCP cliente (config + passthrough) y `forge mcp-server` con las tools iniciales; worktree por sesión; pruebas nightly con Claude Code, Codex, OpenCode, Gemini CLI.
+- **Tareas**: cliente ACP completo (initialize/auth/new/load/prompt/cancel/set_mode/update); panel de sesión con streaming virtualizado, tool calls, planes; `fs/*` sobre buffers; `terminal/*` sobre termd con pestañas visibles; permisos con política y tarjetas; overlay + diff review + rebase; contexto (@archivo, selección, salida de terminal); registro de agentes + ACP registry; MCP cliente (config + passthrough) y `forge mcp-server` con las tools iniciales; worktree por sesión; **perfiles de proveedor** inyectados a Codex/OpenCode/Claude Code y **router** por clase de tarea con ruta visible y reenvío (§17.7); **acciones contextuales** `agent.ask` (`Ctrl+K`) y `agent.investigate` desde diagnóstico y desde comando fallido en terminal (§17.8); superficie del agente como pane (`Ctrl+Shift+A`) con línea de tiempo de herramientas (§17.9); pruebas nightly con Claude Code, Codex, OpenCode, Gemini CLI.
 - **Dependencias**: Fases 2 y 3.
 - **Riesgos**: diferencias de implementación ACP entre agentes (capacidades opcionales); rebase de propuestas sobre ediciones concurrentes; agentes que escriben a disco por su cuenta ignorando `fs/write_text_file` (se detecta por watcher y se muestra como diff externo).
 - **Benchmark**: overhead de Forge por `session/update` ≤ 0,2 ms; render de 10k tokens/min sin frames perdidos; 4 sesiones paralelas sin degradar tecleo.
-- **Aceptación**: flujo completo "pedir cambio → ver diff → aceptar por hunk → tests en terminal creada por el agente" con los 4 agentes; permisos recordados; sesión recuperada tras reinicio de Forge.
-- **No implementar**: MCP gateway/proxy, UI de "chat" genérica con modelos directos (Forge no llama a APIs de LLM por sí mismo: eso lo hacen los agentes).
+- **Aceptación**: flujo completo "pedir cambio → ver diff → aceptar por hunk → tests en terminal creada por el agente" con los 4 agentes; permisos recordados; sesión recuperada tras reinicio de Forge; Codex con login de ChatGPT sin configuración adicional; una petición `trivial` atendida por un proveedor `free` sin tocar la cuota de la suscripción; `agent.investigate` sobre un diagnóstico llega al agente con archivo, línea, diagnóstico y diff sin intervención del usuario.
+- **No implementar**: MCP gateway/proxy, UI de "chat" genérica con modelos directos (Forge no llama a APIs de LLM por sí mismo: eso lo hacen los agentes; las tareas triviales van a un agente ACP con un perfil barato, no a un cliente propio), clasificador de tareas con LLM.
 
 ### Fase 5 — LSP (5–7 semanas)
 
@@ -1109,6 +1194,7 @@ Dirigido por el dashboard: cada semana, las 5 APIs faltantes con más instalacio
 | Riesgo | Prob. | Impacto | Señal temprana | Mitigación |
 |---|---|---|---|---|
 | GPUI cambia de forma incompatible o no sirve para nuestro grid | Media | Alto | Spike Fase 0; > 2 días/mes en upgrades | `forge-core` sin GPUI; `forge-text` contra wgpu; `gpui-ce`; fallback winit+wgpu |
+| Los agentes no aceptan proveedores inyectados (cambian su config, bloquean gateways) o las condiciones de las suscripciones prohíben el uso vía terceros | Media | Medio | Al integrar cada agente en Fase 4; revisar ToS de ChatGPT/Codex y del gateway | El router degrada a "un agente = su proveedor nativo"; el diseño no depende de ningún gateway concreto |
 | IPC de termd añade latencia perceptible | Baja | Medio | > 1 ms en prototipo | Feature flag in-process; runs en vez de celdas; shm más adelante |
 | Compatibilidad VS Code se estanca en "casi funciona" | Alta | Alto | Extensiones top-50 con errores sutiles | Escáner + compat CI + priorizar por instalaciones; aceptar que es una cola infinita y comunicarlo |
 | Webviews en wry son una experiencia pobre | Media | Medio | Spike Fase 8 | CEF offscreen como plan B (150 MB) |

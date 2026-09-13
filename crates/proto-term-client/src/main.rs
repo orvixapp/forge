@@ -55,6 +55,7 @@ mod unix {
                     request_id: 1,
                     command,
                     args,
+                    cwd: std::env::current_dir()?,
                     cols: 80,
                     rows: 24,
                 },

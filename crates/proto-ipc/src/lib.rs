@@ -88,15 +88,8 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Reads and validates one bounded, length-prefixed frame.
-///
-/// # Errors
-///
-/// Returns an error for malformed headers, oversized frames, unknown frame
-/// kinds, truncated input or another I/O failure.
-pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame, ProtocolError> {
-    let mut header = [0_u8; HEADER_BYTES];
-    reader.read_exact(&mut header).await?;
+/// Validated frame header: payload length, kind and flags.
+fn parse_header(header: [u8; HEADER_BYTES]) -> Result<(usize, FrameKind, u8), ProtocolError> {
     let payload_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
     if payload_len > MAX_FRAME_BYTES {
         return Err(ProtocolError::FrameTooLarge {
@@ -107,13 +100,104 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame, P
     if header[6] != 0 || header[7] != 0 {
         return Err(ProtocolError::ReservedBits);
     }
+    Ok((payload_len, FrameKind::try_from(header[4])?, header[5]))
+}
+
+/// Reads and validates one bounded, length-prefixed frame.
+///
+/// Not cancellation-safe: it issues several reads, so dropping the future
+/// mid-frame (for example from a `select!` arm) loses the bytes already
+/// consumed and desynchronizes the stream. Use [`FrameReader`] wherever the
+/// read can be cancelled.
+///
+/// # Errors
+///
+/// Returns an error for malformed headers, oversized frames, unknown frame
+/// kinds, truncated input or another I/O failure.
+pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame, ProtocolError> {
+    let mut header = [0_u8; HEADER_BYTES];
+    reader.read_exact(&mut header).await?;
+    let (payload_len, kind, flags) = parse_header(header)?;
     let mut payload = vec![0; payload_len];
     reader.read_exact(&mut payload).await?;
     Ok(Frame {
-        kind: FrameKind::try_from(header[4])?,
-        flags: header[5],
+        kind,
+        flags,
         payload,
     })
+}
+
+/// Buffered frame decoder whose reads are cancellation-safe: bytes are
+/// appended to an internal buffer with single `read` calls and a frame is
+/// only taken out once it is complete, so a future dropped between polls
+/// never loses stream position.
+pub struct FrameReader<R> {
+    reader: R,
+    buffer: Vec<u8>,
+    chunk: Box<[u8]>,
+}
+
+impl<R: AsyncRead + Unpin> FrameReader<R> {
+    const CHUNK_BYTES: usize = 64 * 1024;
+
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buffer: Vec::new(),
+            chunk: vec![0; Self::CHUNK_BYTES].into_boxed_slice(),
+        }
+    }
+
+    /// Reads the next complete frame. Safe to use inside `select!`.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`read_frame`]; a clean end of stream between
+    /// frames is reported as an `UnexpectedEof` I/O error.
+    pub async fn read_frame(&mut self) -> Result<Frame, ProtocolError> {
+        loop {
+            if let Some(frame) = self.take_frame()? {
+                return Ok(frame);
+            }
+            let count = self.reader.read(&mut self.chunk).await?;
+            if count == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            self.buffer.extend_from_slice(&self.chunk[..count]);
+        }
+    }
+
+    /// Reads the next frame and deserializes its `MessagePack` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when framing, I/O or deserialization fails.
+    pub async fn read_message<T: DeserializeOwned>(
+        &mut self,
+    ) -> Result<(FrameKind, T), ProtocolError> {
+        let frame = self.read_frame().await?;
+        Ok((frame.kind, rmp_serde::from_slice(&frame.payload)?))
+    }
+
+    fn take_frame(&mut self) -> Result<Option<Frame>, ProtocolError> {
+        if self.buffer.len() < HEADER_BYTES {
+            return Ok(None);
+        }
+        let mut header = [0_u8; HEADER_BYTES];
+        header.copy_from_slice(&self.buffer[..HEADER_BYTES]);
+        let (payload_len, kind, flags) = parse_header(header)?;
+        let frame_len = HEADER_BYTES + payload_len;
+        if self.buffer.len() < frame_len {
+            return Ok(None);
+        }
+        let payload = self.buffer[HEADER_BYTES..frame_len].to_vec();
+        self.buffer.drain(..frame_len);
+        Ok(Some(Frame {
+            kind,
+            flags,
+            payload,
+        }))
+    }
 }
 
 /// Serializes a typed `MessagePack` value and writes it as a frame.
@@ -167,6 +251,8 @@ pub enum ClientMessage {
         request_id: u64,
         command: String,
         args: Vec<String>,
+        /// Directory in which the shell must start.
+        cwd: std::path::PathBuf,
         cols: u16,
         rows: u16,
     },
@@ -285,6 +371,67 @@ mod tests {
 
         assert_eq!(kind, FrameKind::Request);
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn buffered_reader_survives_cancellation_mid_frame() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let mut frames = FrameReader::new(reader);
+        let expected = ClientMessage::Input {
+            session_id: 7,
+            data: vec![b'x'; 300],
+        };
+        let mut encoded = Vec::new();
+        write_message(&mut encoded, FrameKind::Notification, &expected)
+            .await
+            .unwrap();
+
+        // Deliver the first half only, then cancel a read that is waiting
+        // for the rest, as a `select!` arm would.
+        let (head, tail) = encoded.split_at(100);
+        writer.write_all(head).await.unwrap();
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            frames.read_message::<ClientMessage>(),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "read must still be waiting for the tail"
+        );
+
+        writer.write_all(tail).await.unwrap();
+        // A second frame right behind exercises the buffered remainder.
+        write_message(
+            &mut writer,
+            FrameKind::Request,
+            &ClientMessage::Detach { session_id: 1 },
+        )
+        .await
+        .unwrap();
+
+        let (kind, first) = frames.read_message::<ClientMessage>().await.unwrap();
+        assert_eq!((kind, first), (FrameKind::Notification, expected));
+        let (kind, second) = frames.read_message::<ClientMessage>().await.unwrap();
+        assert_eq!(
+            (kind, second),
+            (FrameKind::Request, ClientMessage::Detach { session_id: 1 })
+        );
+        drop(writer);
+        assert!(matches!(
+            frames.read_frame().await,
+            Err(ProtocolError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[tokio::test]
+    async fn buffered_reader_rejects_oversized_frames_before_buffering_them() {
+        let mut input: &[u8] = &[0xff, 0xff, 0xff, 0x7f, 1, 0, 0, 0];
+        let mut frames = FrameReader::new(&mut input);
+        assert!(matches!(
+            frames.read_frame().await,
+            Err(ProtocolError::FrameTooLarge { .. })
+        ));
     }
 
     #[tokio::test]

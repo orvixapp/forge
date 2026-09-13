@@ -7,18 +7,41 @@
 //! served from a per-grapheme cache, so shaping happens once per distinct cell
 //! text instead of once per cell per frame.
 
-use forge_gui::{TerminalGrid, background_runs, cursor_shape};
+use forge_gui::{
+    CellPos, Selection, TerminalGrid, background_runs, config::ColorConfig, cursor_shape,
+};
 use gpui::{
     App, BorderStyle, Bounds, Element, ElementId, Entity, Font, FontId, GlobalElementId, GlyphId,
-    Hsla, InspectorElementId, IntoElement, LayoutId, Pixels, Point, Size, Style, TextRun, Window,
-    WindowTextSystem, black, fill, outline, point, px, rgb, size,
+    Hsla, InspectorElementId, IntoElement, LayoutId, Pixels, Point, Rgba, Size, Style, TextRun,
+    Window, WindowTextSystem, black, fill, outline, point, px, rgb, size,
 };
 use proto_ipc::{CursorStyle, Rgb};
 use std::{collections::HashMap, ops::Range};
 
-pub const WINDOW_BACKGROUND: u32 = 0x11_13_18;
-pub const DEFAULT_FOREGROUND: u32 = 0xd8_de_e9;
-pub const CURSOR_COLOR: u32 = 0xeb_cb_8b;
+/// Colours the grid paints itself; everything else comes from the cells.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Palette {
+    pub background: Rgba,
+    pub foreground: Rgba,
+    pub cursor: Rgba,
+    /// Overlay painted on selected cells; carries its own opacity.
+    pub selection: Rgba,
+    pub accent: Rgba,
+}
+
+impl From<&ColorConfig> for Palette {
+    fn from(colors: &ColorConfig) -> Self {
+        let mut selection = rgb(rgb_value(colors.selection.0));
+        selection.a = colors.selection_opacity;
+        Self {
+            background: rgb(rgb_value(colors.background.0)),
+            foreground: rgb(rgb_value(colors.foreground.0)),
+            cursor: rgb(rgb_value(colors.cursor.0)),
+            selection,
+            accent: rgb(rgb_value(colors.accent.0)),
+        }
+    }
+}
 
 /// Fixed cell geometry shared by layout, window resizing and painting.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -29,12 +52,6 @@ pub struct CellMetrics {
 }
 
 impl CellMetrics {
-    pub const DEFAULT: Self = Self {
-        width: 9.0,
-        height: 18.0,
-        font_size: 14.0,
-    };
-
     /// Small enough for a 200×60 grid to fit a 1366×768 display, so the
     /// benchmark paints every cell instead of culling the off-screen ones.
     pub const BENCHMARK: Self = Self {
@@ -56,8 +73,13 @@ impl CellMetrics {
 pub struct TerminalSurface {
     pub grid: TerminalGrid,
     pub metrics: CellMetrics,
+    pub palette: Palette,
+    pub selection: Option<Selection>,
     glyphs: GlyphCache,
     scratch: PaintScratch,
+    /// Where the grid was last painted, in window coordinates; mouse events
+    /// arrive in that space.
+    last_bounds: Option<Bounds<Pixels>>,
     /// Cells inside the clip region during the last paint; lets benchmarks
     /// prove that nothing was culled.
     pub painted_cells: usize,
@@ -65,14 +87,46 @@ pub struct TerminalSurface {
 
 impl TerminalSurface {
     #[must_use]
-    pub fn new(grid: TerminalGrid, metrics: CellMetrics) -> Self {
+    pub fn new(grid: TerminalGrid, metrics: CellMetrics, palette: Palette) -> Self {
         Self {
             grid,
             metrics,
+            palette,
+            selection: None,
             glyphs: GlyphCache::default(),
             scratch: PaintScratch::default(),
+            last_bounds: None,
             painted_cells: 0,
         }
+    }
+
+    /// Cell under a window position, clamped to the grid so a drag that
+    /// leaves the grid keeps extending the selection towards the edge it
+    /// crossed. `None` before the first paint.
+    #[must_use]
+    pub fn cell_at(&self, position: Point<Pixels>) -> Option<CellPos> {
+        let bounds = self.last_bounds?;
+        let (cols, rows) = self.grid.dimensions();
+        let x = cell_index(
+            position.x - bounds.origin.x,
+            px(self.metrics.width),
+            cols.saturating_sub(1),
+            false,
+        );
+        let y = cell_index(
+            position.y - bounds.origin.y,
+            px(self.metrics.height),
+            rows.saturating_sub(1),
+            false,
+        );
+        Some(CellPos::new(x, y))
+    }
+
+    /// Whether a window position lies inside the painted grid.
+    #[must_use]
+    pub fn contains(&self, position: Point<Pixels>) -> bool {
+        self.last_bounds
+            .is_some_and(|bounds| bounds.contains(&position))
     }
 }
 
@@ -367,6 +421,9 @@ fn paint_grid(surface: &mut TerminalSurface, bounds: Bounds<Pixels>, window: &mu
     let text_system = window.text_system().clone();
     let font = window.text_style().font();
     let metrics = surface.metrics;
+    let palette = surface.palette;
+    let selection = surface.selection;
+    surface.last_bounds = Some(bounds);
     let TerminalSurface {
         grid,
         glyphs,
@@ -393,8 +450,11 @@ fn paint_grid(surface: &mut TerminalSurface, bounds: Bounds<Pixels>, window: &mu
 
     window.paint_layer(bounds, |window| {
         paint_backgrounds(grid, &frame, &mut scratch.colors, window);
-        paint_cursor(grid, &frame, metrics, window);
-        collect_glyph_cells(grid, &frame, glyphs, scratch, &text_system);
+        if let Some(selection) = selection {
+            paint_selection(selection, &frame, palette.selection, window);
+        }
+        paint_cursor(grid, &frame, metrics, palette.cursor, window);
+        collect_glyph_cells(grid, &frame, glyphs, scratch, &palette, &text_system);
         paint_glyphs(
             &frame,
             glyphs,
@@ -404,6 +464,25 @@ fn paint_grid(surface: &mut TerminalSurface, bounds: Bounds<Pixels>, window: &mu
             window,
         );
     });
+}
+
+/// One translucent quad per selected row segment, over the backgrounds and
+/// under the glyphs.
+fn paint_selection(selection: Selection, frame: &GridFrame, color: Rgba, window: &mut Window) {
+    let cols = frame.cols.end;
+    for y in frame.rows.clone() {
+        let Some(span) = selection.row_span(y, cols) else {
+            continue;
+        };
+        let start = span.start.max(frame.cols.start);
+        let end = span.end.min(frame.cols.end);
+        if start >= end {
+            continue;
+        }
+        let origin = frame.cell_origin(start, y);
+        let extent = size(frame.cell.width * f32::from(end - start), frame.cell.height);
+        window.paint_quad(fill(Bounds::new(origin, extent), color));
+    }
 }
 
 fn paint_backgrounds(
@@ -423,7 +502,13 @@ fn paint_backgrounds(
     }
 }
 
-fn paint_cursor(grid: &TerminalGrid, frame: &GridFrame, metrics: CellMetrics, window: &mut Window) {
+fn paint_cursor(
+    grid: &TerminalGrid,
+    frame: &GridFrame,
+    metrics: CellMetrics,
+    color: Rgba,
+    window: &mut Window,
+) {
     let Some(cursor) = grid.cursor().filter(|cursor| cursor.visible) else {
         return;
     };
@@ -433,7 +518,6 @@ fn paint_cursor(grid: &TerminalGrid, frame: &GridFrame, metrics: CellMetrics, wi
     let shape = cursor_shape(cursor.style, metrics.width, metrics.height);
     let origin = frame.cell_origin(cursor.x, cursor.y) + point(px(shape.x), px(shape.y));
     let rect = Bounds::new(origin, size(px(shape.width), px(shape.height)));
-    let color: Hsla = rgb(CURSOR_COLOR).into();
     window.paint_quad(if shape.hollow {
         outline(rect, color, BorderStyle::Solid)
     } else {
@@ -448,10 +532,11 @@ fn collect_glyph_cells(
     frame: &GridFrame,
     glyphs: &mut GlyphCache,
     scratch: &mut PaintScratch,
+    palette: &Palette,
     text_system: &WindowTextSystem,
 ) {
-    let default_foreground: Hsla = rgb(DEFAULT_FOREGROUND).into();
-    let block_cursor_text: Hsla = rgb(WINDOW_BACKGROUND).into();
+    let default_foreground: Hsla = palette.foreground.into();
+    let block_cursor_text: Hsla = palette.background.into();
     let block_cursor = grid
         .cursor()
         .filter(|cursor| cursor.visible && cursor.style == CursorStyle::Block)
@@ -593,7 +678,12 @@ mod tests {
 
     #[test]
     fn cell_metrics_size_the_element_from_the_grid_dimensions() {
-        let grid = CellMetrics::DEFAULT.grid_size(80, 24);
+        let grid = CellMetrics {
+            width: 9.0,
+            height: 18.0,
+            font_size: 14.0,
+        }
+        .grid_size(80, 24);
         assert_eq!(grid, size(px(720.0), px(432.0)));
         let benchmark = CellMetrics::BENCHMARK.grid_size(200, 60);
         assert!(benchmark.width < px(1366.0) && benchmark.height < px(700.0));

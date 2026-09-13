@@ -62,6 +62,7 @@ async fn command_output_crosses_the_daemon_boundary() {
                 "-lc".into(),
                 "printf '\\033[31mforge-terminal-ok\\033[0m'; sleep 0.2".into(),
             ],
+            cwd: std::env::current_dir().unwrap(),
             cols: 80,
             rows: 24,
         },

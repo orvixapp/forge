@@ -31,13 +31,47 @@ changes and redraws. `grid_full` measures state update → `present()` per frame
 and reports `painted_cells` so culling cannot hide work; set
 `ZED_MEASUREMENTS=1` to have GPUI print its own draw+present time per frame.
 
+## Configuration
+
+`forge-gui` reads `~/.config/forge/config.toml` (`$XDG_CONFIG_HOME`,
+`$FORGE_CONFIG` or `--config <path>` override it). Every key is optional:
+
+```toml
+[font]
+family = "monospace"   # generic names resolve to an installed monospace family
+size = 14              # pixels
+line_height = 1.3      # cell height as a multiple of the size
+
+[colors]
+background = "#111318"
+foreground = "#d8dee9"
+cursor = "#ebcb8b"
+selection = "#88c0d0"
+selection_opacity = 0.35
+accent = "#88c0d0"     # status line
+
+[terminal]
+shell = "/bin/zsh"     # default: $SHELL
+args = []
+padding = 16
+show_status = true
+```
+
+Mouse: drag to select, double-click selects a word, triple-click a line; a
+finished selection lands on the Linux primary buffer (middle click).
+Keys: `Ctrl+Shift+C` copies, `Ctrl+Shift+V` pastes the clipboard,
+`Shift+Insert` pastes the primary buffer. Typing clears the selection. The
+window closes when the shell exits.
+
 ## Current scope
 
 - Implemented: versioned MessagePack framing, bounded frames, PTY lifecycle,
   attach/detach, bounded raw backlog, terminal resize/input, Ghostty VT parsing
   and incremental styled screen cells, a direct-paint GPUI grid element (one
   quad per background run, one sprite per glyph, glyph cache, block/bar/
-  underline cursors) and keyboard input, rope edits and undo, JSON-RPC/JSONL
+  underline cursors), mouse selection with clipboard and primary-buffer
+  copy/paste, xterm key encoding with modifiers, a TOML config for fonts,
+  colours and shell, rope edits and undo, JSON-RPC/JSONL
   transport primitives for the ACP spike, benchmark harness for IPC latency,
   cold startup, PSS, idle redraws and the fully dirty 200×60 grid.
 - Measured: see `bench/results/2026-09-13-grid-full.md` for the grid spike
