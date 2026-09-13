@@ -14,6 +14,7 @@ const GHOSTTY_FORMATTER_FORMAT_PLAIN: i32 = 0;
 
 type RawTerminal = *mut c_void;
 type RawFormatter = *mut c_void;
+type RawRenderState = *mut c_void;
 
 type TerminalNew = unsafe extern "C" fn(*const c_void, *mut RawTerminal, u16, u16) -> i32;
 type TerminalFree = unsafe extern "C" fn(RawTerminal);
@@ -27,6 +28,11 @@ type FormatterNew = unsafe extern "C" fn(
 ) -> i32;
 type FormatterFormatBuf = unsafe extern "C" fn(RawFormatter, *mut u8, usize, *mut usize) -> i32;
 type FormatterFree = unsafe extern "C" fn(RawFormatter);
+type RenderStateNew = unsafe extern "C" fn(*const c_void, *mut RawRenderState) -> i32;
+type RenderStateFree = unsafe extern "C" fn(RawRenderState);
+type RenderStateUpdate = unsafe extern "C" fn(RawRenderState, RawTerminal) -> i32;
+type RenderStateGet = unsafe extern "C" fn(RawRenderState, i32, *mut c_void) -> i32;
+type RenderStateClean = unsafe extern "C" fn(RawRenderState) -> i32;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -86,6 +92,11 @@ struct Api {
     formatter_new: FormatterNew,
     formatter_format_buf: FormatterFormatBuf,
     formatter_free: FormatterFree,
+    render_state_new: RenderStateNew,
+    render_state_free: RenderStateFree,
+    render_state_update: RenderStateUpdate,
+    render_state_get: RenderStateGet,
+    render_state_clean: RenderStateClean,
 }
 
 impl Api {
@@ -107,6 +118,11 @@ impl Api {
             formatter_new: symbol!(b"ghostty_formatter_terminal_new\0", FormatterNew),
             formatter_format_buf: symbol!(b"ghostty_formatter_format_buf\0", FormatterFormatBuf),
             formatter_free: symbol!(b"ghostty_formatter_free\0", FormatterFree),
+            render_state_new: symbol!(b"ghostty_render_state_new\0", RenderStateNew),
+            render_state_free: symbol!(b"ghostty_render_state_free\0", RenderStateFree),
+            render_state_update: symbol!(b"ghostty_render_state_update\0", RenderStateUpdate),
+            render_state_get: symbol!(b"ghostty_render_state_get\0", RenderStateGet),
+            render_state_clean: symbol!(b"ghostty_render_state_clean\0", RenderStateClean),
             _library: library,
         })
     }
@@ -138,14 +154,31 @@ impl GhosttyLibrary {
         let mut raw = ptr::null_mut();
         // SAFETY: `raw` is a valid out pointer; null selects Ghostty's allocator.
         let result =
-            unsafe { (self.api.terminal_new)(ptr::null(), &mut raw, cols.max(1), rows.max(1)) };
+            unsafe { (self.api.terminal_new)(ptr::null(), &raw mut raw, cols.max(1), rows.max(1)) };
         check("terminal_new", result)?;
         if raw.is_null() {
             return Err(GhosttyError::NullHandle("terminal_new"));
         }
+        let mut render_state = ptr::null_mut();
+        // SAFETY: `render_state` is a valid out pointer and null selects the
+        // default allocator. On failure the already-created terminal is freed.
+        let result = unsafe {
+            (self.api.render_state_new)(ptr::null(), &raw mut render_state)
+        };
+        if let Err(error) = check("render_state_new", result) {
+            // SAFETY: `raw` was created successfully and is uniquely owned.
+            unsafe { (self.api.terminal_free)(raw) };
+            return Err(error);
+        }
+        if render_state.is_null() {
+            // SAFETY: `raw` was created successfully and is uniquely owned.
+            unsafe { (self.api.terminal_free)(raw) };
+            return Err(GhosttyError::NullHandle("render_state_new"));
+        }
         Ok(GhosttyTerminal {
             api: Arc::clone(&self.api),
             raw,
+            render_state,
         })
     }
 }
@@ -153,6 +186,7 @@ impl GhosttyLibrary {
 pub struct GhosttyTerminal {
     api: Arc<Api>,
     raw: RawTerminal,
+    render_state: RawRenderState,
 }
 
 // SAFETY: libghostty-vt terminal handles have no thread affinity. Forge never
@@ -177,6 +211,56 @@ impl GhosttyTerminal {
         check("terminal_resize", result)
     }
 
+    /// Synchronizes Ghostty's incremental render state and returns the frame
+    /// metadata together with a plain-text bridge for the prototype client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Ghostty cannot update or query its render state.
+    pub fn render_snapshot(&mut self) -> Result<RenderSnapshot, GhosttyError> {
+        // SAFETY: both handles are uniquely owned by this value and valid.
+        let result = unsafe { (self.api.render_state_update)(self.render_state, self.raw) };
+        check("render_state_update", result)?;
+
+        let cols = self.render_value::<u16>(1, "render_state_get(cols)")?;
+        let rows = self.render_value::<u16>(2, "render_state_get(rows)")?;
+        let dirty_raw = self.render_value::<i32>(3, "render_state_get(dirty)")?;
+        let dirty = DirtyState::try_from(dirty_raw)?;
+        let text = if dirty == DirtyState::Clean {
+            None
+        } else {
+            Some(self.snapshot_text()?)
+        };
+        // SAFETY: the state is valid and the complete prototype frame was read.
+        let result = unsafe { (self.api.render_state_clean)(self.render_state) };
+        check("render_state_clean", result)?;
+        Ok(RenderSnapshot {
+            cols,
+            rows,
+            dirty,
+            text,
+        })
+    }
+
+    fn render_value<T: Default>(
+        &self,
+        data: i32,
+        operation: &'static str,
+    ) -> Result<T, GhosttyError> {
+        let mut value = T::default();
+        // SAFETY: each private call site pairs the data tag with its documented
+        // output type from the pinned Ghostty header.
+        let result = unsafe {
+            (self.api.render_state_get)(
+                self.render_state,
+                data,
+                (&raw mut value).cast::<c_void>(),
+            )
+        };
+        check(operation, result)?;
+        Ok(value)
+    }
+
     /// Returns the active screen as plain UTF-8 text.
     ///
     /// This is a prototype bridge. The GPU stage will consume Ghostty's render
@@ -190,7 +274,7 @@ impl GhosttyTerminal {
         let options = formatter_options();
         // SAFETY: all handles and by-value ABI structs match the pinned header.
         let result =
-            unsafe { (self.api.formatter_new)(ptr::null(), &mut formatter, self.raw, options) };
+            unsafe { (self.api.formatter_new)(ptr::null(), &raw mut formatter, self.raw, options) };
         check("formatter_terminal_new", result)?;
         if formatter.is_null() {
             return Err(GhosttyError::NullHandle("formatter_terminal_new"));
@@ -203,7 +287,7 @@ impl GhosttyTerminal {
         let mut required = 0;
         // SAFETY: null with zero capacity is the documented size-query operation.
         let query = unsafe {
-            (self.api.formatter_format_buf)(formatter.raw, ptr::null_mut(), 0, &mut required)
+            (self.api.formatter_format_buf)(formatter.raw, ptr::null_mut(), 0, &raw mut required)
         };
         if required == 0 && query == GHOSTTY_SUCCESS {
             return Ok(String::new());
@@ -219,7 +303,7 @@ impl GhosttyTerminal {
                 formatter.raw,
                 bytes.as_mut_ptr(),
                 bytes.len(),
-                &mut written,
+                &raw mut written,
             )
         };
         check("formatter_format_buf", result)?;
@@ -230,9 +314,44 @@ impl GhosttyTerminal {
 
 impl Drop for GhosttyTerminal {
     fn drop(&mut self) {
+        // SAFETY: the render state is uniquely owned and freed before the
+        // terminal it references.
+        unsafe { (self.api.render_state_free)(self.render_state) };
         // SAFETY: this handle is uniquely owned and freed exactly once.
         unsafe { (self.api.terminal_free)(self.raw) };
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirtyState {
+    Clean,
+    Partial,
+    Full,
+}
+
+impl TryFrom<i32> for DirtyState {
+    type Error = GhosttyError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Clean),
+            1 => Ok(Self::Partial),
+            2 => Ok(Self::Full),
+            result => Err(GhosttyError::Operation {
+                operation: "render_state_get(dirty value)",
+                result,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderSnapshot {
+    pub cols: u16,
+    pub rows: u16,
+    pub dirty: DirtyState,
+    /// Temporary text transport until the renderer consumes row/cell data.
+    pub text: Option<String>,
 }
 
 struct FormatterGuard {

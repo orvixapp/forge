@@ -8,7 +8,7 @@ fn main() {
 mod unix {
     use anyhow::{Context, Result, bail};
     use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-    use proto_ghostty_vt::{GhosttyLibrary, GhosttyTerminal};
+    use proto_ghostty_vt::{DirtyState, GhosttyLibrary, GhosttyTerminal};
     use proto_ipc::{
         ClientMessage, FrameKind, PROTOCOL_VERSION, ServerMessage, read_message, write_message,
     };
@@ -104,21 +104,24 @@ mod unix {
         }
 
         fn emit_screen(&self) -> Result<()> {
-            let text = self
+            let frame = self
                 .terminal
                 .lock()
                 .expect("terminal mutex poisoned")
-                .snapshot_text()
-                .context("format Ghostty screen")?;
+                .render_snapshot()
+                .context("update Ghostty render state")?;
+            if frame.dirty == DirtyState::Clean {
+                return Ok(());
+            }
             let revision = self
                 .revision
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
             let _ = self.events.send(SessionEvent::ScreenUpdated {
                 revision,
-                cols: self.cols.load(std::sync::atomic::Ordering::Relaxed),
-                rows: self.rows.load(std::sync::atomic::Ordering::Relaxed),
-                text,
+                cols: frame.cols,
+                rows: frame.rows,
+                text: frame.text.unwrap_or_default(),
             });
             Ok(())
         }
@@ -160,8 +163,8 @@ mod unix {
             }
             let child = pair.slave.spawn_command(builder).context("spawn command")?;
             drop(pair.slave);
-            let mut reader = pair.master.try_clone_reader().context("clone PTY reader")?;
-            let mut writer = pair.master.take_writer().context("take PTY writer")?;
+            let reader = pair.master.try_clone_reader().context("clone PTY reader")?;
+            let writer = pair.master.take_writer().context("take PTY writer")?;
             let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(128);
             let (events, _) = broadcast::channel(256);
             let terminal = self
@@ -185,75 +188,16 @@ mod unix {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
 
-            let read_session = Arc::clone(&session);
             let (reader_done_tx, reader_done_rx) = mpsc::sync_channel(1);
-            thread::Builder::new()
-                .name(format!("forge-pty-read-{session_id}"))
-                .spawn(move || {
-                    let mut chunk = vec![0_u8; 16 * 1024];
-                    loop {
-                        match reader.read(&mut chunk) {
-                            Ok(0) => break,
-                            Ok(count) => {
-                                let data = chunk[..count].to_vec();
-                                append_bounded(&read_session.backlog, &data);
-                                if let Err(error) = read_session.feed_vt(&data) {
-                                    warn!(session_id, %error, "Ghostty VT update failed");
-                                }
-                                let _ = read_session.events.send(SessionEvent::Output(data));
-                            }
-                            Err(error) => {
-                                warn!(session_id, %error, "PTY read failed");
-                                break;
-                            }
-                        }
-                    }
-                    let _ = reader_done_tx.send(());
-                })
-                .context("spawn PTY reader thread")?;
-
-            thread::Builder::new()
-                .name(format!("forge-pty-write-{session_id}"))
-                .spawn(move || {
-                    while let Ok(data) = input_rx.recv() {
-                        if writer.write_all(&data).is_err() || writer.flush().is_err() {
-                            break;
-                        }
-                    }
-                })
-                .context("spawn PTY writer thread")?;
-
-            let wait_session = Arc::clone(&session);
-            thread::Builder::new()
-                .name(format!("forge-pty-wait-{session_id}"))
-                .spawn(move || {
-                    let code = loop {
-                        let status = wait_session
-                            .child
-                            .lock()
-                            .expect("child mutex poisoned")
-                            .try_wait();
-                        match status {
-                            Ok(Some(value)) => break Some(value.exit_code()),
-                            Ok(None) => thread::sleep(std::time::Duration::from_millis(20)),
-                            Err(error) => {
-                                warn!(session_id, %error, "waiting for PTY child failed");
-                                break None;
-                            }
-                        }
-                    };
-                    // Do not emit Exited before the reader has drained the final
-                    // bytes still buffered by the PTY kernel driver.
-                    let _ = reader_done_rx.recv_timeout(std::time::Duration::from_secs(1));
-                    if let Some(value) = code {
-                        *wait_session
-                            .exit_code
-                            .lock()
-                            .expect("exit code mutex poisoned") = Some(value);
-                    }
-                    let _ = wait_session.events.send(SessionEvent::Exited(code));
-                })
-                .context("spawn PTY wait thread")?;
+            spawn_io_threads(
+                session_id,
+                Arc::clone(&session),
+                reader,
+                writer,
+                input_rx,
+                reader_done_tx,
+            )?;
+            spawn_wait_thread(session_id, Arc::clone(&session), reader_done_rx)?;
 
             self.sessions.write().await.insert(session_id, session);
             info!(session_id, "created PTY session");
@@ -268,6 +212,89 @@ mod unix {
                 .cloned()
                 .with_context(|| format!("unknown session {id}"))
         }
+    }
+
+    fn spawn_io_threads(
+        session_id: u64,
+        read_session: Arc<Session>,
+        mut reader: Box<dyn Read + Send>,
+        mut writer: Box<dyn Write + Send>,
+        input_rx: mpsc::Receiver<Vec<u8>>,
+        reader_done_tx: mpsc::SyncSender<()>,
+    ) -> Result<()> {
+        thread::Builder::new()
+            .name(format!("forge-pty-read-{session_id}"))
+            .spawn(move || {
+                let mut chunk = vec![0_u8; 16 * 1024];
+                loop {
+                    match reader.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(count) => {
+                            let data = chunk[..count].to_vec();
+                            append_bounded(&read_session.backlog, &data);
+                            if let Err(error) = read_session.feed_vt(&data) {
+                                warn!(session_id, %error, "Ghostty VT update failed");
+                            }
+                            let _ = read_session.events.send(SessionEvent::Output(data));
+                        }
+                        Err(error) => {
+                            warn!(session_id, %error, "PTY read failed");
+                            break;
+                        }
+                    }
+                }
+                let _ = reader_done_tx.send(());
+            })
+            .context("spawn PTY reader thread")?;
+
+        thread::Builder::new()
+            .name(format!("forge-pty-write-{session_id}"))
+            .spawn(move || {
+                while let Ok(data) = input_rx.recv() {
+                    if writer.write_all(&data).is_err() || writer.flush().is_err() {
+                        break;
+                    }
+                }
+            })
+            .context("spawn PTY writer thread")?;
+        Ok(())
+    }
+
+    fn spawn_wait_thread(
+        session_id: u64,
+        wait_session: Arc<Session>,
+        reader_done_rx: mpsc::Receiver<()>,
+    ) -> Result<()> {
+        thread::Builder::new()
+            .name(format!("forge-pty-wait-{session_id}"))
+            .spawn(move || {
+                let code = loop {
+                    let status = wait_session
+                        .child
+                        .lock()
+                        .expect("child mutex poisoned")
+                        .try_wait();
+                    match status {
+                        Ok(Some(value)) => break Some(value.exit_code()),
+                        Ok(None) => thread::sleep(std::time::Duration::from_millis(20)),
+                        Err(error) => {
+                            warn!(session_id, %error, "waiting for PTY child failed");
+                            break None;
+                        }
+                    }
+                };
+                // Drain final bytes before publishing the terminal exit.
+                let _ = reader_done_rx.recv_timeout(std::time::Duration::from_secs(1));
+                if let Some(value) = code {
+                    *wait_session
+                        .exit_code
+                        .lock()
+                        .expect("exit code mutex poisoned") = Some(value);
+                }
+                let _ = wait_session.events.send(SessionEvent::Exited(code));
+            })
+            .context("spawn PTY wait thread")?;
+        Ok(())
     }
 
     fn append_bounded(backlog: &Mutex<VecDeque<u8>>, data: &[u8]) {
@@ -333,9 +360,10 @@ mod unix {
 
     fn parse_options() -> Result<Options> {
         let mut socket = PathBuf::from("/tmp/forge-prototype.sock");
-        let mut ghostty_lib = std::env::var_os("FORGE_GHOSTTY_LIB")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| "target/ghostty/lib/libghostty-vt.so".into());
+        let mut ghostty_lib = std::env::var_os("FORGE_GHOSTTY_LIB").map_or_else(
+            || "target/ghostty/lib/libghostty-vt.so".into(),
+            PathBuf::from,
+        );
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {

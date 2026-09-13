@@ -24,6 +24,7 @@ if [ "$($ZIG_BIN version)" != "0.16.0" ]; then
     echo "Expected Zig 0.16.0, found $($ZIG_BIN version)." >&2
     exit 2
 fi
+ZIG_BIN=$(command -v "$ZIG_BIN")
 
 mkdir -p "$TOOLS_DIR"
 if [ ! -d "$SOURCE_DIR" ]; then
@@ -35,16 +36,25 @@ if [ ! -d "$SOURCE_DIR" ]; then
     tar -xzf "$ARCHIVE" -C "$TOOLS_DIR"
 fi
 
-"$ZIG_BIN" build \
-    --build-file "$SOURCE_DIR/build.zig" \
-    -Demit-lib-vt=true \
-    -Dapp-runtime=none \
-    -Doptimize=ReleaseFast \
-    --prefix "$PREFIX_DIR"
+(
+    cd "$SOURCE_DIR"
+    ZIG_GLOBAL_CACHE_DIR="$PROJECT_DIR/target/zig-global-cache" \
+        "$ZIG_BIN" build \
+        -Demit-lib-vt=true \
+        -Dapp-runtime=none \
+        -Doptimize=ReleaseFast \
+        --prefix "$PREFIX_DIR"
+)
 
 case "$(uname -s)" in
     Darwin) LIBRARY="$PREFIX_DIR/lib/libghostty-vt.dylib" ;;
-    Linux) LIBRARY="$PREFIX_DIR/lib/libghostty-vt.so" ;;
+    Linux)
+        VERSIONED_LIBRARY="$PREFIX_DIR/lib/libghostty-vt.so.0.1.0"
+        LIBRARY="$PREFIX_DIR/lib/libghostty-vt.so"
+        if [ -f "$VERSIONED_LIBRARY" ]; then
+            ln -sf "$(basename "$VERSIONED_LIBRARY")" "$LIBRARY"
+        fi
+        ;;
     *) LIBRARY="$PREFIX_DIR/bin/ghostty-vt.dll" ;;
 esac
 
@@ -54,4 +64,3 @@ if [ ! -f "$LIBRARY" ]; then
 fi
 
 echo "$LIBRARY"
-
