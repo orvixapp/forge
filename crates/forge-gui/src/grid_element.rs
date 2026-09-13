@@ -15,7 +15,7 @@ use gpui::{
     App, BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, Font, FontId, GlobalElementId, GlyphId, Hsla, InspectorElementId, IntoElement,
     LayoutId, Pixels, Point, Rgba, Size, Style, TextRun, Window, WindowTextSystem, black, fill,
-    outline, point, px, relative, rgb, size,
+    outline, point, px, rgb, size,
 };
 use proto_ipc::{CursorStyle, Rgb};
 use std::{collections::HashMap, ops::Range};
@@ -408,9 +408,14 @@ impl<V: EntityInputHandler> Element for TerminalGridElement<V> {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        // Grow into the parent flex box instead of asking for 100%, which
+        // makes taffy resolve the parent first and re-measure nested splits.
         let mut style = Style::default();
-        style.size.width = relative(1.0).into();
-        style.size.height = relative(1.0).into();
+        style.flex_grow = 1.0;
+        style.flex_shrink = 1.0;
+        style.flex_basis = px(0.0).into();
+        style.min_size.width = px(0.0).into();
+        style.min_size.height = px(0.0).into();
         (window.request_layout(style, [], cx), ())
     }
 

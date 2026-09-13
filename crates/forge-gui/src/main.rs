@@ -187,9 +187,12 @@ fn main() {
 /// `FORGE_LOG` filters `tracing` output on stderr; `FORGE_TRACE_FILE` writes
 /// a Chrome trace (loadable in Perfetto) of the spans in this process.
 fn init_tracing() -> Option<tracing_chrome::FlushGuard> {
-    let filter = EnvFilter::try_from_env("FORGE_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
+    let trace_file = std::env::var_os("FORGE_TRACE_FILE");
+    let default_level = if trace_file.is_some() { "info" } else { "warn" };
+    let filter =
+        EnvFilter::try_from_env("FORGE_LOG").unwrap_or_else(|_| EnvFilter::new(default_level));
     let registry = tracing_subscriber::registry().with(filter);
-    if let Some(path) = std::env::var_os("FORGE_TRACE_FILE") {
+    if let Some(path) = trace_file {
         let (chrome, guard) = tracing_chrome::ChromeLayerBuilder::new()
             .file(path)
             .include_args(true)

@@ -292,6 +292,8 @@ fn pane_leaf(view: &ForgeWindow, index: usize, cx: &mut Context<ForgeWindow>) ->
         .cursor(CursorStyle::IBeam)
         .child(
             div()
+                .flex()
+                .flex_col()
                 .flex_1()
                 .min_h(px(0.0))
                 .overflow_hidden()
