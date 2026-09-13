@@ -1,17 +1,19 @@
-//! Pure state for the Phase 1 application shell.
+//! Pure state for the application shell: the command registry, the keymap,
+//! the pane tree and the persisted window session.
 //!
 //! Widgets ask this module which command a keystroke represents; command
-//! execution remains at the application boundary, where it can create windows
+//! execution stays at the application boundary, where it can create windows
 //! or update layout state without coupling the resolver to GPUI.
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::Value;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use std::{fs, io, path::Path};
 
-/// Stable identifiers used by keymaps, the future command palette and CLI.
+/// Stable identifiers used by keymaps, the command palette and the CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShellCommand {
     NewTerminalTab,
+    NewTerminalTabInDirectory,
     CloseWindow,
     ToggleMaximize,
     ShowCommandPalette,
@@ -19,11 +21,14 @@ pub enum ShellCommand {
     SplitVertical,
     FocusNextPane,
     ShowProcessExplorer,
+    CycleTheme,
+    ReloadConfig,
 }
 
 impl ShellCommand {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 11] = [
         Self::NewTerminalTab,
+        Self::NewTerminalTabInDirectory,
         Self::CloseWindow,
         Self::ToggleMaximize,
         Self::ShowCommandPalette,
@@ -31,11 +36,15 @@ impl ShellCommand {
         Self::SplitVertical,
         Self::FocusNextPane,
         Self::ShowProcessExplorer,
+        Self::CycleTheme,
+        Self::ReloadConfig,
     ];
+
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
             Self::NewTerminalTab => "terminal.newTab",
+            Self::NewTerminalTabInDirectory => "terminal.newTabInDirectory",
             Self::CloseWindow => "window.close",
             Self::ToggleMaximize => "window.toggleMaximize",
             Self::ShowCommandPalette => "commandPalette.show",
@@ -43,6 +52,8 @@ impl ShellCommand {
             Self::SplitVertical => "layout.splitVertical",
             Self::FocusNextPane => "layout.focusNextPane",
             Self::ShowProcessExplorer => "processExplorer.show",
+            Self::CycleTheme => "theme.cycle",
+            Self::ReloadConfig => "config.reload",
         }
     }
 
@@ -50,13 +61,16 @@ impl ShellCommand {
     pub const fn title(self) -> &'static str {
         match self {
             Self::NewTerminalTab => "New terminal tab",
-            Self::CloseWindow => "Close window",
+            Self::NewTerminalTabInDirectory => "New terminal tab in directory…",
+            Self::CloseWindow => "Close tab or window",
             Self::ToggleMaximize => "Toggle maximized window",
             Self::ShowCommandPalette => "Show command palette",
             Self::SplitHorizontal => "Split horizontally",
             Self::SplitVertical => "Split vertically",
             Self::FocusNextPane => "Focus next pane",
             Self::ShowProcessExplorer => "Show process explorer",
+            Self::CycleTheme => "Cycle theme",
+            Self::ReloadConfig => "Reload configuration",
         }
     }
 
@@ -67,10 +81,12 @@ impl ShellCommand {
 }
 
 /// User-owned binding declaration, accepted from `config.toml`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UserKeyBinding {
+    /// Command id, e.g. `terminal.newTab`.
     pub command: String,
+    /// Chord such as `ctrl+shift+p`.
     pub keys: String,
 }
 
@@ -150,298 +166,19 @@ pub struct KeyBinding {
 }
 
 /// Ordered keymap. Later bindings override earlier bindings, which gives user
-/// configuration a deterministic override mechanism in subphase 1.4.
+/// configuration a deterministic override mechanism.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellKeymap {
     bindings: Vec<KeyBinding>,
 }
 
-/// Content-free pane types. Terminal/editor implementations plug into these
-/// stable IDs in later phases without changing persisted layouts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PaneKind {
-    Empty,
-    Terminal,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Pane {
-    pub id: u64,
-    pub kind: PaneKind,
-    pub title: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SplitDirection {
-    Horizontal,
-    Vertical,
-}
-
-/// A recursive shell layout: leaves are panes, and groups are tabs or splits.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum LayoutNode {
-    Pane(Pane),
-    Tabs {
-        active: usize,
-        children: Vec<LayoutNode>,
-    },
-    Split {
-        direction: SplitDirection,
-        ratio: f32,
-        first: Box<LayoutNode>,
-        second: Box<LayoutNode>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ShellLayout {
-    pub root: LayoutNode,
-    focused_pane: u64,
-    next_pane_id: u64,
-}
-
-impl Default for ShellLayout {
-    fn default() -> Self {
-        let pane = Pane {
-            id: 1,
-            kind: PaneKind::Empty,
-            title: "Welcome".into(),
-        };
-        Self {
-            root: LayoutNode::Tabs {
-                active: 0,
-                children: vec![LayoutNode::Pane(pane)],
-            },
-            focused_pane: 1,
-            next_pane_id: 2,
-        }
-    }
-}
-
-impl ShellLayout {
-    #[must_use]
-    pub const fn focused_pane(&self) -> u64 {
-        self.focused_pane
-    }
-
-    #[must_use]
-    pub fn pane_ids(&self) -> Vec<u64> {
-        let mut ids = Vec::new();
-        collect_panes(&self.root, &mut ids);
-        ids
-    }
-
-    /// Splits the focused leaf and focuses the newly-created empty pane.
-    pub fn split_focused(&mut self, direction: SplitDirection) {
-        let old = self.focused_pane;
-        let new = Pane {
-            id: self.next_pane_id,
-            kind: PaneKind::Empty,
-            title: "Empty pane".into(),
-        };
-        self.next_pane_id += 1;
-        if split_pane(&mut self.root, old, direction, new.clone()) {
-            self.focused_pane = new.id;
-        }
-    }
-
-    pub fn focus_next(&mut self) {
-        let ids = self.pane_ids();
-        if let Some(index) = ids.iter().position(|id| *id == self.focused_pane) {
-            self.focused_pane = ids[(index + 1) % ids.len()];
-        }
-    }
-}
-
-fn collect_panes(node: &LayoutNode, output: &mut Vec<u64>) {
-    match node {
-        LayoutNode::Pane(pane) => output.push(pane.id),
-        LayoutNode::Tabs { children, .. } => children
-            .iter()
-            .for_each(|child| collect_panes(child, output)),
-        LayoutNode::Split { first, second, .. } => {
-            collect_panes(first, output);
-            collect_panes(second, output);
-        }
-    }
-}
-
-fn split_pane(node: &mut LayoutNode, id: u64, direction: SplitDirection, new: Pane) -> bool {
-    match node {
-        LayoutNode::Pane(pane) if pane.id == id => {
-            let old = std::mem::replace(node, LayoutNode::Pane(new));
-            *node = LayoutNode::Split {
-                direction,
-                ratio: 0.5,
-                first: Box::new(old),
-                second: Box::new(match node {
-                    LayoutNode::Pane(pane) => LayoutNode::Pane(pane.clone()),
-                    _ => unreachable!(),
-                }),
-            };
-            true
-        }
-        LayoutNode::Tabs { children, .. } => children
-            .iter_mut()
-            .any(|child| split_pane(child, id, direction, new.clone())),
-        LayoutNode::Split { first, second, .. } => {
-            split_pane(first, id, direction, new.clone()) || split_pane(second, id, direction, new)
-        }
-        LayoutNode::Pane(_) => false,
-    }
-}
-
-/// Persisted, versioned shell state. Invalid or future state is rejected by
-/// callers so a broken cache can never stop Forge from opening.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ShellSession {
-    pub version: u8,
-    pub layout: ShellLayout,
-    pub theme: String,
-}
-
-impl Default for ShellSession {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            layout: ShellLayout::default(),
-            theme: "forge-dark".into(),
-        }
-    }
-}
-
-impl ShellSession {
-    pub fn load(path: &Path) -> io::Result<Self> {
-        let text = fs::read_to_string(path)?;
-        let session: Self = serde_json::from_str(&strip_jsonc_comments(&text))
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if session.version != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported shell session version",
-            ));
-        }
-        Ok(session)
-    }
-
-    pub fn save(&self, path: &Path) -> io::Result<()> {
-        let parent = path.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "session path has no parent")
-        })?;
-        fs::create_dir_all(parent)?;
-        let temporary = path.with_extension("tmp");
-        fs::write(
-            &temporary,
-            serde_json::to_string_pretty(self).expect("session is serializable"),
-        )?;
-        fs::rename(temporary, path)
-    }
-}
-
-/// Removes line and block comments while preserving quoted strings. JSONC
-/// trailing commas are deliberately not accepted yet: rejecting malformed
-/// configuration is safer than silently changing its meaning.
-fn strip_jsonc_comments(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut quoted = false;
-    let mut escaped = false;
-    while let Some(ch) = chars.next() {
-        if quoted {
-            escaped = ch == '\\' && !escaped;
-            if ch == '"' && !escaped {
-                quoted = false;
-            }
-            out.push(ch);
-            continue;
-        }
-        if ch == '"' {
-            quoted = true;
-            out.push(ch);
-            continue;
-        }
-        if ch == '/' && chars.peek() == Some(&'/') {
-            chars.next();
-            for line in chars.by_ref() {
-                if line == '\n' {
-                    out.push('\n');
-                    break;
-                }
-            }
-            continue;
-        }
-        if ch == '/' && chars.peek() == Some(&'*') {
-            chars.next();
-            while let Some(block) = chars.next() {
-                if block == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    break;
-                }
-            }
-            continue;
-        }
-        out.push(ch);
-    }
-    out
-}
-
-/// Minimal Phase 1 settings. More settings are added by their owning phase;
-/// unknown fields remain in the JSON layer rather than silently affecting UI.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ShellSettings {
-    pub theme: String,
-}
-
-impl Default for ShellSettings {
-    fn default() -> Self {
-        Self {
-            theme: "forge-dark".into(),
-        }
-    }
-}
-
-/// Reads JSONC layers in ascending precedence (defaults, user, workspace).
-/// Missing layers are ignored; a malformed present layer is an error and must
-/// leave the already-running configuration untouched.
-pub fn load_jsonc_layers<T: DeserializeOwned + Default>(paths: &[&Path]) -> io::Result<T> {
-    let mut merged = Value::Object(Default::default());
-    for path in paths {
-        let text = match fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        let layer: Value = serde_json::from_str(&strip_jsonc_comments(&text)).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{}: {error}", path.display()),
-            )
-        })?;
-        merge_json(&mut merged, layer);
-    }
-    serde_json::from_value(merged)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
-fn merge_json(base: &mut Value, override_value: Value) {
-    match (base, override_value) {
-        (Value::Object(base), Value::Object(override_value)) => {
-            for (key, value) in override_value {
-                merge_json(base.entry(key).or_insert(Value::Null), value);
-            }
-        }
-        (base, override_value) => *base = override_value,
-    }
-}
-
 impl Default for ShellKeymap {
     fn default() -> Self {
-        use ShellCommand::*;
-        use ShellContext::*;
+        use ShellCommand::{
+            CycleTheme, FocusNextPane, NewTerminalTab, ShowCommandPalette, SplitHorizontal,
+            SplitVertical, CloseWindow,
+        };
+        use ShellContext::{Terminal, Window};
         Self {
             bindings: vec![
                 binding("t", true, false, false, Terminal, NewTerminalTab),
@@ -450,6 +187,7 @@ impl Default for ShellKeymap {
                 binding("\\", true, false, false, Window, SplitVertical),
                 binding("5", true, false, true, Window, SplitHorizontal),
                 binding("tab", true, false, false, Window, FocusNextPane),
+                binding("t", true, false, true, Window, CycleTheme),
             ],
         }
     }
@@ -475,35 +213,59 @@ impl ShellKeymap {
         }
         self
     }
+
+    /// Resolves a keystroke in `context`; `Window` bindings apply inside every
+    /// other context unless that context binds the same keystroke.
     #[must_use]
     pub fn resolve(
         &self,
         keystroke: &ShellKeystroke,
         context: ShellContext,
     ) -> Option<ShellCommand> {
-        self.bindings
-            .iter()
-            .rev()
-            .find(|binding| binding.context == context && binding.keystroke == *keystroke)
-            .map(|binding| binding.command)
-            .or_else(|| {
-                (context != ShellContext::Window)
-                    .then(|| {
-                        self.bindings
-                            .iter()
-                            .rev()
-                            .find(|binding| {
-                                binding.context == ShellContext::Window
-                                    && binding.keystroke == *keystroke
-                            })
-                            .map(|binding| binding.command)
-                    })
-                    .flatten()
-            })
+        let in_context = |wanted: ShellContext| {
+            self.bindings
+                .iter()
+                .rev()
+                .find(|binding| binding.context == wanted && binding.keystroke == *keystroke)
+                .map(|binding| binding.command)
+        };
+        in_context(context).or_else(|| {
+            (context != ShellContext::Window)
+                .then(|| in_context(ShellContext::Window))
+                .flatten()
+        })
     }
 
     pub fn bind(&mut self, binding: KeyBinding) {
         self.bindings.push(binding);
+    }
+
+    /// The first chord bound to `command`, for hints in the UI.
+    #[must_use]
+    pub fn chord_for(&self, command: ShellCommand) -> Option<String> {
+        self.bindings
+            .iter()
+            .rev()
+            .find(|binding| binding.command == command)
+            .map(|binding| {
+                let key = &binding.keystroke;
+                let mut parts = Vec::new();
+                if key.control {
+                    parts.push("Ctrl".to_string());
+                }
+                if key.alt {
+                    parts.push("Alt".to_string());
+                }
+                if key.shift {
+                    parts.push("Shift".to_string());
+                }
+                let mut name = key.key.clone();
+                if let Some(first) = name.get(..1) {
+                    name = first.to_ascii_uppercase() + &name[1..];
+                }
+                parts.push(name);
+                parts.join("+")
+            })
     }
 }
 
@@ -543,6 +305,200 @@ fn binding(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitDirection {
+    Horizontal,
+    Vertical,
+}
+
+/// Binary split tree over tab indices. Leaves are indices into the window's
+/// tab list; removing a tab shifts the indices above it down.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PaneTree {
+    Leaf { index: usize },
+    Split {
+        direction: SplitDirection,
+        first: Box<PaneTree>,
+        second: Box<PaneTree>,
+    },
+}
+
+impl PaneTree {
+    #[must_use]
+    pub const fn leaf(index: usize) -> Self {
+        Self::Leaf { index }
+    }
+
+    /// Replaces the leaf `target` with a split of `target` and `new`.
+    pub fn split(&mut self, target: usize, new: usize, direction: SplitDirection) {
+        match self {
+            Self::Leaf { index } if *index == target => {
+                *self = Self::Split {
+                    direction,
+                    first: Box::new(Self::leaf(target)),
+                    second: Box::new(Self::leaf(new)),
+                };
+            }
+            Self::Split { first, second, .. } => {
+                first.split(target, new, direction);
+                second.split(target, new, direction);
+            }
+            Self::Leaf { .. } => {}
+        }
+    }
+
+    #[must_use]
+    pub fn leaves(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.collect_leaves(&mut out);
+        out
+    }
+
+    fn collect_leaves(&self, out: &mut Vec<usize>) {
+        match self {
+            Self::Leaf { index } => out.push(*index),
+            Self::Split { first, second, .. } => {
+                first.collect_leaves(out);
+                second.collect_leaves(out);
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn contains(&self, index: usize) -> bool {
+        self.leaves().contains(&index)
+    }
+
+    /// Removes tab `target`, collapsing its parent split, and renumbers the
+    /// leaves above it. `None` when the tree becomes empty.
+    #[must_use]
+    pub fn remove(self, target: usize) -> Option<Self> {
+        match self {
+            Self::Leaf { index } if index == target => None,
+            Self::Leaf { index } => Some(Self::leaf(if index > target {
+                index - 1
+            } else {
+                index
+            })),
+            Self::Split {
+                direction,
+                first,
+                second,
+            } => match (first.remove(target), second.remove(target)) {
+                (Some(first), Some(second)) => Some(Self::Split {
+                    direction,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+                (remaining, None) | (None, remaining) => remaining,
+            },
+        }
+    }
+
+    /// Leaf after `current` in reading order, wrapping around.
+    #[must_use]
+    pub fn next_leaf(&self, current: usize) -> usize {
+        let leaves = self.leaves();
+        let position = leaves.iter().position(|leaf| *leaf == current).unwrap_or(0);
+        leaves[(position + 1) % leaves.len()]
+    }
+}
+
+/// Persisted, versioned window state. Invalid or future state is rejected so
+/// a broken file can never stop Forge from opening.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowSession {
+    pub version: u8,
+    /// Number of terminal tabs.
+    pub count: usize,
+    pub active: usize,
+    pub split: Option<PaneTree>,
+    pub cwd: std::path::PathBuf,
+    pub width: f32,
+    pub height: f32,
+    #[serde(default)]
+    pub theme: Option<String>,
+}
+
+impl WindowSession {
+    pub const VERSION: u8 = 2;
+    pub const MAX_TABS: usize = 64;
+
+    /// Reads and validates a session file; `Ok(None)` when it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// A present but unreadable, unparsable or inconsistent file.
+    pub fn load(path: &Path) -> io::Result<Option<Self>> {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let session: Self = serde_json::from_str(&text)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        session.validate().map_err(|reason| {
+            io::Error::new(io::ErrorKind::InvalidData, reason)
+        })?;
+        Ok(Some(session))
+    }
+
+    /// Writes atomically and only when the content changed, so a periodic
+    /// save never touches the disk while the layout is stable.
+    ///
+    /// # Errors
+    ///
+    /// I/O failures creating the directory or replacing the file.
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(self)?;
+        if fs::read(path).ok().as_deref() == Some(bytes.as_slice()) {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temporary = path.with_extension("json.tmp");
+        fs::write(&temporary, bytes)?;
+        fs::rename(temporary, path)
+    }
+
+    /// Structural checks that keep a corrupt file from producing an
+    /// out-of-range tab index at runtime.
+    ///
+    /// # Errors
+    ///
+    /// A human-readable reason.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != Self::VERSION {
+            return Err(format!("unsupported session version {}", self.version));
+        }
+        if self.count == 0 || self.count > Self::MAX_TABS {
+            return Err(format!("tab count {} out of range", self.count));
+        }
+        if self.active >= self.count {
+            return Err("active tab out of range".into());
+        }
+        if let Some(tree) = &self.split {
+            let leaves = tree.leaves();
+            if leaves.iter().any(|index| *index >= self.count) {
+                return Err("split references a missing tab".into());
+            }
+            let mut sorted = leaves.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            if sorted.len() != leaves.len() {
+                return Err("split references a tab twice".into());
+            }
+        }
+        if !(self.width.is_finite() && self.height.is_finite()) {
+            return Err("window size is not finite".into());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,6 +514,10 @@ mod tests {
             Some(ShellCommand::NewTerminalTab)
         );
         assert_eq!(ShellCommand::NewTerminalTab.id(), "terminal.newTab");
+        assert_eq!(
+            keymap.chord_for(ShellCommand::ShowCommandPalette).as_deref(),
+            Some("Ctrl+Shift+P")
+        );
     }
 
     #[test]
@@ -593,11 +553,21 @@ mod tests {
     }
 
     #[test]
-    fn user_keybinding_overrides_the_default() {
-        let keymap = ShellKeymap::default().with_overrides(&[UserKeyBinding {
-            command: "terminal.newTab".into(),
-            keys: "ctrl+n".into(),
-        }]);
+    fn user_keybinding_overrides_the_default_and_ignores_garbage() {
+        let keymap = ShellKeymap::default().with_overrides(&[
+            UserKeyBinding {
+                command: "terminal.newTab".into(),
+                keys: "ctrl+n".into(),
+            },
+            UserKeyBinding {
+                command: "no.such.command".into(),
+                keys: "ctrl+x".into(),
+            },
+            UserKeyBinding {
+                command: "theme.cycle".into(),
+                keys: "hyper+t".into(),
+            },
+        ]);
         assert_eq!(
             keymap.resolve(
                 &ShellKeystroke::new("n", true, false, false),
@@ -605,44 +575,31 @@ mod tests {
             ),
             Some(ShellCommand::NewTerminalTab)
         );
+        assert_eq!(
+            keymap.resolve(
+                &ShellKeystroke::new("t", true, false, false),
+                ShellContext::Terminal
+            ),
+            None
+        );
+        assert_eq!(
+            keymap.resolve(
+                &ShellKeystroke::new("t", true, false, true),
+                ShellContext::Window
+            ),
+            Some(ShellCommand::CycleTheme)
+        );
     }
 
     #[test]
-    fn splitting_and_focusing_produces_a_stable_layout_tree() {
-        let mut layout = ShellLayout::default();
-        layout.split_focused(SplitDirection::Vertical);
-        assert_eq!(layout.pane_ids(), vec![1, 2]);
-        assert_eq!(layout.focused_pane(), 2);
-        layout.focus_next();
-        assert_eq!(layout.focused_pane(), 1);
-    }
-
-    #[test]
-    fn session_round_trips_jsonc_comments() {
-        let path = std::env::temp_dir().join(format!("forge-session-{}.jsonc", std::process::id()));
-        let session = ShellSession::default();
-        session.save(&path).unwrap();
-        let json = fs::read_to_string(&path).unwrap();
-        fs::write(&path, format!("// Forge session\n{json}\n/* end */")).unwrap();
-        assert_eq!(ShellSession::load(&path).unwrap(), session);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn jsonc_layers_merge_in_precedence_order() {
-        let root = std::env::temp_dir().join(format!("forge-settings-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let user = root.join("user.jsonc");
-        let workspace = root.join("workspace.jsonc");
-        fs::write(&user, "// user\n{ \"theme\": \"forge-light\" }").unwrap();
-        fs::write(
-            &workspace,
-            "{ /* workspace wins */ \"theme\": \"forge-dark\" }",
-        )
-        .unwrap();
-        let settings: ShellSettings = load_jsonc_layers(&[&user, &workspace]).unwrap();
-        assert_eq!(settings.theme, "forge-dark");
-        fs::remove_dir_all(root).unwrap();
+    fn every_command_has_a_unique_id_and_round_trips() {
+        let mut ids: Vec<_> = ShellCommand::ALL.iter().map(|command| command.id()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), ShellCommand::ALL.len());
+        for command in ShellCommand::ALL {
+            assert_eq!(ShellCommand::from_id(command.id()), Some(command));
+        }
     }
 
     #[test]
@@ -652,5 +609,60 @@ mod tests {
             Some(ShellCommand::NewTerminalTab)
         );
         assert!(search_commands("not a command").is_empty());
+    }
+
+    #[test]
+    fn nested_split_close_preserves_remaining_branches() {
+        let mut tree = PaneTree::leaf(0);
+        tree.split(0, 1, SplitDirection::Vertical);
+        tree.split(1, 2, SplitDirection::Horizontal);
+        tree.split(2, 3, SplitDirection::Vertical);
+        assert_eq!(tree.leaves(), [0, 1, 2, 3]);
+        assert_eq!(tree.next_leaf(3), 0);
+        let tree = tree.remove(1).unwrap();
+        assert_eq!(tree.leaves(), [0, 1, 2]);
+        assert!(matches!(tree, PaneTree::Split { .. }));
+        let encoded = serde_json::to_vec(&tree).unwrap();
+        let restored: PaneTree = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored, tree);
+        assert_eq!(PaneTree::leaf(0).remove(0), None);
+    }
+
+    #[test]
+    fn session_round_trips_and_rejects_inconsistent_state() {
+        let path = std::env::temp_dir().join(format!("forge-session-{}.json", std::process::id()));
+        let mut tree = PaneTree::leaf(0);
+        tree.split(0, 1, SplitDirection::Horizontal);
+        let session = WindowSession {
+            version: WindowSession::VERSION,
+            count: 2,
+            active: 1,
+            split: Some(tree),
+            cwd: std::env::temp_dir(),
+            width: 960.0,
+            height: 600.0,
+            theme: Some("forge-light".into()),
+        };
+        session.save(&path).unwrap();
+        assert_eq!(WindowSession::load(&path).unwrap(), Some(session.clone()));
+        // Unchanged content does not rewrite the file.
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        session.save(&path).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+
+        let broken = WindowSession {
+            active: 5,
+            ..session.clone()
+        };
+        assert!(broken.validate().is_err());
+        let stale = WindowSession {
+            version: 1,
+            ..session
+        };
+        assert!(stale.validate().is_err());
+        fs::write(&path, "{not json").unwrap();
+        assert!(WindowSession::load(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        assert_eq!(WindowSession::load(&path).unwrap(), None);
     }
 }

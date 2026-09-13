@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 gpui.workspace = true
 proto-ipc = { path = "../proto-ipc" }
+schemars = "1"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

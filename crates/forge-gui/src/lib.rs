@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod shell;
+pub mod theme;
 
 use proto_ipc::{CursorStyle, Rgb, ScreenCell, ScreenCursor, ScreenRow, ServerMessage};
 use std::ops::Range;
