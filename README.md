@@ -60,8 +60,10 @@ show_status = true
 Mouse: drag to select, double-click selects a word, triple-click a line; a
 finished selection lands on the Linux primary buffer (middle click).
 Keys: `Ctrl+Shift+C` copies, `Ctrl+Shift+V` pastes the clipboard,
-`Shift+Insert` pastes the primary buffer. Typing clears the selection. The
-window closes when the shell exits.
+`Shift+Insert` pastes the primary buffer, and `Ctrl+T` opens another Forge
+terminal window in the same application and starting directory. Typing clears
+the selection. A shell that exits leaves its window available while other
+terminal windows continue running.
 
 ## Current scope
 

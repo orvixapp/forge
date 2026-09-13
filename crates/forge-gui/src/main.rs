@@ -7,9 +7,10 @@ use forge_gui::{
     encode_terminal_key,
 };
 use gpui::{
-    App, Application, Bounds, ClipboardItem, Context, FocusHandle, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, Timer, Window, WindowBounds,
-    WindowHandle, WindowOptions, div, prelude::*, px, size,
+    App, Application, AssetSource, Bounds, ClipboardItem, Context, FocusHandle, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, SharedString, Timer, Window,
+    WindowBounds, WindowDecorations, WindowHandle, WindowOptions, div, img, prelude::*, px, rgb,
+    size,
 };
 use grid_element::{CellMetrics, Palette, TerminalGridElement, TerminalSurface};
 use proto_ipc::{
@@ -52,8 +53,25 @@ struct FrameProbe {
     presented: oneshot::Sender<f64>,
 }
 
-/// Height of the status line above the grid, including its bottom margin.
-const STATUS_HEIGHT: f32 = 24.0;
+/// Height of the application chrome above the terminal grid.
+const TOPBAR_HEIGHT: f32 = 36.0;
+
+struct Assets;
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        match path {
+            "forge-logo.svg" => Ok(Some(std::borrow::Cow::Borrowed(include_bytes!(
+                "../assets/forge-logo.svg"
+            )))),
+            _ => Ok(None),
+        }
+    }
+
+    fn list(&self, _path: &str) -> anyhow::Result<Vec<SharedString>> {
+        Ok(vec!["forge-logo.svg".into()])
+    }
+}
 
 /// Everything needed to create another terminal window in this application.
 /// Keeping this in one small value makes Ctrl+T use the same shell, config,
@@ -80,6 +98,10 @@ impl WindowFactory {
         let window = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // Forge owns the chrome whenever the compositor accepts
+                // client-side decorations.
+                window_decorations: Some(WindowDecorations::Client),
+                app_id: Some("dev.forge.Terminal".into()),
                 ..Default::default()
             },
             move |window, cx| {
@@ -112,9 +134,10 @@ impl WindowFactory {
         if start_ipc {
             let socket = self.socket.clone();
             let shell = self.shell.clone();
+            let cwd = self.cwd.clone();
             window.update(cx, |_, window, _| {
                 window.on_next_frame(move |_, _| {
-                    spawn_ipc_worker(socket, shell, event_tx, input_rx);
+                    spawn_ipc_worker(socket, shell, cwd, event_tx, input_rx);
                 });
             })?;
         }
@@ -220,7 +243,7 @@ impl ForgeWindow {
             && keystroke.key.eq_ignore_ascii_case("t")
         {
             let factory = self.factory.clone();
-            cx.spawn(async move |cx| {
+            cx.spawn(async move |_this, cx| {
                 let _ = cx.update(|app| factory.open(app, true));
             })
             .detach();
@@ -327,9 +350,11 @@ impl Render for ForgeWindow {
                     .send(probe.started.elapsed().as_secs_f64() * 1_000.0);
             });
         }
-        let (cols, rows) = self.terminal.grid.dimensions();
         let palette = self.terminal.palette;
         let config = &self.config;
+        let chrome = rgb(0x171b24);
+        let chrome_border = rgb(0x2a3140);
+        let muted = rgb(0x7f8aa3);
         div()
             .id("forge-terminal")
             .track_focus(&self.focus)
@@ -349,24 +374,45 @@ impl Render for ForgeWindow {
             )
             .cursor(gpui::CursorStyle::IBeam)
             .size_full()
+            .flex()
+            .flex_col()
             .overflow_hidden()
             .bg(palette.background)
             .text_color(palette.foreground)
-            .p(px(config.terminal.padding))
             .font_family(config.font.family.clone())
-            .when(config.terminal.show_status, |element| {
-                element.child(
-                    div()
-                        .h(px(STATUS_HEIGHT - 4.0))
-                        .mb(px(4.0))
-                        .text_size(px(13.0))
-                        .text_color(palette.accent)
-                        .child(format!("Forge · {cols}×{rows} · {}", self.status)),
-                )
-            })
-            .child(TerminalGridElement::new(cx.entity(), |view: &mut Self| {
-                &mut view.terminal
-            }))
+            .child(
+                div()
+                    .h(px(TOPBAR_HEIGHT))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .px(px(10.0))
+                    .gap(px(8.0))
+                    .bg(chrome)
+                    .border_b_1()
+                    .border_color(chrome_border)
+                    .child(img("forge-logo.svg").size(px(21.0)))
+                    .child(div().text_size(px(13.0)).child("Terminal"))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(muted)
+                            .child("Ctrl+T · nueva terminal"),
+                    )
+                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(rgb(0x62d196)))
+                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(rgb(0xf2cc67)))
+                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(rgb(0xef7182))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .p(px(config.terminal.padding))
+                    .child(TerminalGridElement::new(cx.entity(), |view: &mut Self| {
+                        &mut view.terminal
+                    })),
+            )
     }
 }
 
@@ -375,8 +421,6 @@ fn main() {
     let started = Instant::now();
     let socket = options.socket;
     let grid_frames = options.benchmark_grid_frames;
-    let (event_tx, event_rx) = mpsc::channel();
-    let (input_tx, input_rx) = async_mpsc::unbounded_channel();
     let render_count = Arc::new(AtomicU64::new(0));
     // Benchmarks stay comparable across machines by ignoring user config.
     let config = if grid_frames.is_some() {
@@ -390,88 +434,65 @@ fn main() {
         size(px(960.0), px(600.0))
     };
 
-    Application::new().run(move |cx: &mut App| {
-        let mut config = config;
-        let family = resolve_font_family(&config.font.family, &cx.text_system().all_font_names());
-        if !family.eq_ignore_ascii_case(&config.font.family) {
-            eprintln!(
-                "forge: fuente {:?} no disponible como familia; usando {family:?}",
-                config.font.family
-            );
-        }
-        config.font.family = family;
-        let config = Arc::new(config);
-        // The grid benchmark needs every one of its 200×60 cells on screen.
-        let metrics = if grid_frames.is_some() {
-            CellMetrics::BENCHMARK
-        } else {
-            cell_metrics_for(&config, cx)
-        };
-        let chrome_height = chrome_height(&config);
-        let shell = (config.shell(), config.terminal.args.clone());
-        let bounds = Bounds::centered(None, window_size, cx);
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    let resize_tx = input_tx.clone();
-                    let view = cx.new(|cx| {
-                        cx.observe_window_bounds(window, move |_, window, _| {
-                            let (cols, rows) =
-                                grid_dimensions(window.bounds().size, metrics, chrome_height);
-                            let _ = resize_tx.send(IpcCommand::Resize { cols, rows });
-                        })
-                        .detach();
-                        ForgeWindow::new(
-                            event_rx,
-                            input_tx,
-                            Arc::clone(&render_count),
-                            metrics,
-                            Arc::clone(&config),
-                            cx,
-                        )
-                    });
-                    window.focus(&view.read(cx).focus);
-                    view
-                },
-            )
-            .expect("open Forge window");
-        if options.exit_after_first_frame {
-            window
-                .update(cx, |_, window, _| {
-                    window.on_next_frame(move |_, cx| {
-                        emit_metrics(&GuiMetrics {
-                            scenario: "startup_empty",
-                            elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
-                            samples_ms: None,
-                            frames: 1,
-                            pss_kib: process_pss_kib(),
-                            painted_cells: None,
+    Application::new()
+        .with_assets(Assets)
+        .run(move |cx: &mut App| {
+            let mut config = config;
+            let family =
+                resolve_font_family(&config.font.family, &cx.text_system().all_font_names());
+            if !family.eq_ignore_ascii_case(&config.font.family) {
+                eprintln!(
+                    "forge: fuente {:?} no disponible como familia; usando {family:?}",
+                    config.font.family
+                );
+            }
+            config.font.family = family;
+            let config = Arc::new(config);
+            // The grid benchmark needs every one of its 200×60 cells on screen.
+            let metrics = if grid_frames.is_some() {
+                CellMetrics::BENCHMARK
+            } else {
+                cell_metrics_for(&config, cx)
+            };
+            let chrome_height = chrome_height(&config);
+            let shell = (config.shell(), config.terminal.args.clone());
+            let factory = WindowFactory {
+                socket,
+                shell,
+                cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                config: Arc::clone(&config),
+                metrics,
+                window_size,
+                chrome_height,
+                render_count: Arc::clone(&render_count),
+            };
+            let start_ipc = options.benchmark_idle_ms.is_none() && grid_frames.is_none();
+            let window = factory.open(cx, start_ipc).expect("open Forge window");
+            if options.exit_after_first_frame {
+                window
+                    .update(cx, |_, window, _| {
+                        window.on_next_frame(move |_, cx| {
+                            emit_metrics(&GuiMetrics {
+                                scenario: "startup_empty",
+                                elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                                samples_ms: None,
+                                frames: 1,
+                                pss_kib: process_pss_kib(),
+                                painted_cells: None,
+                            });
+                            cx.quit();
                         });
-                        cx.quit();
-                    });
-                })
-                .expect("schedule startup measurement");
-        } else if options.benchmark_idle_ms.is_none() && grid_frames.is_none() {
-            window
-                .update(cx, |_, window, _| {
-                    window.on_next_frame(move |_, _| {
-                        spawn_ipc_worker(socket, shell, event_tx, input_rx);
-                    });
-                })
-                .expect("schedule terminal startup");
-        }
-        if let Some(idle_ms) = options.benchmark_idle_ms {
-            spawn_idle_benchmark(idle_ms, Arc::clone(&render_count), cx);
-        }
-        if let Some(iterations) = grid_frames {
-            spawn_grid_benchmark(iterations, window, cx);
-        }
-        cx.activate(true);
-    });
+                    })
+                    .expect("schedule startup measurement");
+            }
+            if let Some(idle_ms) = options.benchmark_idle_ms {
+                spawn_idle_benchmark(idle_ms, Arc::clone(&render_count), cx);
+            }
+            if let Some(iterations) = grid_frames {
+                spawn_grid_benchmark(iterations, window, cx);
+            }
+            cx.activate(true);
+        });
 }
 
 fn spawn_idle_benchmark(idle_ms: u64, render_count: Arc<AtomicU64>, cx: &mut App) {
@@ -550,6 +571,7 @@ fn spawn_grid_benchmark(iterations: usize, window: WindowHandle<ForgeWindow>, cx
 fn spawn_ipc_worker(
     socket: PathBuf,
     shell: (String, Vec<String>),
+    cwd: PathBuf,
     events: Sender<UiEvent>,
     input: async_mpsc::UnboundedReceiver<IpcCommand>,
 ) {
@@ -561,7 +583,7 @@ fn spawn_ipc_worker(
                 .build()
                 .context("create IPC runtime")
                 .and_then(|runtime| {
-                    runtime.block_on(run_ipc(socket, shell, events.clone(), input))
+                    runtime.block_on(run_ipc(socket, shell, cwd, events.clone(), input))
                 });
             if let Err(error) = result {
                 let _ = events.send(UiEvent::Status(format!("Sin conexión: {error:#}")));
@@ -573,6 +595,7 @@ fn spawn_ipc_worker(
 async fn run_ipc(
     socket: PathBuf,
     (command, args): (String, Vec<String>),
+    cwd: PathBuf,
     events: Sender<UiEvent>,
     mut input: async_mpsc::UnboundedReceiver<IpcCommand>,
 ) -> Result<()> {
@@ -600,6 +623,7 @@ async fn run_ipc(
             request_id: 1,
             command,
             args,
+            cwd,
             cols: 80,
             rows: 24,
         },
@@ -767,14 +791,9 @@ fn cell_metrics_for(config: &Config, cx: &App) -> CellMetrics {
     }
 }
 
-/// Vertical space taken by window padding and the status line above the grid.
+/// Vertical space taken by window padding and the application chrome.
 fn chrome_height(config: &Config) -> f32 {
-    config.terminal.padding * 2.0
-        + if config.terminal.show_status {
-            STATUS_HEIGHT
-        } else {
-            0.0
-        }
+    config.terminal.padding * 2.0 + TOPBAR_HEIGHT
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -927,7 +946,7 @@ mod tests {
     #[test]
     fn derives_grid_dimensions_from_window_size_and_cell_metrics() {
         let chrome = chrome_height(&Config::default());
-        assert!((chrome - 56.0).abs() < f32::EPSILON);
+        assert!((chrome - 68.0).abs() < f32::EPSILON);
         let metrics = CellMetrics {
             width: 9.0,
             height: 18.0,
@@ -935,11 +954,11 @@ mod tests {
         };
         assert_eq!(
             grid_dimensions(size(px(900.0), px(416.0)), metrics, chrome),
-            (100, 20)
+            (100, 19)
         );
         assert_eq!(
             grid_dimensions(size(px(1300.0), px(700.0)), CellMetrics::BENCHMARK, chrome),
-            (216, 64)
+            (216, 63)
         );
         assert_eq!(
             grid_dimensions(size(px(1.0), px(1.0)), metrics, chrome),
@@ -948,7 +967,7 @@ mod tests {
         let mut bare = Config::default();
         bare.terminal.show_status = false;
         bare.terminal.padding = 0.0;
-        assert!(chrome_height(&bare).abs() < f32::EPSILON);
+        assert!((chrome_height(&bare) - TOPBAR_HEIGHT).abs() < f32::EPSILON);
     }
 
     #[test]
