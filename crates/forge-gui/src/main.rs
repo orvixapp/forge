@@ -549,9 +549,10 @@ mod tests {
         colored.text = "b".into();
         colored.foreground = Some(Rgb { r: 1, g: 2, b: 3 });
         let runs = cell_runs(&[plain.clone(), plain, colored.clone(), colored], Some(1));
-        assert_eq!(runs.len(), 4, "cursor and style boundaries split runs");
+        assert_eq!(runs.len(), 3, "cursor and style boundaries split runs");
         assert_eq!(runs[0].text, "a");
         assert!(runs[1].cursor);
         assert_eq!(runs[2].foreground, Some(Rgb { r: 1, g: 2, b: 3 }));
+        assert_eq!(runs[2].text, "bb");
     }
 }
