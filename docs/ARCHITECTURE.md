@@ -33,7 +33,7 @@ Forge es un entorno de desarrollo **terminal-first** para trabajo asistido por a
 6. **Terminal sobre `alacritty_terminal` + `portable-pty`**, con integración de shell (OSC 133/7/8), scrollback por niveles y persistencia de sesión vía daemon. Se evalúa `libghostty-vt` cuando su API se estabilice. **[RECOMENDADO → prototipo]**
 7. **Editor sobre rope (`ropey`/`crop`) + tree-sitter + cliente LSP propio**, ediciones como operaciones (no como "reemplazar buffer") para que parsing incremental, LSP incremental, undo y ediciones de agentes compartan el mismo primitivo. Sin CRDT. **[DECIDIDO]**
 8. **Extensiones VS Code en Node.js real** (bundled, versión fijada), con nuestra propia implementación TypeScript del namespace `vscode` guiada por un **escáner de uso de API** sobre las 1.000 extensiones más instaladas de Open VSX. Sin QuickJS ni V8 embebido para esto. **[DECIDIDO]** El registro es **Open VSX** (los ToS del Marketplace de Microsoft lo prohíben). **[DECIDIDO]**
-9. **Configuración como datos (JSONC + JSON Schema), no como código.** Sin lenguaje de scripting en v1. Las automatizaciones se expresan como comandos y macros. **[RECOMENDADO → confirmar antes de tener usuarios]**
+9. **Configuración como datos (TOML + JSON Schema generado), no como código.** Sin lenguaje de scripting en v1. Las automatizaciones se expresan como comandos y macros. **[DECIDIDO en Fase 1]** (§22.1)
 10. **Rendimiento como restricción continua, no como fase.** La suite de benchmarks es un crate del workspace desde la Fase 1 y corre en CI con umbrales. La "Fase 10: optimización extrema" del brief se elimina. **[DECIDIDO]**
 11. **Modelos intercambiables sin cliente LLM propio.** Las suscripciones existentes (ChatGPT → Codex, Anthropic → Claude Code), los gateways compatibles con OpenAI (p. ej. Token Harbor) y los modelos locales (llama.cpp) son **perfiles de proveedor** que Forge inyecta en la configuración de los agentes, y un **enrutador por clase de tarea** (trivial / normal / compleja / sin red) decide qué agente y qué perfil atienden cada petición. Forge no llama a APIs de modelos por sí mismo. **[RECOMENDADO → Fase 4]**
 
@@ -276,7 +276,7 @@ Zig merece una nota: Ghostty demuestra que se puede construir la mejor terminal 
 | Ext host | Node.js LTS bundled; shim `vscode` propio en TS | Alta | Escáner Fase 0 |
 | Webviews | `wry` como vista hija superpuesta | **Baja** | Spike Fase 8 |
 | IPC | unix socket / named pipe; framing propio; MessagePack interno, JSON-RPC externo | Alta | Bench termd Fase 0 |
-| Config | JSONC + JSON Schema, capas | Media | Confirmar Fase 1 |
+| Config | TOML + JSON Schema generado, capas usuario/workspace | **Alta** | Decidido en Fase 1 (§22.1) |
 | Allocator | mimalloc | Alta | — |
 | Observabilidad | `tracing` + exportación Perfetto/Tracy; `minidumper` para crashes | Alta | — |
 | Async | tokio (I/O), rayon (CPU), hilo de UI dedicado | Alta | — |
@@ -629,7 +629,7 @@ ConPTY tiene diferencias de comportamiento (re-renderiza en lugar de pasar secue
 ## 15. LSP
 
 - Cliente propio en `forge-lsp` sobre `lsp-types` (tipos generados de la spec), transporte `Content-Length` sobre stdio (y TCP/socket para servidores que lo exijan). No se usa `tower-lsp` (es para *escribir* servidores).
-- **Registro de lenguajes** (`languages.jsonc`, extensible por paquetes y por extensiones VS Code vía `contributes.languages`): id, extensiones, gramática tree-sitter, servidores (comando, args, `initializationOptions`, `rootMarkers`), formateadores, comentarios, indentación. Formato inspirado en `languages.toml` de Helix, en JSONC por coherencia (§22).
+- **Registro de lenguajes** (`languages.jsonc`, extensible por paquetes y por extensiones VS Code vía `contributes.languages`): id, extensiones, gramática tree-sitter, servidores (comando, args, `initializationOptions`, `rootMarkers`), formateadores, comentarios, indentación. Formato inspirado en `languages.toml` de Helix, en TOML por coherencia (§22).
 - **Multi-servidor**: N servidores por lenguaje (p. ej. `typescript-language-server` + `eslint` + `tailwindcss`); las respuestas se fusionan por capacidad (completion: concatenar y deduplicar; hover: apilar; diagnostics: unir por fuente).
 - **Ciclo de vida**: arranque en el primer buffer del lenguaje abierto **tras 500 ms** (evitar arrancar al previsualizar), una instancia por (servidor, raíz) con detección de raíz por `rootMarkers`, apagado por inactividad (§10.4), reinicio con backoff, re-`didOpen` tras reinicio.
 - **Sincronización**: `didChange` incremental derivado de las transacciones (§13.2), debounce 50–100 ms con flush inmediato antes de cualquier request que dependa del contenido (completion, hover). `didSave`, `willSaveWaitUntil` con timeout 1 s.
@@ -879,51 +879,59 @@ No en v1. Candidatos cuando haga falta: **WASM (wasmtime + component model)** al
 
 ## 22. Sistema de configuración
 
-### 22.1 Formato **[RECOMENDADO → confirmar en Fase 1]**
+### 22.1 Formato **[DECIDIDO en Fase 1: TOML]**
 
 | Formato | Pros | Contras |
 |---|---|---|
-| **JSONC + JSON Schema** | Las extensiones VS Code ya contribuyen configuración como JSON Schema (validación, autocompletado y settings UI gratis); el editor lo edita con validación; familiar | Verboso; comas |
-| TOML | Legible; estándar Rust/Helix | Estructuras anidadas profundas (layouts, keymaps con `when`) son incómodas; sin schema estándar ampliamente soportado |
+| JSONC + JSON Schema | Las extensiones VS Code ya contribuyen configuración como JSON Schema (validación, autocompletado y settings UI gratis); el editor lo edita con validación; familiar | Verboso; comas |
+| **TOML + JSON Schema** | Legible; estándar Rust/Helix/Alacritty/Ghostty, que es lo que espera el usuario terminal-first; los editores validan TOML contra JSON Schema (taplo, Even Better TOML) | Estructuras anidadas profundas (layouts, keymaps con `when`) son incómodas; las contribuciones JSON de extensiones se convierten |
 | KDL | Ideal para layouts (Zellij) | Segundo formato; ecosistema pequeño |
 | Lua/JS | Poder ilimitado | Config = código no auditable; segundo ecosistema; seguridad |
 
-Un solo formato: **JSONC**. Todo archivo de config tiene `$schema`; el schema global se genera desde el código (Rust `schemars`) más las contribuciones de extensiones.
+Decisión tomada al cerrar la Fase 1 con el código en la mano: **TOML** (`~/.config/forge/config.toml`), con el JSON Schema generado desde los tipos Rust con `schemars` (`forge-gui --print-config-schema`, publicado en `docs/config.schema.json`). El layout persistido (`session.json`) es JSON generado por Forge, no editado a mano. Cuando lleguen las extensiones VS Code, sus contribuciones de configuración se exponen bajo su propio prefijo del mismo schema; la sección "JSONC" de este documento queda como alternativa descartada.
 
 ### 22.2 Capas (precedencia creciente)
 
 ```text
-defaults (compiladas)  →  usuario (~/.config/forge/settings.jsonc)
-  →  perfil activo (~/.config/forge/profiles/<name>/settings.jsonc)
-  →  workspace (<repo>/.forge/settings.jsonc; solo si el workspace es de confianza)
+defaults (compiladas)  →  usuario (~/.config/forge/config.toml)          [Fase 1]
+  →  perfil activo (~/.config/forge/profiles/<name>/config.toml)
+  →  workspace (<repo>/.forge/config.toml)                                [Fase 1]
   →  carpeta (multi-root: por carpeta)
   →  overrides por lenguaje ("[rust]": {…})
   →  runtime (cambios temporales por comando; no se persisten salvo "guardar")
 ```
 
-Cada valor resuelto sabe de qué capa viene (la UI lo muestra; "¿por qué está esta opción así?"). Recarga en caliente por watcher. Claves con `restart_required` explícito (pocas: renderer, runtime de ext host).
+Cada valor resuelto sabe de qué capa viene (la UI lo muestra; "¿por qué está esta opción así?"). Recarga en caliente (en Fase 1 por sondeo cada segundo sin redibujar si nada cambió; watcher cuando haya más archivos que vigilar). Claves con `restart_required` explícito (pocas: renderer, runtime de ext host). Hasta que exista el modelo de confianza (§23), la capa de workspace **no puede** fijar `terminal.shell` ni `terminal.args`: un repositorio no elige qué programa ejecuta Forge en la máquina del usuario.
 
 ### 22.3 Qué se configura
 
-`settings.jsonc` (comportamiento), `keymap.jsonc` (bindings con `when`, chords, modos), `layout.jsonc` (árbol de panes/docks por defecto y por workspace), `themes/*.jsonc`, `languages.jsonc` (registro §15), `agents.jsonc` (agentes, proveedores de modelos, enrutamiento y MCP servers), `tasks.jsonc` (compatible con `tasks.json` de VS Code), `profiles/`. El workspace puede aportar `.forge/{settings,keymap,tasks,agents}.jsonc` bajo trust.
+`config.toml` (comportamiento, fuente, colores, `[[keybindings]]`; en Fase 1 un solo archivo), `themes/*.toml` (temas del usuario sobre una base integrada), `session.json` (layout, tamaño y tema de la última ventana, escrito por Forge), y más adelante `keymap.toml` (bindings con `when`, chords, modos), `layout.toml`, `languages.toml` (registro §15), `agents.toml` (agentes, proveedores de modelos, enrutamiento y MCP servers), `tasks.toml` (compatible con `tasks.json` de VS Code), `profiles/`. El workspace puede aportar `.forge/config.toml` (y más adelante `keymap`, `tasks`, `agents`) bajo trust.
 
-Forma de `agents.jsonc` para proveedores y enrutamiento (§17.7):
+Forma de `agents.toml` para proveedores y enrutamiento (§17.7):
 
-```jsonc
-{
-  "providers": {
-    "openai":      { "type": "chatgpt", "agent": "codex", "cost": "subscription" },
-    "tokenharbor": { "type": "openai-compatible", "endpoint": "https://…/v1",
-                     "credential": "keyring:tokenharbor", "model": "deepseek-v4-flash:free", "cost": "free" },
-    "local":       { "type": "local", "endpoint": "http://127.0.0.1:8080/v1", "cost": "free" }
-  },
-  "routing": {
-    "trivial": { "agent": "opencode", "provider": "tokenharbor" },
-    "normal":  { "agent": "opencode", "provider": "tokenharbor", "model": "th-orchestra" },
-    "complex": { "agent": "codex",    "provider": "openai" },
-    "offline": { "agent": "opencode", "provider": "local" }
-  }
-}
+```toml
+[providers.openai]
+type = "chatgpt"
+agent = "codex"
+cost = "subscription"
+
+[providers.tokenharbor]
+type = "openai-compatible"
+endpoint = "https://…/v1"
+credential = "keyring:tokenharbor"
+model = "deepseek-v4-flash:free"
+cost = "free"
+
+[providers.local]
+type = "local"
+endpoint = "http://127.0.0.1:8080/v1"
+cost = "free"
+
+[routing]
+trivial = { agent = "opencode", provider = "tokenharbor" }
+normal  = { agent = "opencode", provider = "tokenharbor", model = "th-orchestra" }
+complex = { agent = "codex", provider = "openai" }
+offline = { agent = "opencode", provider = "local" }
 ```
 
 ### 22.4 Comandos, macros, workflows
@@ -996,7 +1004,7 @@ Un perfil = conjunto de settings + keymap + extensiones activas + tema. Cambio d
 
 ## 25. Estrategia de lazy loading
 
-Camino crítico de arranque (objetivo ≤ 100 ms): `main` → leer config del usuario (parse JSONC, ~1 ms) → crear ventana + device wgpu (el coste dominante: 20–60 ms según driver) → restaurar layout del último workspace **desde caché serializada** (sin tocar el filesystem del repo) → primer frame con los paneles vacíos o con el último contenido cacheado → **después** de presentar: arrancar `termd`/attach, abrir buffers, walker del proyecto en fondo, watcher, git, gramáticas de los buffers visibles.
+Camino crítico de arranque (objetivo ≤ 100 ms): `main` → leer config del usuario (parse TOML, <1 ms medido) → crear ventana + device wgpu (el coste dominante: 20–60 ms según driver) → restaurar layout del último workspace **desde caché serializada** (sin tocar el filesystem del repo) → primer frame con los paneles vacíos o con el último contenido cacheado → **después** de presentar: arrancar `termd`/attach, abrir buffers, walker del proyecto en fondo, watcher, git, gramáticas de los buffers visibles.
 
 | Qué | Cuándo se carga | Cuándo se descarga |
 |---|---|---|
@@ -1040,7 +1048,7 @@ Regla: **nada escanea `node_modules`, `.git`, `target`, `vendor`, builds ni cach
 |---|---|---|
 | Unit | rope/transacciones/undo/selecciones, keymap resolver, config layers, framing IPC, políticas de permisos | `cargo test`, `proptest` (invariantes: undo∘redo = id; rebase de ediciones propuestas) |
 | Conformidad VT | secuencias ANSI/DEC, modos, reflow | suites de `alacritty_terminal`, `esctest`, `vttest` scripted; comparación grid-a-grid con Alacritty como oráculo |
-| Fuzzing | parser VT, JSONC/config, framing IPC, protocolo ACP/LSP entrante, gramáticas | `cargo-fuzz` en CI nocturno |
+| Fuzzing | parser VT, TOML/config, framing IPC, protocolo ACP/LSP entrante, gramáticas | `cargo-fuzz` en CI nocturno |
 | Render | snapshots de paneles (texto, selección, diagnósticos) renderizados offscreen con lavapipe, comparación con tolerancia | wgpu headless |
 | Core headless | escenarios de usuario scriptados contra `forge-core` sin GPUI ("abrir X, teclear Y, esperar diagnóstico Z") | harness propio; base para los benchmarks |
 | Protocolos | LSP contra servidor mock + rust-analyzer/tsserver reales; ACP contra un agente mock + Claude Code/Codex/OpenCode/Gemini reales (nightly, con claves de CI); MCP cliente/servidor contra `rmcp` examples | CI por matriz |
@@ -1112,7 +1120,7 @@ Transversal desde Fase 1: presupuestos de rendimiento en CI, crash recovery, pro
 
 - **Objetivo**: la "cáscara" completa sin contenido: ventana, event loop, layout de panes/docks/tabs, comandos, keymap, palette, config con capas y schema, temas y fuentes, process explorer vacío, `forge-bench` con `startup_empty`, `idle_60s`.
 - **Arquitectura**: `forge-app`, `forge-ui`, `forge-core`, `forge-ipc`, `forge-supervisor`, `forge-bench`.
-- **Tareas**: árbol de layout con persistencia; comandos + keymap `when`; JSONC + schema + recarga; tema; IME/DPI/multi-monitor; diálogos nativos; tracing + Perfetto; CI con umbrales.
+- **Tareas**: árbol de layout con persistencia; comandos + keymap `when`; TOML + schema + recarga; tema; IME/DPI/multi-monitor; diálogos nativos; tracing + Perfetto; CI con umbrales. Registro de ejecución y cierre: `docs/PHASE_1_EXECUTION.md`.
 - **Dependencias**: Fase 0.
 - **Riesgos**: IME y Wayland fraccional en GPUI; tiempo de compilación.
 - **Benchmark**: startup ≤ 100 ms; RSS ≤ 60 MB (sin termd); 0 frames idle; frame ≤ 2 ms con 20 paneles vacíos.
@@ -1226,7 +1234,7 @@ Cada una con la pregunta que el prototipo/medición debe responder y cuándo.
 | 4 | `ropey` vs `crop` vs SumTree propio | ¿Necesitamos métricas por nodo (alturas de wrap)? ¿Diferencia medible en `type_1000_chars`? | Fase 3 |
 | 5 | `alacritty_terminal` vs `libghostty-vt` | ¿Estabilidad de la API de libghostty? ¿vtebench y conformance? ¿Reflow, imágenes? | Fase 2 |
 | 6 | Rasterización de texto: `swash` vs plataforma | ¿Calidad percibida y consistencia con el sistema vs. coste de mantener 3 backends? | Fase 1 |
-| 7 | Formato de config JSONC vs TOML | ¿Los keymaps y layouts son legibles? ¿El settings UI generado desde schema es suficiente? | Fase 1 (antes de usuarios) |
+| 7 | Formato de config JSONC vs TOML | **Decidido: TOML** (§22.1). Queda por validar en Fase 3–4 que keymaps con `when` y layouts sigan siendo legibles en TOML | Fase 1 → revisar en Fase 3 |
 | 8 | Separar core y renderer en procesos ("headless core") | ¿Aparece el caso de uso (remote, TUI cliente, multi-ventana entre máquinas)? | Fase 9+ |
 | 9 | Node vs Bun para el ext host | ¿Bun pasa la compat CI top-50 sin regresiones? ¿Ganancia real de RSS/arranque? | Fase 7 (tras tener compat CI) |
 | 10 | Gramáticas TextMate como fallback | ¿Cuántos lenguajes del top-1.000 no tienen gramática tree-sitter? | Fase 7 con datos del escáner |
