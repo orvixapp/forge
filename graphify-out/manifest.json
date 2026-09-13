@@ -1,0 +1,112 @@
+{
+  "crates/forge-gui/src/config.rs": {
+    "mtime": 1789331255.9478056,
+    "ast_hash": "56631b1d398c50b47e0c8b02358e9f5f",
+    "semantic_hash": "56631b1d398c50b47e0c8b02358e9f5f"
+  },
+  "crates/forge-gui/src/grid_element.rs": {
+    "mtime": 1789331061.068535,
+    "ast_hash": "1eb045cb97b11dd85f0b4118619db000",
+    "semantic_hash": "1eb045cb97b11dd85f0b4118619db000"
+  },
+  "crates/forge-gui/src/lib.rs": {
+    "mtime": 1789331061.1918519,
+    "ast_hash": "3bc58c007827a934847ffff32d771af7",
+    "semantic_hash": "3bc58c007827a934847ffff32d771af7"
+  },
+  "crates/forge-gui/src/main.rs": {
+    "mtime": 1789333078.8827267,
+    "ast_hash": "9e92e304ddc770b67e3d8cf74970987f",
+    "semantic_hash": "9e92e304ddc770b67e3d8cf74970987f"
+  },
+  "crates/proto-acp/src/lib.rs": {
+    "mtime": 1789333559.2700999,
+    "ast_hash": "c0cfb87bb05c9ff53d8fb8432104b38c",
+    "semantic_hash": "c0cfb87bb05c9ff53d8fb8432104b38c"
+  },
+  "crates/proto-bench/src/lib.rs": {
+    "mtime": 1789325203.3275588,
+    "ast_hash": "92dd7666fd92488ae0111965d0bac728",
+    "semantic_hash": "92dd7666fd92488ae0111965d0bac728"
+  },
+  "crates/proto-bench/src/main.rs": {
+    "mtime": 1789333236.5338397,
+    "ast_hash": "8a584b2ac4a82ce2cc5145206a077ce9",
+    "semantic_hash": "8a584b2ac4a82ce2cc5145206a077ce9"
+  },
+  "crates/proto-buffer/src/lib.rs": {
+    "mtime": 1789319921.7825365,
+    "ast_hash": "460baf81ffa769ae647199018a115713",
+    "semantic_hash": "460baf81ffa769ae647199018a115713"
+  },
+  "crates/proto-ghostty-vt/src/lib.rs": {
+    "mtime": 1789324593.2618136,
+    "ast_hash": "f85af228c944113cd33db08817171d2d",
+    "semantic_hash": "f85af228c944113cd33db08817171d2d"
+  },
+  "crates/proto-ipc/src/lib.rs": {
+    "mtime": 1789332400.7919383,
+    "ast_hash": "33e23d17563bcbcad42ec8304a5d7709",
+    "semantic_hash": "33e23d17563bcbcad42ec8304a5d7709"
+  },
+  "crates/proto-term-client/src/main.rs": {
+    "mtime": 1789332401.2599416,
+    "ast_hash": "2c088d0f665604a53f1570fae689712c",
+    "semantic_hash": "2c088d0f665604a53f1570fae689712c"
+  },
+  "crates/proto-termd/src/main.rs": {
+    "mtime": 1789332401.01994,
+    "ast_hash": "1238f19b7a131842b6a2d711d9eb5cb9",
+    "semantic_hash": "1238f19b7a131842b6a2d711d9eb5cb9"
+  },
+  "crates/proto-termd/tests/terminal_round_trip.rs": {
+    "mtime": 1789332401.4909432,
+    "ast_hash": "5e2b27ad2fe7638f71a1e3b896e71aa2",
+    "semantic_hash": "5e2b27ad2fe7638f71a1e3b896e71aa2"
+  },
+  "scripts/bootstrap-ghostty.sh": {
+    "mtime": 1789322824.085053,
+    "ast_hash": "8567a952f7fab2160296df388018f888",
+    "semantic_hash": "8567a952f7fab2160296df388018f888"
+  },
+  "tools/vscode-api-scan/scan.mjs": {
+    "mtime": 1789333431.6002085,
+    "ast_hash": "a992602ccae2260ca4de9f2e479afda0",
+    "semantic_hash": "a992602ccae2260ca4de9f2e479afda0"
+  },
+  ".github/workflows/ci.yml": {
+    "mtime": 1789321745.8686664,
+    "ast_hash": "7ec929f60c5f2eeb635baaef28be6f8f",
+    "semantic_hash": "7ec929f60c5f2eeb635baaef28be6f8f"
+  },
+  "README.md": {
+    "mtime": 1789333966.0869408,
+    "ast_hash": "06e4bab78f8a187e1ed3330e11a54040",
+    "semantic_hash": "06e4bab78f8a187e1ed3330e11a54040"
+  },
+  "bench/MACHINES.md": {
+    "mtime": 1789319659.2760599,
+    "ast_hash": "fb47b72c6eedc026a12bcf6f4cdb0692",
+    "semantic_hash": "fb47b72c6eedc026a12bcf6f4cdb0692"
+  },
+  "bench/results/2026-09-13-grid-full.md": {
+    "mtime": 1789330316.4010253,
+    "ast_hash": "e60f1458924fe79242e7db8e4992e4be",
+    "semantic_hash": "e60f1458924fe79242e7db8e4992e4be"
+  },
+  "docs/ARCHITECTURE.md": {
+    "mtime": 1789333966.552944,
+    "ast_hash": "f0cf169026178ed34027c741f7033b62",
+    "semantic_hash": "f0cf169026178ed34027c741f7033b62"
+  },
+  "tools/vscode-api-scan/README.md": {
+    "mtime": 1789333990.4961112,
+    "ast_hash": "fe9010ae3021baaa4a41cd760e5e8060",
+    "semantic_hash": "fe9010ae3021baaa4a41cd760e5e8060"
+  },
+  "crates/forge-gui/assets/forge-logo.svg": {
+    "mtime": 1789332734.5772953,
+    "ast_hash": "9ad951f6deb4ff7d9a11fd67ba79c2f5",
+    "semantic_hash": "9ad951f6deb4ff7d9a11fd67ba79c2f5"
+  }
+}

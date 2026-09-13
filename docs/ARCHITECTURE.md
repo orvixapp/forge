@@ -833,7 +833,9 @@ Consecuencia: la cobertura VS Code crece cuando crece la API nativa, y viceversa
 
 ### 20.3 Medir en lugar de estimar: `tools/vscode-api-scan`
 
-Fase 0 entrega una herramienta que descarga el top-N (1.000) de Open VSX por instalaciones, extrae `package.json` y el bundle, y con un análisis estático (AST con `swc`/`oxc`; fallback regex para bundles minificados) cuenta referencias a `vscode.<ns>.<miembro>` y a `contributes.*`, ponderando por instalaciones. Salida: tabla `API → nº extensiones que la usan → instalaciones acumuladas`. Esa tabla **ordena el backlog** de la Tier 1/2 y alimenta el dashboard público de cobertura. Sin esta herramienta, los porcentajes de arriba son opiniones.
+Fase 0 entrega `tools/vscode-api-scan`: descarga el top-N (1.000) de Open VSX por instalaciones, extrae `package.json` y los bundles JavaScript, y cuenta referencias estáticas a `vscode.<ns>.<miembro>` y a las claves de primer nivel de `contributes`, ponderadas por instalaciones. La implementación actual es deliberadamente sin dependencias: usa una expresión regular auditable, no AST con `swc`/`oxc`. Por tanto no infiere aliases, imports, propiedades computadas ni uso dinámico; esos casos se excluyen y la tabla se interpreta como un mínimo observable, no como cobertura total.
+
+La salida es `kind,member,extensions,installs`, acompañada por fecha, versión de Node y checksum del CSV en `bench/results/openvsx-<fecha>/`. La guía reproducible y la semántica de cada columna viven en [`tools/vscode-api-scan/README.md`](../tools/vscode-api-scan/README.md); el criterio de aceptación de Fase 0, en [`docs/PHASE_0.md`](PHASE_0.md). La tabla **ordena el backlog** de la Tier 0/1; una fila alta no declara una API compatible. Cada prioridad pasa después por `vscode.d.ts` y una prueba de extensión real antes de entrar en el dashboard público.
 
 ### 20.4 Gramáticas y temas TextMate
 

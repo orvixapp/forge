@@ -23,6 +23,13 @@ or starts one automatically, creates a shell, forwards keyboard input, and
 stops the daemon it owns when the window closes. Building Ghostty is a one-time
 bootstrap step.
 
+On Linux, install the user-scoped desktop entry once to make the taskbar match
+Forge's Wayland/X11 application ID and icon:
+
+```bash
+./scripts/install-linux-desktop-integration.sh
+```
+
 The benchmark runner emits JSON. With `--check`, it also enforces the versioned
 budgets in `bench/thresholds.toml`; the idle scenario runs for 60 seconds. Build
 `forge-gui` in the same profile before running the GUI scenarios, and run them
@@ -78,5 +85,9 @@ terminal windows continue running.
   cold startup, PSS, idle redraws and the fully dirty 200×60 grid.
 - Measured: see `bench/results/2026-09-13-grid-full.md` for the grid spike
   numbers and the reading behind bet A.
+- Documentation: the Phase 0 close-out and the evidence expected from the
+  Open VSX scan are recorded in [`docs/PHASE_0.md`](docs/PHASE_0.md).
 - Next: incremental terminal redraw (cached unchanged rows), ACP capability
-  flow, benchmark history persistence and the Open VSX API scanner.
+  flow and benchmark history persistence. The Open VSX scanner is implemented;
+  its first registry run remains an evidence-gathering task, not a claim of
+  extension compatibility.

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Forge
+Comment=Terminal-first development environment
+Exec=forge-gui
+Icon=dev.forge.Forge
+Terminal=false
+Categories=Development;Utility;TerminalEmulator;
+StartupWMClass=dev.forge.Forge
+StartupNotify=true

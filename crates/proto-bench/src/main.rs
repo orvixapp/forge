@@ -36,6 +36,9 @@ async fn main() -> Result<()> {
         ),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
+    if let Some(path) = options.output.as_deref() {
+        save_result(path, &result)?;
+    }
     if options.check {
         check_thresholds(&result)?;
     }
@@ -46,6 +49,20 @@ async fn main() -> Result<()> {
 struct Options {
     iterations: usize,
     check: bool,
+    output: Option<PathBuf>,
+}
+
+fn save_result(path: &std::path::Path, result: &BenchmarkResult) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .context("benchmark output needs a parent directory")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create benchmark directory {}", parent.display()))?;
+    let mut encoded = serde_json::to_vec_pretty(result)?;
+    encoded.push(b'\n');
+    std::fs::write(path, encoded)
+        .with_context(|| format!("write benchmark result {}", path.display()))
 }
 
 async fn ipc_round_trip(iterations: usize) -> Result<BenchmarkResult> {
@@ -140,11 +157,16 @@ fn parse_options(args: &[String]) -> Result<Options> {
     let mut options = Options {
         iterations: 10,
         check: false,
+        output: None,
     };
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--check" => options.check = true,
+            "--output" => {
+                index += 1;
+                options.output = Some(args.get(index).context("--output requires a path")?.into());
+            }
             "--iterations" => {
                 index += 1;
                 let value = args.get(index).context("--iterations requires a value")?;
@@ -170,17 +192,39 @@ mod tests {
             parse_options(&[]).unwrap(),
             Options {
                 iterations: 10,
-                check: false
+                check: false,
+                output: None,
             }
         );
         assert_eq!(
             parse_options(&["--check".into(), "--iterations".into(), "3".into()]).unwrap(),
             Options {
                 iterations: 3,
-                check: true
+                check: true,
+                output: None,
             }
         );
         assert!(parse_options(&["--iterations".into(), "0".into()]).is_err());
+        assert_eq!(
+            parse_options(&["--output".into(), "bench/results/example.json".into()])
+                .unwrap()
+                .output,
+            Some(PathBuf::from("bench/results/example.json"))
+        );
+    }
+
+    #[test]
+    fn saves_pretty_json_result() {
+        let directory =
+            std::env::temp_dir().join(format!("forge-bench-test-{}", std::process::id()));
+        let path = directory.join("nested/result.json");
+        let result = summarize("ipc_round_trip", vec![0.25], &[], None);
+        save_result(&path, &result).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<BenchmarkResult>(&std::fs::read(path).unwrap()).unwrap(),
+            result
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

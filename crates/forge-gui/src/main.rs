@@ -7,10 +7,11 @@ use forge_gui::{
     encode_terminal_key,
 };
 use gpui::{
-    App, Application, AssetSource, Bounds, ClipboardItem, Context, FocusHandle, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, SharedString, Timer, Window,
-    WindowBounds, WindowDecorations, WindowHandle, WindowOptions, div, img, prelude::*, px, rgb,
-    size,
+    App, Application, AssetSource, Bounds, ClipboardItem, Context,
+    CursorStyle as WindowCursorStyle, FocusHandle, HitboxBehavior, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point, Render, ResizeEdge, SharedString, Timer,
+    Window, WindowBounds, WindowDecorations, WindowHandle, WindowOptions, canvas, div, img, point,
+    prelude::*, px, rgb, size,
 };
 use grid_element::{CellMetrics, Palette, TerminalGridElement, TerminalSurface};
 use proto_ipc::{
@@ -55,6 +56,10 @@ struct FrameProbe {
 
 /// Height of the application chrome above the terminal grid.
 const TOPBAR_HEIGHT: f32 = 36.0;
+/// Hit target for resizing a client-decorated window. This is intentionally
+/// wider than the visible border so Wayland and X11 feel equally usable.
+const WINDOW_RESIZE_INSET: f32 = 8.0;
+const FORGE_APP_ID: &str = "dev.forge.Forge";
 
 struct Assets;
 
@@ -101,7 +106,11 @@ impl WindowFactory {
                 // Forge owns the chrome whenever the compositor accepts
                 // client-side decorations.
                 window_decorations: Some(WindowDecorations::Client),
-                app_id: Some("dev.forge.Terminal".into()),
+                // Linux desktops associate taskbar icons through this ID and
+                // assets/linux/dev.forge.Forge.desktop, not the in-app SVG.
+                app_id: Some(FORGE_APP_ID.into()),
+                is_resizable: true,
+                window_min_size: Some(size(px(480.0), px(320.0))),
                 ..Default::default()
             },
             move |window, cx| {
@@ -339,7 +348,7 @@ impl ForgeWindow {
 }
 
 impl Render for ForgeWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.render_count.fetch_add(1, Ordering::Relaxed);
         if let Some(probe) = self.frame_probe.take() {
             // Deferred callbacks run when the outermost update finishes, which
@@ -355,15 +364,29 @@ impl Render for ForgeWindow {
         let chrome = rgb(0x171b24);
         let chrome_border = rgb(0x2a3140);
         let muted = rgb(0x7f8aa3);
+        window.set_client_inset(px(WINDOW_RESIZE_INSET));
         div()
             .id("forge-terminal")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|view, event, _, cx| view.on_key_down(event, cx)))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|view, event, _, cx| view.on_mouse_down(event, cx)),
+                cx.listener(|view, event: &MouseDownEvent, window, cx| {
+                    if let Some(edge) =
+                        resize_edge(event.position, window.window_bounds().get_bounds().size)
+                    {
+                        window.start_window_resize(edge);
+                    } else {
+                        view.on_mouse_down(event, cx);
+                    }
+                }),
             )
-            .on_mouse_move(cx.listener(|view, event, _, cx| view.on_mouse_move(event, cx)))
+            .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| {
+                if resize_edge(event.position, window.window_bounds().get_bounds().size).is_none() {
+                    view.on_mouse_move(event, cx);
+                }
+                window.refresh();
+            }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|view, event, _, cx| view.on_mouse_up(event, cx)),
@@ -381,6 +404,30 @@ impl Render for ForgeWindow {
             .text_color(palette.foreground)
             .font_family(config.font.family.clone())
             .child(
+                canvas(
+                    |_bounds, window, _cx| {
+                        window.insert_hitbox(
+                            Bounds::new(
+                                point(px(0.0), px(0.0)),
+                                window.window_bounds().get_bounds().size,
+                            ),
+                            HitboxBehavior::Normal,
+                        )
+                    },
+                    move |_bounds, hitbox, window, _cx| {
+                        let Some(edge) = resize_edge(
+                            window.mouse_position(),
+                            window.window_bounds().get_bounds().size,
+                        ) else {
+                            return;
+                        };
+                        window.set_cursor_style(resize_cursor(edge), &hitbox);
+                    },
+                )
+                .size_full()
+                .absolute(),
+            )
+            .child(
                 div()
                     .h(px(TOPBAR_HEIGHT))
                     .w_full()
@@ -391,18 +438,69 @@ impl Render for ForgeWindow {
                     .bg(chrome)
                     .border_b_1()
                     .border_color(chrome_border)
-                    .child(img("forge-logo.svg").size(px(21.0)))
-                    .child(div().text_size(px(13.0)).child("Terminal"))
-                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("forge-drag-region")
+                            .h_full()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .cursor_default()
+                            .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                window.start_window_move();
+                            })
+                            .child(img("forge-logo.svg").size(px(21.0)))
+                            .child(div().text_size(px(13.0)).child("Terminal")),
+                    )
                     .child(
                         div()
                             .text_size(px(12.0))
                             .text_color(muted)
                             .child("Ctrl+T · nueva terminal"),
                     )
-                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(rgb(0x62d196)))
-                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(rgb(0xf2cc67)))
-                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(rgb(0xef7182))),
+                    .child(
+                        div()
+                            .id("forge-minimize")
+                            .size(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .text_color(muted)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x252c3a)))
+                            .on_click(|_, window, _| window.minimize_window())
+                            .child("—"),
+                    )
+                    .child(
+                        div()
+                            .id("forge-maximize")
+                            .size(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .text_color(muted)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x252c3a)))
+                            .on_click(|_, window, _| window.zoom_window())
+                            .child("□"),
+                    )
+                    .child(
+                        div()
+                            .id("forge-close")
+                            .size(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .text_color(muted)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0xa84152)))
+                            .on_click(|_, window, _| window.remove_window())
+                            .child("×"),
+                    ),
             )
             .child(
                 div()
@@ -413,6 +511,85 @@ impl Render for ForgeWindow {
                         &mut view.terminal
                     })),
             )
+    }
+}
+
+fn resize_edge(
+    position: Point<gpui::Pixels>,
+    size: gpui::Size<gpui::Pixels>,
+) -> Option<ResizeEdge> {
+    let inset = px(WINDOW_RESIZE_INSET);
+    let edge = if position.y < inset && position.x < inset {
+        ResizeEdge::TopLeft
+    } else if position.y < inset && position.x > size.width - inset {
+        ResizeEdge::TopRight
+    } else if position.y < inset {
+        ResizeEdge::Top
+    } else if position.y > size.height - inset && position.x < inset {
+        ResizeEdge::BottomLeft
+    } else if position.y > size.height - inset && position.x > size.width - inset {
+        ResizeEdge::BottomRight
+    } else if position.y > size.height - inset {
+        ResizeEdge::Bottom
+    } else if position.x < inset {
+        ResizeEdge::Left
+    } else if position.x > size.width - inset {
+        ResizeEdge::Right
+    } else {
+        return None;
+    };
+    Some(edge)
+}
+
+fn resize_cursor(edge: ResizeEdge) -> WindowCursorStyle {
+    match edge {
+        ResizeEdge::Top | ResizeEdge::Bottom => WindowCursorStyle::ResizeUpDown,
+        ResizeEdge::Left | ResizeEdge::Right => WindowCursorStyle::ResizeLeftRight,
+        ResizeEdge::TopLeft | ResizeEdge::BottomRight => WindowCursorStyle::ResizeUpLeftDownRight,
+        ResizeEdge::TopRight | ResizeEdge::BottomLeft => WindowCursorStyle::ResizeUpRightDownLeft,
+    }
+}
+
+#[cfg(test)]
+mod window_chrome_tests {
+    use super::*;
+
+    #[test]
+    fn resize_edges_cover_corners_sides_and_leave_the_content_alone() {
+        let size = size(px(800.0), px(600.0));
+        assert_eq!(
+            resize_edge(point(px(0.0), px(0.0)), size),
+            Some(ResizeEdge::TopLeft)
+        );
+        assert_eq!(
+            resize_edge(point(px(799.0), px(0.0)), size),
+            Some(ResizeEdge::TopRight)
+        );
+        assert_eq!(
+            resize_edge(point(px(0.0), px(599.0)), size),
+            Some(ResizeEdge::BottomLeft)
+        );
+        assert_eq!(
+            resize_edge(point(px(799.0), px(599.0)), size),
+            Some(ResizeEdge::BottomRight)
+        );
+        assert_eq!(
+            resize_edge(point(px(400.0), px(0.0)), size),
+            Some(ResizeEdge::Top)
+        );
+        assert_eq!(
+            resize_edge(point(px(400.0), px(599.0)), size),
+            Some(ResizeEdge::Bottom)
+        );
+        assert_eq!(
+            resize_edge(point(px(0.0), px(300.0)), size),
+            Some(ResizeEdge::Left)
+        );
+        assert_eq!(
+            resize_edge(point(px(799.0), px(300.0)), size),
+            Some(ResizeEdge::Right)
+        );
+        assert_eq!(resize_edge(point(px(400.0), px(300.0)), size), None);
     }
 }
 
