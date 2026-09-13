@@ -1,6 +1,6 @@
 //! Headless terminal-grid state consumed by the GPUI frontend.
 
-use proto_ipc::{Rgb, ScreenCell, ScreenRow};
+use proto_ipc::{ScreenCell, ScreenRow};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -86,6 +86,20 @@ impl TerminalGrid {
             .get(usize::from(y) * usize::from(self.cols) + usize::from(x))
     }
 
+    #[must_use]
+    pub fn row_text(&self, y: u16) -> Option<String> {
+        if y >= self.rows {
+            return None;
+        }
+        let start = usize::from(y) * usize::from(self.cols);
+        Some(
+            self.cells[start..start + usize::from(self.cols)]
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect(),
+        )
+    }
+
     fn resize(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
@@ -93,7 +107,12 @@ impl TerminalGrid {
     }
 }
 
-fn validate_rows(cols: u16, rows: u16, full: bool, dirty_rows: &[ScreenRow]) -> Result<(), GridError> {
+fn validate_rows(
+    cols: u16,
+    rows: u16,
+    full: bool,
+    dirty_rows: &[ScreenRow],
+) -> Result<(), GridError> {
     let mut present = vec![false; usize::from(rows)];
     for row in dirty_rows {
         if row.y >= rows {
@@ -130,6 +149,7 @@ fn blank_cell() -> ScreenCell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proto_ipc::Rgb;
 
     fn cell(text: &str) -> ScreenCell {
         ScreenCell {
@@ -150,9 +170,10 @@ mod tests {
     #[test]
     fn applies_full_frame_and_preserves_cell_metadata() {
         let mut grid = TerminalGrid::new(1, 1);
-        assert!(grid
-            .apply_patch(1, 2, 2, true, &[row(0, &["a", "b"]), row(1, &["c", "d"])])
-            .unwrap());
+        assert!(
+            grid.apply_patch(1, 2, 2, true, &[row(0, &["a", "b"]), row(1, &["c", "d"])])
+                .unwrap()
+        );
         assert_eq!(grid.dimensions(), (2, 2));
         assert_eq!(grid.cell(1, 1), Some(&cell("d")));
     }
@@ -171,15 +192,30 @@ mod tests {
     #[test]
     fn ignores_stale_patch() {
         let mut grid = TerminalGrid::new(1, 1);
-        grid.apply_patch(2, 1, 1, true, &[row(0, &["new"])]).unwrap();
-        assert!(!grid.apply_patch(1, 1, 1, true, &[row(0, &["old"])]).unwrap());
+        grid.apply_patch(2, 1, 1, true, &[row(0, &["new"])])
+            .unwrap();
+        assert!(
+            !grid
+                .apply_patch(1, 1, 1, true, &[row(0, &["old"])])
+                .unwrap()
+        );
         assert_eq!(grid.cell(0, 0).unwrap().text, "new");
+    }
+
+    #[test]
+    fn exposes_a_renderable_row_without_losing_graphemes() {
+        let mut grid = TerminalGrid::new(2, 1);
+        grid.apply_patch(1, 2, 1, true, &[row(0, &["🦀", "e\u{301}"])])
+            .unwrap();
+        assert_eq!(grid.row_text(0).as_deref(), Some("🦀e\u{301}"));
+        assert_eq!(grid.row_text(1), None);
     }
 
     #[test]
     fn resize_clears_cells_missing_from_partial_patch() {
         let mut grid = TerminalGrid::new(2, 1);
-        grid.apply_patch(1, 2, 1, true, &[row(0, &["a", "b"])]).unwrap();
+        grid.apply_patch(1, 2, 1, true, &[row(0, &["a", "b"])])
+            .unwrap();
         grid.apply_patch(2, 3, 2, false, &[row(1, &["x", "y", "z"])])
             .unwrap();
         assert_eq!(grid.dimensions(), (3, 2));
