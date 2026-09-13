@@ -28,6 +28,11 @@ pub enum TransportError {
     EndOfStream,
 }
 
+/// Writes one JSON-RPC message using newline-delimited JSON framing.
+///
+/// # Errors
+///
+/// Returns an error when serialization or writing fails.
 pub async fn write_jsonl<W: AsyncWrite + Unpin>(
     writer: &mut W,
     message: &JsonRpcMessage,
@@ -39,6 +44,11 @@ pub async fn write_jsonl<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Reads one newline-delimited JSON-RPC message.
+///
+/// # Errors
+///
+/// Returns an error for invalid JSON, an I/O failure or a closed stream.
 pub async fn read_jsonl<R: AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> Result<JsonRpcMessage, TransportError> {
@@ -71,4 +81,3 @@ mod tests {
         assert_eq!(read_jsonl(&mut reader).await.unwrap(), expected);
     }
 }
-

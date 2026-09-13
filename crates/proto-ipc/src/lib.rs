@@ -56,6 +56,12 @@ pub enum ProtocolError {
     ReservedBits,
 }
 
+/// Writes one bounded, length-prefixed frame.
+///
+/// # Errors
+///
+/// Returns an error when the payload exceeds [`MAX_FRAME_BYTES`] or when the
+/// underlying writer cannot accept the complete frame.
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     frame: &Frame,
@@ -68,7 +74,12 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     }
 
     let mut header = [0_u8; HEADER_BYTES];
-    header[..4].copy_from_slice(&(frame.payload.len() as u32).to_le_bytes());
+    let payload_len =
+        u32::try_from(frame.payload.len()).map_err(|_| ProtocolError::FrameTooLarge {
+            actual: frame.payload.len(),
+            maximum: MAX_FRAME_BYTES,
+        })?;
+    header[..4].copy_from_slice(&payload_len.to_le_bytes());
     header[4] = frame.kind as u8;
     header[5] = frame.flags;
     writer.write_all(&header).await?;
@@ -77,10 +88,16 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Reads and validates one bounded, length-prefixed frame.
+///
+/// # Errors
+///
+/// Returns an error for malformed headers, oversized frames, unknown frame
+/// kinds, truncated input or another I/O failure.
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame, ProtocolError> {
     let mut header = [0_u8; HEADER_BYTES];
     reader.read_exact(&mut header).await?;
-    let payload_len = u32::from_le_bytes(header[..4].try_into().expect("four-byte length")) as usize;
+    let payload_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
     if payload_len > MAX_FRAME_BYTES {
         return Err(ProtocolError::FrameTooLarge {
             actual: payload_len,
@@ -99,6 +116,11 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame, P
     })
 }
 
+/// Serializes a typed `MessagePack` value and writes it as a frame.
+///
+/// # Errors
+///
+/// Returns an error when serialization fails or the frame cannot be written.
 pub async fn write_message<W, T>(
     writer: &mut W,
     kind: FrameKind,
@@ -120,6 +142,11 @@ where
     .await
 }
 
+/// Reads one frame and deserializes its `MessagePack` payload.
+///
+/// # Errors
+///
+/// Returns an error when framing, I/O or deserialization fails.
 pub async fn read_message<R, T>(reader: &mut R) -> Result<(FrameKind, T), ProtocolError>
 where
     R: AsyncRead + Unpin,
@@ -143,22 +170,51 @@ pub enum ClientMessage {
         cols: u16,
         rows: u16,
     },
-    Attach { session_id: u64 },
-    Detach { session_id: u64 },
-    Input { session_id: u64, data: Vec<u8> },
-    Resize { session_id: u64, cols: u16, rows: u16 },
-    ShutdownSession { session_id: u64 },
+    Attach {
+        session_id: u64,
+    },
+    Detach {
+        session_id: u64,
+    },
+    Input {
+        session_id: u64,
+        data: Vec<u8>,
+    },
+    Resize {
+        session_id: u64,
+        cols: u16,
+        rows: u16,
+    },
+    ShutdownSession {
+        session_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    Initialized { protocol_version: u16 },
-    SessionCreated { request_id: u64, session_id: u64 },
-    Attached { session_id: u64, backlog: Vec<u8> },
-    Output { session_id: u64, data: Vec<u8> },
-    Exited { session_id: u64, exit_code: Option<u32> },
-    Error { message: String },
+    Initialized {
+        protocol_version: u16,
+    },
+    SessionCreated {
+        request_id: u64,
+        session_id: u64,
+    },
+    Attached {
+        session_id: u64,
+        backlog: Vec<u8>,
+    },
+    Output {
+        session_id: u64,
+        data: Vec<u8>,
+    },
+    Exited {
+        session_id: u64,
+        exit_code: Option<u32>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[cfg(test)]
@@ -191,4 +247,3 @@ mod tests {
         ));
     }
 }
-

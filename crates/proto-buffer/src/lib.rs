@@ -17,7 +17,11 @@ struct AppliedEdit {
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BufferError {
     #[error("edit range {start}..{end} is invalid for {len} characters")]
-    InvalidRange { start: usize, end: usize, len: usize },
+    InvalidRange {
+        start: usize,
+        end: usize,
+        len: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +58,12 @@ impl Buffer {
         self.text.to_string()
     }
 
+    /// Applies an edit and records its inverse in the undo history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError::InvalidRange`] when the character range is
+    /// reversed or falls outside the current rope.
     pub fn apply(&mut self, edit: Edit) -> Result<u64, BufferError> {
         let applied = self.apply_without_history(edit)?;
         self.undo.push(applied);
@@ -61,6 +71,12 @@ impl Buffer {
         Ok(self.version)
     }
 
+    /// Applies the inverse of the most recent edit, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError::InvalidRange`] if the stored history is no longer
+    /// valid for the current rope, which indicates an internal invariant breach.
     pub fn undo(&mut self) -> Result<bool, BufferError> {
         let Some(applied) = self.undo.pop() else {
             return Ok(false);
@@ -70,6 +86,12 @@ impl Buffer {
         Ok(true)
     }
 
+    /// Reapplies the most recently undone edit, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError::InvalidRange`] if the stored history is no longer
+    /// valid for the current rope, which indicates an internal invariant breach.
     pub fn redo(&mut self) -> Result<bool, BufferError> {
         let Some(applied) = self.redo.pop() else {
             return Ok(false);
@@ -151,4 +173,3 @@ mod tests {
         assert_eq!(buffer.version(), 0);
     }
 }
-

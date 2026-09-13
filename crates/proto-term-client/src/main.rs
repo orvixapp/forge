@@ -126,7 +126,9 @@ mod unix {
 
     async fn expect_initialized<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result<()> {
         match read_message::<_, ServerMessage>(reader).await?.1 {
-            ServerMessage::Initialized { protocol_version } if protocol_version == PROTOCOL_VERSION => {
+            ServerMessage::Initialized { protocol_version }
+                if protocol_version == PROTOCOL_VERSION =>
+            {
                 Ok(())
             }
             other => bail!("daemon initialization failed: {other:?}"),
@@ -177,4 +179,3 @@ mod unix {
 async fn main() -> anyhow::Result<()> {
     unix::run().await
 }
-

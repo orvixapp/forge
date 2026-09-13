@@ -39,8 +39,8 @@ async fn main() -> Result<()> {
     let row = ResultRow {
         scenario: "ipc_messagepack_duplex_round_trip",
         iterations,
-        median_microseconds: percentile(&samples, 0.50),
-        p95_microseconds: percentile(&samples, 0.95),
+        median_microseconds: percentile(&samples, 50, 100),
+        p95_microseconds: percentile(&samples, 95, 100),
     };
     println!("{}", serde_json::to_string_pretty(&row)?);
     Ok(())
@@ -55,8 +55,8 @@ fn parse_iterations() -> Result<usize> {
     }
 }
 
-fn percentile(sorted: &[f64], quantile: f64) -> f64 {
-    let index = ((sorted.len() - 1) as f64 * quantile).round() as usize;
+fn percentile(sorted: &[f64], numerator: usize, denominator: usize) -> f64 {
+    let last = sorted.len() - 1;
+    let index = last.saturating_mul(numerator).div_ceil(denominator);
     sorted[index]
 }
-

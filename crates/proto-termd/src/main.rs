@@ -38,6 +38,7 @@ mod unix {
         master: Mutex<Box<dyn MasterPty + Send>>,
         child: Mutex<Box<dyn Child + Send + Sync>>,
         backlog: Mutex<VecDeque<u8>>,
+        exit_code: Mutex<Option<u32>>,
         events: broadcast::Sender<SessionEvent>,
     }
 
@@ -110,6 +111,7 @@ mod unix {
                 master: Mutex::new(pair.master),
                 child: Mutex::new(child),
                 backlog: Mutex::new(VecDeque::with_capacity(64 * 1024)),
+                exit_code: Mutex::new(None),
                 events,
             });
             let session_id = self
@@ -154,13 +156,27 @@ mod unix {
             thread::Builder::new()
                 .name(format!("forge-pty-wait-{session_id}"))
                 .spawn(move || {
-                    let status = wait_session
-                        .child
-                        .lock()
-                        .expect("child mutex poisoned")
-                        .wait()
-                        .ok();
-                    let code = status.and_then(|value| value.exit_code());
+                    let code = loop {
+                        let status = wait_session
+                            .child
+                            .lock()
+                            .expect("child mutex poisoned")
+                            .try_wait();
+                        match status {
+                            Ok(Some(value)) => break Some(value.exit_code()),
+                            Ok(None) => thread::sleep(std::time::Duration::from_millis(20)),
+                            Err(error) => {
+                                warn!(session_id, %error, "waiting for PTY child failed");
+                                break None;
+                            }
+                        }
+                    };
+                    if let Some(value) = code {
+                        *wait_session
+                            .exit_code
+                            .lock()
+                            .expect("exit code mutex poisoned") = Some(value);
+                    }
                     let _ = wait_session.events.send(SessionEvent::Exited(code));
                 })
                 .context("spawn PTY wait thread")?;
@@ -186,7 +202,8 @@ mod unix {
             .len()
             .saturating_add(data.len())
             .saturating_sub(BACKLOG_LIMIT);
-        backlog.drain(..overflow.min(backlog.len()));
+        let remove = overflow.min(backlog.len());
+        backlog.drain(..remove);
         if data.len() > BACKLOG_LIMIT {
             backlog.extend(&data[data.len() - BACKLOG_LIMIT..]);
         } else {
@@ -205,8 +222,8 @@ mod unix {
         if socket.exists() {
             std::fs::remove_file(&socket).context("remove stale socket")?;
         }
-        let listener = UnixListener::bind(&socket)
-            .with_context(|| format!("bind {}", socket.display()))?;
+        let listener =
+            UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
         info!(path = %socket.display(), "terminal daemon listening");
         let daemon = Arc::new(Daemon::default());
         loop {
@@ -231,7 +248,8 @@ mod unix {
 
     async fn handle_connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
         let (mut reader, mut writer) = stream.into_split();
-        let (out_tx, mut out_rx) = async_mpsc::channel::<(FrameKind, ServerMessage)>(CONNECTION_QUEUE);
+        let (out_tx, mut out_rx) =
+            async_mpsc::channel::<(FrameKind, ServerMessage)>(CONNECTION_QUEUE);
         let writer_task = tokio::spawn(async move {
             while let Some((kind, message)) = out_rx.recv().await {
                 write_message(&mut writer, kind, &message).await?;
@@ -242,8 +260,7 @@ mod unix {
         let (_, first) = read_message::<_, ClientMessage>(&mut reader).await?;
         match first {
             ClientMessage::Initialize {
-                protocol_version,
-                ..
+                protocol_version, ..
             } if protocol_version == PROTOCOL_VERSION => {
                 out_tx
                     .send((
@@ -308,48 +325,7 @@ mod unix {
             }
             ClientMessage::Attach { session_id } => {
                 let session = daemon.session(session_id).await?;
-                out_tx
-                    .send((
-                        FrameKind::Response,
-                        ServerMessage::Attached {
-                            session_id,
-                            backlog: session.snapshot(),
-                        },
-                    ))
-                    .await?;
-                let mut events = session.events.subscribe();
-                let forwarding = out_tx.clone();
-                tokio::spawn(async move {
-                    loop {
-                        let message = match events.recv().await {
-                            Ok(SessionEvent::Output(data)) => ServerMessage::Output { session_id, data },
-                            Ok(SessionEvent::Exited(exit_code)) => {
-                                let _ = forwarding
-                                    .send((
-                                        FrameKind::Notification,
-                                        ServerMessage::Exited {
-                                            session_id,
-                                            exit_code,
-                                        },
-                                    ))
-                                    .await;
-                                break;
-                            }
-                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                                error!(session_id, skipped, "slow client lost terminal chunks");
-                                continue;
-                            }
-                            Err(broadcast::error::RecvError::Closed) => break,
-                        };
-                        if forwarding
-                            .send((FrameKind::StreamItem, message))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                });
+                attach_session(session_id, session, out_tx).await?;
             }
             ClientMessage::Input { session_id, data } => {
                 daemon
@@ -376,10 +352,71 @@ mod unix {
         Ok(())
     }
 
-    async fn send_error(
-        sender: &async_mpsc::Sender<(FrameKind, ServerMessage)>,
-        message: String,
-    ) {
+    async fn attach_session(
+        session_id: u64,
+        session: Arc<Session>,
+        out_tx: &async_mpsc::Sender<(FrameKind, ServerMessage)>,
+    ) -> Result<()> {
+        let mut events = session.events.subscribe();
+        out_tx
+            .send((
+                FrameKind::Response,
+                ServerMessage::Attached {
+                    session_id,
+                    backlog: session.snapshot(),
+                },
+            ))
+            .await?;
+        let exited = *session.exit_code.lock().expect("exit code mutex poisoned");
+        if let Some(exit_code) = exited {
+            out_tx
+                .send((
+                    FrameKind::Notification,
+                    ServerMessage::Exited {
+                        session_id,
+                        exit_code: Some(exit_code),
+                    },
+                ))
+                .await?;
+            return Ok(());
+        }
+
+        let forwarding = out_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                let message = match events.recv().await {
+                    Ok(SessionEvent::Output(data)) => ServerMessage::Output { session_id, data },
+                    Ok(SessionEvent::Exited(exit_code)) => {
+                        let _ = forwarding
+                            .send((
+                                FrameKind::Notification,
+                                ServerMessage::Exited {
+                                    session_id,
+                                    exit_code,
+                                },
+                            ))
+                            .await;
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        error!(session_id, skipped, "slow client lost terminal chunks");
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                if forwarding
+                    .send((FrameKind::StreamItem, message))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    async fn send_error(sender: &async_mpsc::Sender<(FrameKind, ServerMessage)>, message: String) {
         let _ = sender
             .send((FrameKind::Response, ServerMessage::Error { message }))
             .await;
@@ -406,4 +443,3 @@ mod unix {
 async fn main() -> anyhow::Result<()> {
     unix::run().await
 }
-
