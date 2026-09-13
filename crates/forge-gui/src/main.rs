@@ -318,6 +318,19 @@ fn default_socket() -> PathBuf {
 mod tests {
     use super::*;
 
+    /// `docs/config.schema.json` is what editors validate against; keep it
+    /// in sync by regenerating with `forge-gui --print-config-schema`.
+    #[test]
+    fn committed_config_schema_matches_the_types() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/config.schema.json");
+        let committed = std::fs::read_to_string(&path).expect("docs/config.schema.json exists");
+        assert_eq!(
+            committed.trim(),
+            Config::json_schema().trim(),
+            "regenerate docs/config.schema.json with `forge-gui --print-config-schema`"
+        );
+    }
+
     #[test]
     fn socket_argument_uses_documented_default_shape() {
         assert!(
