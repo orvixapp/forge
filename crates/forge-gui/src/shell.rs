@@ -18,10 +18,11 @@ pub enum ShellCommand {
     SplitHorizontal,
     SplitVertical,
     FocusNextPane,
+    ShowProcessExplorer,
 }
 
 impl ShellCommand {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::NewTerminalTab,
         Self::CloseWindow,
         Self::ToggleMaximize,
@@ -29,6 +30,7 @@ impl ShellCommand {
         Self::SplitHorizontal,
         Self::SplitVertical,
         Self::FocusNextPane,
+        Self::ShowProcessExplorer,
     ];
     #[must_use]
     pub const fn id(self) -> &'static str {
@@ -40,6 +42,7 @@ impl ShellCommand {
             Self::SplitHorizontal => "layout.splitHorizontal",
             Self::SplitVertical => "layout.splitVertical",
             Self::FocusNextPane => "layout.focusNextPane",
+            Self::ShowProcessExplorer => "processExplorer.show",
         }
     }
 
@@ -53,6 +56,7 @@ impl ShellCommand {
             Self::SplitHorizontal => "Split horizontally",
             Self::SplitVertical => "Split vertically",
             Self::FocusNextPane => "Focus next pane",
+            Self::ShowProcessExplorer => "Show process explorer",
         }
     }
 
@@ -461,6 +465,8 @@ impl ShellKeymap {
             let Some(keystroke) = parse_keybinding(&override_.keys) else {
                 continue;
             };
+            self.bindings
+                .retain(|binding| binding.command != command && binding.keystroke != keystroke);
             self.bindings.push(KeyBinding {
                 keystroke,
                 context: ShellContext::Window,

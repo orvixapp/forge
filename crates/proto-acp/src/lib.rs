@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn reads_an_unsaved_workspace_buffer_by_lines() {
-        let root = std::env::temp_dir().join(format!("forge-acp-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("forge-acp-buffer-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("draft.rs");
         let mut surface = ClientSurface::new(root.clone(), PermissionChoice::Deny);
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn rejects_a_file_outside_the_workspace() {
-        let root = std::env::temp_dir().join(format!("forge-acp-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("forge-acp-outside-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let outside = std::env::temp_dir().join("forge-acp-outside.txt");
         std::fs::write(&outside, "secret").unwrap();

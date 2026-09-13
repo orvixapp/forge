@@ -106,8 +106,8 @@ y conserva el atajo por defecto.
 - [x] `Ctrl+Shift+P` abre la palette; texto filtra y Escape la cierra.
 - [x] Overlay visible con consulta y hasta seis resultados fuzzy.
 - [x] Resultado de palette/notificaciones se comunica mediante la barra de estado.
-- [ ] Overlay navegable, ejecutar el comando seleccionado, diálogos nativos y
-  sistema de notificaciones con duración/prioridad.
+- [x] Overlay navegable con ↑/↓; Enter ejecuta el resultado seleccionado.
+- [ ] Diálogos nativos y sistema de notificaciones con duración/prioridad.
 
 ## Convenciones de implementación
 

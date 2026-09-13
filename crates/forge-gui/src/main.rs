@@ -21,7 +21,7 @@ use proto_ipc::{
     ClientMessage, CursorStyle, FrameKind, FrameReader, PROTOCOL_VERSION, Rgb, ScreenCell,
     ScreenCursor, ScreenRow, ServerMessage, write_message,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
@@ -86,6 +86,7 @@ impl AssetSource for Assets {
 /// socket and starting directory as the first window.
 #[derive(Clone)]
 struct WindowFactory {
+    config_path: Option<PathBuf>,
     socket: PathBuf,
     shell: (String, Vec<String>),
     cwd: PathBuf,
@@ -128,7 +129,8 @@ impl WindowFactory {
                     let chrome_height = factory.chrome_height;
                     let observer_resize_targets = Arc::clone(&resize_targets);
                     let observer_last_resize = Arc::clone(&last_resize);
-                    cx.observe_window_bounds(window, move |_, window, _| {
+                    cx.observe_window_bounds(window, move |view: &mut ForgeWindow, window, _| {
+                        view.factory.window_size = window.bounds().size;
                         let (cols, rows) =
                             grid_dimensions(window.bounds().size, metrics, chrome_height);
                         let mut last = observer_last_resize
@@ -136,12 +138,7 @@ impl WindowFactory {
                             .expect("resize state mutex poisoned");
                         if *last != Some((cols, rows)) {
                             *last = Some((cols, rows));
-                            observer_resize_targets
-                                .lock()
-                                .expect("resize targets mutex poisoned")
-                                .retain(|(_, input)| {
-                                    input.send(IpcCommand::Resize { cols, rows }).is_ok()
-                                });
+                            let _ = &observer_resize_targets;
                         }
                     })
                     .detach();
@@ -167,7 +164,8 @@ impl WindowFactory {
             let socket = self.socket.clone();
             let shell = self.shell.clone();
             let cwd = self.cwd.clone();
-            window.update(cx, |_, window, _| {
+            window.update(cx, |view, window, cx| {
+                view.restore_window_session(cx);
                 window.on_next_frame(move |_, _| {
                     spawn_ipc_worker(socket, shell, cwd, 1, event_tx, input_rx);
                 });
@@ -192,14 +190,77 @@ struct ForgeWindow {
     keymap: ShellKeymap,
     palette_open: bool,
     palette_query: String,
-    split: Option<ActiveSplit>,
+    palette_index: usize,
+    process_explorer: bool,
+    split: Option<PaneTree>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ActiveSplit {
     direction: SplitDirection,
-    first: usize,
-    second: usize,
+    first: Box<PaneTree>,
+    second: Box<PaneTree>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+enum PaneTree {
+    Leaf(usize),
+    Split(ActiveSplit),
+}
+
+#[derive(Serialize, Deserialize)]
+struct WindowSession {
+    version: u8,
+    count: usize,
+    active: usize,
+    split: Option<PaneTree>,
+    cwd: PathBuf,
+    width: f32,
+    height: f32,
+}
+
+impl PaneTree {
+    fn split(&mut self, target: usize, new: usize, direction: SplitDirection) {
+        match self {
+            Self::Leaf(index) if *index == target => {
+                *self = Self::Split(ActiveSplit {
+                    direction,
+                    first: Box::new(Self::Leaf(target)),
+                    second: Box::new(Self::Leaf(new)),
+                })
+            }
+            Self::Split(split) => {
+                split.first.split(target, new, direction);
+                split.second.split(target, new, direction);
+            }
+            _ => {}
+        }
+    }
+
+    fn leaves(&self, out: &mut Vec<usize>) {
+        match self {
+            Self::Leaf(index) => out.push(*index),
+            Self::Split(split) => {
+                split.first.leaves(out);
+                split.second.leaves(out);
+            }
+        }
+    }
+
+    fn remove(self, target: usize) -> Option<Self> {
+        match self {
+            Self::Leaf(index) if index == target => None,
+            Self::Leaf(index) => Some(Self::Leaf(if index > target { index - 1 } else { index })),
+            Self::Split(split) => match (split.first.remove(target), split.second.remove(target)) {
+                (Some(first), Some(second)) => Some(Self::Split(ActiveSplit {
+                    direction: split.direction,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                })),
+                (remaining, None) | (None, remaining) => remaining,
+            },
+        }
+    }
 }
 
 /// A live terminal is intentionally owned by exactly one tab. This prevents a
@@ -211,9 +272,167 @@ struct TerminalTab {
     status: String,
     input: async_mpsc::UnboundedSender<IpcCommand>,
     drag_anchor: Option<forge_gui::CellPos>,
+    viewport: Option<(u16, u16)>,
 }
 
 impl ForgeWindow {
+    fn save_window_session(&self) {
+        let Some(path) = &self.factory.config_path else {
+            return;
+        };
+        let path = path.with_file_name("session.json");
+        let state = WindowSession {
+            version: 1,
+            count: self.tabs.len(),
+            active: self.active_tab,
+            split: self.split.clone(),
+            cwd: self.factory.cwd.clone(),
+            width: f32::from(self.factory.window_size.width),
+            height: f32::from(self.factory.window_size.height),
+        };
+        let result = (|| -> std::io::Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let temporary = path.with_extension("json.tmp");
+            let bytes = serde_json::to_vec_pretty(&state)?;
+            if std::fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) { return Ok(()); }
+            std::fs::write(&temporary, bytes)?;
+            std::fs::rename(temporary, path)
+        })();
+        if let Err(error) = result {
+            eprintln!("forge session: {error}");
+        }
+    }
+
+    fn restore_window_session(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = &self.factory.config_path else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(path.with_file_name("session.json")) else {
+            return;
+        };
+        let state = serde_json::from_slice::<WindowSession>(&bytes);
+        let Ok(state) = state else {
+            self.active_tab_mut().status = "Invalid saved session".into();
+            return;
+        };
+        let mut leaves = Vec::new();
+        if let Some(tree) = &state.split {
+            tree.leaves(&mut leaves);
+        }
+        if state.version != 1
+            || state.count == 0
+            || state.count > 64
+            || state.active >= state.count
+            || leaves.iter().any(|index| *index >= state.count)
+        {
+            self.active_tab_mut().status = "Invalid saved layout".into();
+            return;
+        }
+        if state.cwd.is_dir() {
+            self.factory.cwd = state.cwd;
+        }
+        for _ in 1..state.count {
+            self.create_terminal_tab(cx);
+        }
+        self.active_tab = state.active;
+        self.split = state.split;
+        cx.notify();
+    }
+    fn reload_config(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = &self.factory.config_path else {
+            return;
+        };
+        match Config::load(path) {
+            Ok(mut config) => {
+                config.font.family =
+                    resolve_font_family(&config.font.family, &cx.text_system().all_font_names());
+                if config == *self.config {
+                    return;
+                }
+                let metrics = cell_metrics_for(&config, cx);
+                let palette = Palette::from(&config.colors);
+                self.keymap = ShellKeymap::default().with_overrides(&config.keybindings);
+                for tab in &mut self.tabs {
+                    tab.terminal.metrics = metrics;
+                    tab.terminal.palette = palette;
+                    tab.viewport = None;
+                }
+                self.factory.metrics = metrics;
+                self.factory.shell = (config.shell(), config.terminal.args.clone());
+                self.config = Arc::new(config);
+                self.factory.config = Arc::clone(&self.config);
+                cx.notify();
+            }
+            Err(error) => {
+                self.active_tab_mut().status = format!("Configuration: {error}");
+            }
+        }
+    }
+    fn render_panes(&self, tree: &PaneTree, cx: &mut Context<Self>) -> gpui::AnyElement {
+        match tree {
+            PaneTree::Leaf(index) => {
+                let index = *index;
+                div()
+                    .id(("pane", index))
+                    .relative()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .overflow_hidden()
+                    .p(px(self.config.terminal.padding))
+                    .border_1()
+                    .border_color(if index == self.active_tab {
+                        rgb(0x6688aa)
+                    } else {
+                        rgb(0x2a3140)
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| {
+                            view.activate_tab(index, cx);
+                        }),
+                    )
+                    .child({
+                        let entity = cx.entity();
+                        canvas(
+                            |bounds, _, _| bounds,
+                            move |_, bounds, _, cx| {
+                                entity.update(cx, |view, _| {
+                                    let metrics = view.factory.metrics;
+                                    let (cols, rows) = grid_dimensions(bounds.size, metrics, 0.0);
+                                    let tab = &mut view.tabs[index];
+                                    if tab.viewport != Some((cols, rows)) {
+                                        tab.viewport = Some((cols, rows));
+                                        let _ = tab.input.send(IpcCommand::Resize { cols, rows });
+                                    }
+                                });
+                            },
+                        )
+                        .absolute()
+                        .size_full()
+                    })
+                    .child(TerminalGridElement::new(
+                        cx.entity(),
+                        index,
+                        |view: &mut Self, index| view.terminal_surface_at(index),
+                    ))
+                    .into_any_element()
+            }
+            PaneTree::Split(split) => div()
+                .flex()
+                .flex_1()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .when(split.direction == SplitDirection::Horizontal, |area| {
+                    area.flex_col()
+                })
+                .child(self.render_panes(&split.first, cx))
+                .child(self.render_panes(&split.second, cx))
+                .into_any_element(),
+        }
+    }
     fn new(
         events: Receiver<UiEvent>,
         event_tx: Sender<UiEvent>,
@@ -227,8 +446,21 @@ impl ForgeWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.spawn(async move |this, cx| {
+            let mut last_config_check = Instant::now();
             loop {
                 Timer::after(Duration::from_millis(16)).await;
+                if last_config_check.elapsed() >= Duration::from_secs(1) {
+                    if this
+                        .update(cx, |view, cx| {
+                            view.reload_config(cx);
+                            view.save_window_session();
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    last_config_check = Instant::now();
+                }
                 let mut changed = false;
                 while let Ok(event) = events.try_recv() {
                     if this
@@ -255,6 +487,7 @@ impl ForgeWindow {
                 status: "Conectando a forge-termd…".into(),
                 input,
                 drag_anchor: None,
+                viewport: None,
             }],
             active_tab: 0,
             next_tab_id: 2,
@@ -269,6 +502,8 @@ impl ForgeWindow {
             keymap,
             palette_open: false,
             palette_query: String::new(),
+            palette_index: 0,
+            process_explorer: false,
             split: None,
         }
     }
@@ -355,7 +590,9 @@ impl ForgeWindow {
             status: "Conectando a forge-termd…".into(),
             input,
             drag_anchor: None,
+            viewport: None,
         });
+        self.active_tab = self.tabs.len() - 1;
         self.resize_targets
             .lock()
             .expect("resize targets mutex poisoned")
@@ -400,7 +637,7 @@ impl ForgeWindow {
             .expect("resize targets mutex poisoned")
             .retain(|(id, _)| *id != closed.id);
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
-        self.split = None;
+        self.split = self.split.take().and_then(|tree| tree.remove(index));
         cx.notify();
     }
 
@@ -427,7 +664,7 @@ impl ForgeWindow {
                 "escape" => self.palette_open = false,
                 "enter" => {
                     let command = search_commands(&self.palette_query)
-                        .first()
+                        .get(self.palette_index)
                         .map(|item| item.command);
                     self.palette_open = false;
                     if let Some(command) = command {
@@ -438,10 +675,17 @@ impl ForgeWindow {
                 }
                 "backspace" => {
                     self.palette_query.pop();
+                    self.palette_index = 0;
+                }
+                "up" => self.palette_index = self.palette_index.saturating_sub(1),
+                "down" => {
+                    let count = search_commands(&self.palette_query).len();
+                    self.palette_index = (self.palette_index + 1).min(count.saturating_sub(1));
                 }
                 _ if !modifiers.control && !modifiers.alt => {
                     if let Some(text) = &keystroke.key_char {
                         self.palette_query.push_str(text);
+                        self.palette_index = 0;
                     }
                 }
                 _ => {}
@@ -465,12 +709,26 @@ impl ForgeWindow {
         {
             self.palette_open = true;
             self.palette_query.clear();
+            self.palette_index = 0;
             self.active_tab_mut().status =
                 "Palette · escribe para buscar; Escape para cerrar".into();
             cx.notify();
             return;
         }
         match keystroke.key.as_str() {
+            _ if self
+                .keymap
+                .resolve(&shell_key, ShellContext::Terminal)
+                .is_some() =>
+            {
+                self.run_shell_command(
+                    self.keymap
+                        .resolve(&shell_key, ShellContext::Terminal)
+                        .unwrap(),
+                    cx,
+                );
+                return;
+            }
             "c" if copy_paste => {
                 self.copy_selection(cx);
                 return;
@@ -496,22 +754,33 @@ impl ForgeWindow {
     }
 
     fn run_shell_command(&mut self, command: ShellCommand, cx: &mut Context<Self>) {
+        if std::env::var_os("FORGE_TRACE").is_some() {
+            eprintln!(
+                "forge command={} pane={} sessions={}",
+                command.id(),
+                self.active_tab().id,
+                self.tabs.len()
+            );
+        }
         match command {
+            ShellCommand::ShowProcessExplorer => {
+                self.process_explorer = !self.process_explorer;
+                cx.notify();
+            }
             ShellCommand::NewTerminalTab => {
                 self.create_terminal_tab(cx);
             }
             ShellCommand::SplitHorizontal | ShellCommand::SplitVertical => {
                 let first = self.active_tab;
                 let second = self.create_terminal_tab(cx);
-                self.split = Some(ActiveSplit {
-                    direction: if command == ShellCommand::SplitHorizontal {
-                        SplitDirection::Horizontal
-                    } else {
-                        SplitDirection::Vertical
-                    },
-                    first,
-                    second,
-                });
+                let direction = if command == ShellCommand::SplitHorizontal {
+                    SplitDirection::Horizontal
+                } else {
+                    SplitDirection::Vertical
+                };
+                self.split
+                    .get_or_insert(PaneTree::Leaf(first))
+                    .split(first, second, direction);
                 self.active_tab = second;
                 self.active_tab_mut().status = "Split activo · Ctrl+Tab cambia el foco".into();
                 cx.notify();
@@ -521,16 +790,18 @@ impl ForgeWindow {
             // and closes the focused tab when there is more than one.
             ShellCommand::CloseWindow if self.tabs.len() > 1 => self.close_active_tab(cx),
             ShellCommand::FocusNextPane => {
-                let next = self.split.map_or_else(
-                    || (self.active_tab + 1) % self.tabs.len(),
-                    |split| {
-                        if self.active_tab == split.first {
-                            split.second
-                        } else {
-                            split.first
-                        }
-                    },
-                );
+                let mut leaves = Vec::new();
+                if let Some(tree) = &self.split {
+                    tree.leaves(&mut leaves);
+                }
+                if leaves.is_empty() {
+                    leaves.extend(0..self.tabs.len());
+                }
+                let position = leaves
+                    .iter()
+                    .position(|index| *index == self.active_tab)
+                    .unwrap_or(0);
+                let next = leaves[(position + 1) % leaves.len()];
                 self.activate_tab(next, cx);
             }
             command => {
@@ -632,52 +903,16 @@ impl Render for ForgeWindow {
         } else {
             "Ctrl+T · nueva pestaña"
         };
-        let terminal_area = if let Some(split) = self.split {
-            let horizontal = split.direction == SplitDirection::Horizontal;
-            div()
-                .flex_1()
-                .min_h(px(0.0))
-                .flex()
-                .when(horizontal, |area| area.flex_col())
-                .when(!horizontal, |area| area.flex_row())
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .min_h(px(0.0))
-                        .p(px(config.terminal.padding))
-                        .border_color(chrome_border)
-                        .when(horizontal, |pane| pane.border_b_1())
-                        .when(!horizontal, |pane| pane.border_r_1())
-                        .child(TerminalGridElement::new(
-                            cx.entity(),
-                            split.first,
-                            |view: &mut Self, index| view.terminal_surface_at(index),
-                        )),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .min_h(px(0.0))
-                        .p(px(config.terminal.padding))
-                        .child(TerminalGridElement::new(
-                            cx.entity(),
-                            split.second,
-                            |view: &mut Self, index| view.terminal_surface_at(index),
-                        )),
-                )
-        } else {
-            div()
-                .flex_1()
-                .min_h(px(0.0))
-                .p(px(config.terminal.padding))
-                .child(TerminalGridElement::new(
-                    cx.entity(),
-                    self.active_tab,
-                    |view: &mut Self, index| view.terminal_surface_at(index),
-                ))
-        };
+        let tree = self
+            .split
+            .clone()
+            .filter(|tree| {
+                let mut leaves = Vec::new();
+                tree.leaves(&mut leaves);
+                leaves.contains(&self.active_tab)
+            })
+            .unwrap_or(PaneTree::Leaf(self.active_tab));
+        let terminal_area = self.render_panes(&tree, cx);
         window.set_client_inset(px(WINDOW_RESIZE_INSET));
         div()
             .id("forge-terminal")
@@ -877,6 +1112,39 @@ impl Render for ForgeWindow {
                     ),
             )
             .child(terminal_area)
+            .when(self.process_explorer, |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top(px(48.0))
+                        .left(px(24.0))
+                        .w(px(440.0))
+                        .p(px(12.0))
+                        .bg(chrome)
+                        .border_1()
+                        .border_color(chrome_border)
+                        .child(format!(
+                            "Forge · PID {} · PSS {} KiB",
+                            std::process::id(),
+                            process_pss_kib().unwrap_or(0)
+                        ))
+                        .children(self.tabs.iter().map(|tab| {
+                            div()
+                                .text_size(px(12.0))
+                                .child(format!("{} · {}", tab.title, tab.status))
+                        }))
+                        .child(
+                            div()
+                                .id("close-process-explorer")
+                                .cursor_pointer()
+                                .child("×")
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.process_explorer = false;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             .when(self.palette_open, |root| {
                 let matches = search_commands(&self.palette_query);
                 root.child(
@@ -909,21 +1177,32 @@ impl Render for ForgeWindow {
                                 .text_size(px(11.0))
                                 .text_color(muted)
                                 .child(if english {
-                                    "Enter runs the first result · Esc closes"
+                                    "↑↓ select · Enter runs · Esc closes"
                                 } else {
-                                    "Enter ejecutará el primer resultado · Esc cierra"
+                                    "↑↓ selecciona · Enter ejecuta · Esc cierra"
                                 }),
                         )
-                        .children(matches.into_iter().take(6).map(|item| {
-                            div()
-                                .mt(px(7.0))
-                                .px(px(8.0))
-                                .py(px(5.0))
-                                .rounded(px(4.0))
-                                .bg(rgb(0x2a3140))
-                                .text_size(px(13.0))
-                                .child(item.command.title())
-                        })),
+                        .children(
+                            matches
+                                .into_iter()
+                                .enumerate()
+                                .skip(self.palette_index.saturating_sub(5))
+                                .take(6)
+                                .map(|(index, item)| {
+                                    div()
+                                        .mt(px(7.0))
+                                        .px(px(8.0))
+                                        .py(px(5.0))
+                                        .rounded(px(4.0))
+                                        .bg(if index == self.palette_index {
+                                            rgb(0x3b526e)
+                                        } else {
+                                            rgb(0x2a3140)
+                                        })
+                                        .text_size(px(13.0))
+                                        .child(item.command.title())
+                                }),
+                        ),
                 )
             })
     }
@@ -968,6 +1247,27 @@ fn resize_cursor(edge: ResizeEdge) -> WindowCursorStyle {
 #[cfg(test)]
 mod window_chrome_tests {
     use super::*;
+
+    #[test]
+    fn nested_split_close_preserves_remaining_branches() {
+        let mut tree = PaneTree::Leaf(0);
+        tree.split(0, 1, SplitDirection::Vertical);
+        tree.split(1, 2, SplitDirection::Horizontal);
+        tree.split(2, 3, SplitDirection::Vertical);
+        let mut leaves = Vec::new();
+        tree.leaves(&mut leaves);
+        assert_eq!(leaves, [0, 1, 2, 3]);
+        let tree = tree.remove(1).unwrap();
+        leaves.clear();
+        tree.leaves(&mut leaves);
+        assert_eq!(leaves, [0, 1, 2]);
+        assert!(matches!(tree, PaneTree::Split(_)));
+        let encoded = serde_json::to_vec(&tree).unwrap();
+        let restored: PaneTree = serde_json::from_slice(&encoded).unwrap();
+        leaves.clear();
+        restored.leaves(&mut leaves);
+        assert_eq!(leaves, [0, 1, 2]);
+    }
 
     #[test]
     fn resize_edges_cover_corners_sides_and_leave_the_content_alone() {
@@ -1048,7 +1348,15 @@ fn main() {
             };
             let chrome_height = chrome_height(&config);
             let shell = (config.shell(), config.terminal.args.clone());
-            let factory = WindowFactory {
+            let mut factory = WindowFactory {
+                config_path: if options.benchmark_idle_ms.is_none()
+                    && grid_frames.is_none()
+                    && !options.exit_after_first_frame
+                {
+                    Config::default_path(options.config.as_deref())
+                } else {
+                    None
+                },
                 socket,
                 shell,
                 cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -1058,7 +1366,26 @@ fn main() {
                 chrome_height,
                 render_count: Arc::clone(&render_count),
             };
-            let start_ipc = options.benchmark_idle_ms.is_none() && grid_frames.is_none();
+            if let Some(path) = &factory.config_path {
+                if let Ok(bytes) = std::fs::read(path.with_file_name("session.json")) {
+                    if let Ok(state) = serde_json::from_slice::<WindowSession>(&bytes) {
+                        if state.version == 1 {
+                            if state.cwd.is_dir() {
+                                factory.cwd = state.cwd;
+                            }
+                            if state.width.is_finite() && state.height.is_finite() {
+                                factory.window_size = size(
+                                    px(state.width.clamp(480.0, 7680.0)),
+                                    px(state.height.clamp(320.0, 4320.0)),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let start_ipc = options.benchmark_idle_ms.is_none()
+                && grid_frames.is_none()
+                && !options.exit_after_first_frame;
             let window = factory.open(cx, start_ipc).expect("open Forge window");
             if options.exit_after_first_frame {
                 window
