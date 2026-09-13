@@ -14,6 +14,7 @@ mod unix {
     use std::{
         collections::{HashMap, VecDeque},
         io::{Read, Write},
+        os::unix::fs::PermissionsExt,
         path::PathBuf,
         sync::{Arc, Mutex, mpsc},
         thread,
@@ -120,6 +121,7 @@ mod unix {
                 + 1;
 
             let read_session = Arc::clone(&session);
+            let (reader_done_tx, reader_done_rx) = mpsc::sync_channel(1);
             thread::Builder::new()
                 .name(format!("forge-pty-read-{session_id}"))
                 .spawn(move || {
@@ -138,6 +140,7 @@ mod unix {
                             }
                         }
                     }
+                    let _ = reader_done_tx.send(());
                 })
                 .context("spawn PTY reader thread")?;
 
@@ -171,6 +174,9 @@ mod unix {
                             }
                         }
                     };
+                    // Do not emit Exited before the reader has drained the final
+                    // bytes still buffered by the PTY kernel driver.
+                    let _ = reader_done_rx.recv_timeout(std::time::Duration::from_secs(1));
                     if let Some(value) = code {
                         *wait_session
                             .exit_code
@@ -220,10 +226,18 @@ mod unix {
             .init();
         let socket = parse_socket()?;
         if socket.exists() {
+            if UnixStream::connect(&socket).await.is_ok() {
+                bail!(
+                    "another terminal daemon is already listening at {}",
+                    socket.display()
+                );
+            }
             std::fs::remove_file(&socket).context("remove stale socket")?;
         }
         let listener =
             UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .context("restrict socket permissions")?;
         info!(path = %socket.display(), "terminal daemon listening");
         let daemon = Arc::new(Daemon::default());
         loop {
