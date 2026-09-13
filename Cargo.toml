@@ -10,6 +10,7 @@ members = [
     "crates/forge-gui",
 ]
 resolver = "3"
+default-members = ["crates/forge-gui"]
 
 [workspace.package]
 version = "0.0.1"

@@ -215,6 +215,7 @@ pub enum ServerMessage {
         rows: u16,
         full: bool,
         dirty_rows: Vec<ScreenRow>,
+        cursor: Option<ScreenCursor>,
     },
     Exited {
         session_id: u64,
@@ -245,6 +246,24 @@ pub struct Rgb {
     pub r: u8,
     pub g: u8,
     pub b: u8,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScreenCursor {
+    pub x: u16,
+    pub y: u16,
+    pub visible: bool,
+    pub blinking: bool,
+    pub style: CursorStyle,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorStyle {
+    Bar,
+    Block,
+    Underline,
+    HollowBlock,
 }
 
 #[cfg(test)]

@@ -61,6 +61,19 @@ struct GhosttyColorRgb {
 }
 
 #[repr(C)]
+struct GhosttyRenderCursor {
+    size: usize,
+    viewport_has_value: bool,
+    viewport_x: u16,
+    viewport_y: u16,
+    wide_tail: bool,
+    visible: bool,
+    blinking: bool,
+    password_input: bool,
+    visual_style: i32,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct FormatterScreenExtra {
     size: usize,
@@ -272,6 +285,7 @@ impl GhosttyTerminal {
         let rows = self.render_value::<u16>(2, "render_state_get(rows)")?;
         let dirty_raw = self.render_value::<i32>(3, "render_state_get(dirty)")?;
         let dirty = DirtyState::try_from(dirty_raw)?;
+        let cursor = self.render_cursor()?;
         let dirty_rows = if dirty == DirtyState::Clean {
             Vec::new()
         } else {
@@ -285,7 +299,35 @@ impl GhosttyTerminal {
             rows,
             dirty,
             dirty_rows,
+            cursor,
         })
+    }
+
+    fn render_cursor(&self) -> Result<Option<RenderCursor>, GhosttyError> {
+        let mut cursor = GhosttyRenderCursor {
+            size: size_of::<GhosttyRenderCursor>(),
+            viewport_has_value: false,
+            viewport_x: 0,
+            viewport_y: 0,
+            wide_tail: false,
+            visible: false,
+            blinking: false,
+            password_input: false,
+            visual_style: 0,
+        };
+        let result =
+            unsafe { (self.api.render_state_get)(self.render_state, 18, (&raw mut cursor).cast()) };
+        check("render_state_get(cursor)", result)?;
+        if !cursor.viewport_has_value {
+            return Ok(None);
+        }
+        Ok(Some(RenderCursor {
+            x: cursor.viewport_x,
+            y: cursor.viewport_y,
+            visible: cursor.visible,
+            blinking: cursor.blinking,
+            style: CursorStyle::try_from(cursor.visual_style)?,
+        }))
     }
 
     fn read_dirty_rows(&self) -> Result<Vec<RenderRow>, GhosttyError> {
@@ -493,6 +535,41 @@ pub struct RenderSnapshot {
     pub rows: u16,
     pub dirty: DirtyState,
     pub dirty_rows: Vec<RenderRow>,
+    pub cursor: Option<RenderCursor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderCursor {
+    pub x: u16,
+    pub y: u16,
+    pub visible: bool,
+    pub blinking: bool,
+    pub style: CursorStyle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorStyle {
+    Bar,
+    Block,
+    Underline,
+    HollowBlock,
+}
+
+impl TryFrom<i32> for CursorStyle {
+    type Error = GhosttyError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Bar),
+            1 => Ok(Self::Block),
+            2 => Ok(Self::Underline),
+            3 => Ok(Self::HollowBlock),
+            result => Err(GhosttyError::Operation {
+                operation: "render_state_get(cursor style)",
+                result,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

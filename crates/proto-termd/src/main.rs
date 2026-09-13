@@ -10,8 +10,8 @@ mod unix {
     use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
     use proto_ghostty_vt::{DirtyState, GhosttyLibrary, GhosttyTerminal};
     use proto_ipc::{
-        ClientMessage, FrameKind, PROTOCOL_VERSION, Rgb, ScreenCell, ScreenRow, ServerMessage,
-        read_message, write_message,
+        ClientMessage, CursorStyle, FrameKind, PROTOCOL_VERSION, Rgb, ScreenCell, ScreenCursor,
+        ScreenRow, ServerMessage, read_message, write_message,
     };
     use std::{
         collections::{HashMap, VecDeque},
@@ -39,6 +39,7 @@ mod unix {
             rows: u16,
             full: bool,
             dirty_rows: Vec<ScreenRow>,
+            cursor: Option<ScreenCursor>,
         },
         Exited(Option<u32>),
     }
@@ -149,6 +150,18 @@ mod unix {
                             .collect(),
                     })
                     .collect(),
+                cursor: frame.cursor.map(|cursor| ScreenCursor {
+                    x: cursor.x,
+                    y: cursor.y,
+                    visible: cursor.visible,
+                    blinking: cursor.blinking,
+                    style: match cursor.style {
+                        proto_ghostty_vt::CursorStyle::Bar => CursorStyle::Bar,
+                        proto_ghostty_vt::CursorStyle::Block => CursorStyle::Block,
+                        proto_ghostty_vt::CursorStyle::Underline => CursorStyle::Underline,
+                        proto_ghostty_vt::CursorStyle::HollowBlock => CursorStyle::HollowBlock,
+                    },
+                }),
             });
             Ok(())
         }
@@ -553,6 +566,7 @@ mod unix {
                         rows,
                         full,
                         dirty_rows,
+                        cursor,
                     }) => ServerMessage::ScreenPatch {
                         session_id,
                         revision,
@@ -560,6 +574,7 @@ mod unix {
                         rows,
                         full,
                         dirty_rows,
+                        cursor,
                     },
                     Ok(SessionEvent::Exited(exit_code)) => {
                         let _ = forwarding

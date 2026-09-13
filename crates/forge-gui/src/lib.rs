@@ -1,6 +1,6 @@
 //! Headless terminal-grid state consumed by the GPUI frontend.
 
-use proto_ipc::{ScreenCell, ScreenRow, ServerMessage};
+use proto_ipc::{ScreenCell, ScreenCursor, ScreenRow, ServerMessage};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -23,6 +23,7 @@ pub struct TerminalGrid {
     rows: u16,
     revision: u64,
     cells: Vec<ScreenCell>,
+    cursor: Option<ScreenCursor>,
 }
 
 impl TerminalGrid {
@@ -34,6 +35,7 @@ impl TerminalGrid {
             rows,
             revision: 0,
             cells: vec![blank_cell(); usize::from(cols) * usize::from(rows)],
+            cursor: None,
         }
     }
 
@@ -100,6 +102,20 @@ impl TerminalGrid {
         )
     }
 
+    #[must_use]
+    pub fn row(&self, y: u16) -> Option<&[ScreenCell]> {
+        if y >= self.rows {
+            return None;
+        }
+        let start = usize::from(y) * usize::from(self.cols);
+        Some(&self.cells[start..start + usize::from(self.cols)])
+    }
+
+    #[must_use]
+    pub fn cursor(&self) -> Option<ScreenCursor> {
+        self.cursor
+    }
+
     /// Applies a screen-bearing IPC message and ignores unrelated messages.
     ///
     /// # Errors
@@ -112,18 +128,24 @@ impl TerminalGrid {
             rows,
             full,
             dirty_rows,
+            cursor,
             ..
         } = message
         else {
             return Ok(false);
         };
-        self.apply_patch(*revision, *cols, *rows, *full, dirty_rows)
+        let changed = self.apply_patch(*revision, *cols, *rows, *full, dirty_rows)?;
+        if changed {
+            self.cursor = *cursor;
+        }
+        Ok(changed)
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
         self.cells = vec![blank_cell(); usize::from(cols) * usize::from(rows)];
+        self.cursor = None;
     }
 }
 
@@ -193,7 +215,7 @@ pub fn encode_terminal_key(key: &str, key_char: Option<&str>, control: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto_ipc::Rgb;
+    use proto_ipc::{CursorStyle, Rgb};
 
     fn cell(text: &str) -> ScreenCell {
         ScreenCell {
@@ -294,10 +316,39 @@ mod tests {
     }
 
     #[test]
+    fn reducer_updates_cursor_with_screen_revision() {
+        let mut grid = TerminalGrid::new(1, 1);
+        let cursor = ScreenCursor {
+            x: 0,
+            y: 0,
+            visible: true,
+            blinking: false,
+            style: CursorStyle::Block,
+        };
+        grid.apply_server_message(&ServerMessage::ScreenPatch {
+            session_id: 1,
+            revision: 1,
+            cols: 1,
+            rows: 1,
+            full: true,
+            dirty_rows: vec![row(0, &["x"])],
+            cursor: Some(cursor),
+        })
+        .unwrap();
+        assert_eq!(grid.cursor(), Some(cursor));
+    }
+
+    #[test]
     fn encodes_text_navigation_and_control_keys() {
-        assert_eq!(encode_terminal_key("x", Some("ñ"), false), Some("ñ".as_bytes().to_vec()));
+        assert_eq!(
+            encode_terminal_key("x", Some("ñ"), false),
+            Some("ñ".as_bytes().to_vec())
+        );
         assert_eq!(encode_terminal_key("enter", None, false), Some(vec![b'\r']));
-        assert_eq!(encode_terminal_key("up", None, false), Some(b"\x1b[A".to_vec()));
+        assert_eq!(
+            encode_terminal_key("up", None, false),
+            Some(b"\x1b[A".to_vec())
+        );
         assert_eq!(encode_terminal_key("c", None, true), Some(vec![3]));
     }
 }
