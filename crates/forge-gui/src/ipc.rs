@@ -89,13 +89,17 @@ mod unix {
         sync::mpsc as async_mpsc,
     };
 
-    pub async fn run_ipc(
+    /// Connects (starting the daemon if needed), creates the session and
+    /// attaches. Returns the framed reader, the writer and the session id.
+    async fn handshake(
         spec: SessionSpec,
-        tab_id: u64,
-        events: Sender<UiEvent>,
-        mut input: async_mpsc::UnboundedReceiver<IpcCommand>,
-    ) -> Result<()> {
-        let (stream, _daemon) = connect_or_start_daemon(&spec.socket).await?;
+    ) -> Result<(
+        FrameReader<tokio::net::unix::OwnedReadHalf>,
+        tokio::net::unix::OwnedWriteHalf,
+        u64,
+        Option<DaemonGuard>,
+    )> {
+        let (stream, daemon) = connect_or_start_daemon(&spec.socket).await?;
         let (reader, mut writer) = stream.into_split();
         let mut reader = FrameReader::new(reader);
         write_message(
@@ -135,6 +139,16 @@ mod unix {
             &ClientMessage::Attach { session_id },
         )
         .await?;
+        Ok((reader, writer, session_id, daemon))
+    }
+
+    pub async fn run_ipc(
+        spec: SessionSpec,
+        tab_id: u64,
+        events: Sender<UiEvent>,
+        mut input: async_mpsc::UnboundedReceiver<IpcCommand>,
+    ) -> Result<()> {
+        let (mut reader, mut writer, session_id, _daemon) = handshake(spec).await?;
         let _ = events.send(UiEvent::Status {
             tab_id,
             status: format!("Sesión {session_id} conectada"),
@@ -210,11 +224,7 @@ mod unix {
         result
     }
 
-    async fn send_resize<W>(
-        writer: &mut W,
-        session_id: u64,
-        (cols, rows): (u16, u16),
-    ) -> Result<()>
+    async fn send_resize<W>(writer: &mut W, session_id: u64, (cols, rows): (u16, u16)) -> Result<()>
     where
         W: tokio::io::AsyncWrite + Unpin,
     {
@@ -239,9 +249,7 @@ mod unix {
         }
     }
 
-    async fn connect_or_start_daemon(
-        socket: &Path,
-    ) -> Result<(UnixStream, Option<DaemonGuard>)> {
+    async fn connect_or_start_daemon(socket: &Path) -> Result<(UnixStream, Option<DaemonGuard>)> {
         if let Ok(stream) = UnixStream::connect(socket).await {
             return Ok((stream, None));
         }

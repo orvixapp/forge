@@ -517,14 +517,23 @@ mod tests {
             Config::default_path(Some(explicit)),
             Some(explicit.to_path_buf())
         );
-        assert!(Config::default_path(None).is_none_or(|path| path.ends_with("forge/config.toml")
-            || std::env::var_os("FORGE_CONFIG").is_some()));
+        assert!(
+            Config::default_path(None).is_none_or(|path| path.ends_with("forge/config.toml")
+                || std::env::var_os("FORGE_CONFIG").is_some())
+        );
     }
 
     #[test]
     fn json_schema_documents_every_section() {
         let schema = Config::json_schema();
-        for key in ["font", "colors", "terminal", "ui", "keybindings", "HexColor"] {
+        for key in [
+            "font",
+            "colors",
+            "terminal",
+            "ui",
+            "keybindings",
+            "HexColor",
+        ] {
             assert!(schema.contains(key), "schema lacks {key}");
         }
     }

@@ -8,12 +8,14 @@
 //! text instead of once per cell per frame.
 
 use forge_gui::{
-    CellPos, Selection, TerminalGrid, background_runs, config::ColorConfig, cursor_shape,
+    CellPos, Selection, TerminalGrid, background_runs, config::HexColor, cursor_shape,
+    theme::ThemeColors,
 };
 use gpui::{
-    App, BorderStyle, Bounds, Element, ElementId, Entity, Font, FontId, GlobalElementId, GlyphId,
-    Hsla, InspectorElementId, IntoElement, LayoutId, Pixels, Point, Rgba, Size, Style, TextRun,
-    Window, WindowTextSystem, black, fill, outline, point, px, rgb, size,
+    App, BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
+    FocusHandle, Font, FontId, GlobalElementId, GlyphId, Hsla, InspectorElementId, IntoElement,
+    LayoutId, Pixels, Point, Rgba, Size, Style, TextRun, Window, WindowTextSystem, black, fill,
+    outline, point, px, rgb, size,
 };
 use proto_ipc::{CursorStyle, Rgb};
 use std::{collections::HashMap, ops::Range};
@@ -29,18 +31,24 @@ pub struct Palette {
     pub accent: Rgba,
 }
 
-impl From<&ColorConfig> for Palette {
-    fn from(colors: &ColorConfig) -> Self {
-        let mut selection = rgb(rgb_value(colors.selection.0));
+impl From<&ThemeColors> for Palette {
+    fn from(colors: &ThemeColors) -> Self {
+        let mut selection = color(colors.selection);
         selection.a = colors.selection_opacity;
         Self {
-            background: rgb(rgb_value(colors.background.0)),
-            foreground: rgb(rgb_value(colors.foreground.0)),
-            cursor: rgb(rgb_value(colors.cursor.0)),
+            background: color(colors.background),
+            foreground: color(colors.foreground),
+            cursor: color(colors.cursor),
             selection,
-            accent: rgb(rgb_value(colors.accent.0)),
+            accent: color(colors.accent),
         }
     }
+}
+
+/// GPUI colour for a configured `#rrggbb`.
+#[must_use]
+pub fn color(value: HexColor) -> Rgba {
+    rgb(rgb_value(value.0))
 }
 
 /// Fixed cell geometry shared by layout, window resizing and painting.
@@ -127,6 +135,21 @@ impl TerminalSurface {
     pub fn contains(&self, position: Point<Pixels>) -> bool {
         self.last_bounds
             .is_some_and(|bounds| bounds.contains(&position))
+    }
+
+    /// Window-space rectangle of the cursor cell, where IME candidate
+    /// windows should appear. `None` before the first paint.
+    #[must_use]
+    pub fn cursor_bounds(&self) -> Option<Bounds<Pixels>> {
+        let bounds = self.last_bounds?;
+        let cursor = self.grid.cursor()?;
+        let cell = size(px(self.metrics.width), px(self.metrics.height));
+        let origin = bounds.origin
+            + point(
+                cell.width * f32::from(cursor.x),
+                cell.height * f32::from(cursor.y),
+            );
+        Some(Bounds::new(origin, cell))
     }
 }
 
@@ -321,13 +344,16 @@ impl ColorCache {
 }
 
 /// Element that paints a [`TerminalSurface`] owned by view `V`.
-pub struct TerminalGridElement<V: 'static> {
+pub struct TerminalGridElement<V: EntityInputHandler> {
     view: Entity<V>,
     index: usize,
     surface: fn(&mut V, usize) -> &mut TerminalSurface,
+    /// When set, this pane receives IME text (dead keys, CJK composition)
+    /// through the view's [`EntityInputHandler`].
+    input_focus: Option<FocusHandle>,
 }
 
-impl<V: 'static> TerminalGridElement<V> {
+impl<V: EntityInputHandler> TerminalGridElement<V> {
     /// Selects one surface from a view. Keeping the index in the element (and
     /// not in a closure) lets one Forge window paint several live terminals.
     pub fn new(
@@ -339,11 +365,20 @@ impl<V: 'static> TerminalGridElement<V> {
             view,
             index,
             surface,
+            input_focus: None,
         }
+    }
+
+    /// Registers the pane as the window's text input target while `focus`
+    /// is focused.
+    #[must_use]
+    pub fn with_input_focus(mut self, focus: FocusHandle) -> Self {
+        self.input_focus = Some(focus);
+        self
     }
 }
 
-impl<V: 'static> IntoElement for TerminalGridElement<V> {
+impl<V: EntityInputHandler> IntoElement for TerminalGridElement<V> {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -351,7 +386,7 @@ impl<V: 'static> IntoElement for TerminalGridElement<V> {
     }
 }
 
-impl<V: 'static> Element for TerminalGridElement<V> {
+impl<V: EntityInputHandler> Element for TerminalGridElement<V> {
     type RequestLayoutState = ();
     type PrepaintState = ();
 
@@ -407,8 +442,15 @@ impl<V: 'static> Element for TerminalGridElement<V> {
     ) {
         let surface = self.surface;
         let index = self.index;
+        if let Some(focus) = &self.input_focus {
+            window.handle_input(
+                focus,
+                ElementInputHandler::new(bounds, self.view.clone()),
+                cx,
+            );
+        }
         self.view.update(cx, |view, _| {
-            paint_grid(surface(view, index), bounds, window)
+            paint_grid(surface(view, index), bounds, window);
         });
     }
 }

@@ -175,8 +175,8 @@ pub struct ShellKeymap {
 impl Default for ShellKeymap {
     fn default() -> Self {
         use ShellCommand::{
-            CycleTheme, FocusNextPane, NewTerminalTab, ShowCommandPalette, SplitHorizontal,
-            SplitVertical, CloseWindow,
+            CloseWindow, CycleTheme, FocusNextPane, NewTerminalTab, ShowCommandPalette,
+            SplitHorizontal, SplitVertical,
         };
         use ShellContext::{Terminal, Window};
         Self {
@@ -317,7 +317,9 @@ pub enum SplitDirection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PaneTree {
-    Leaf { index: usize },
+    Leaf {
+        index: usize,
+    },
     Split {
         direction: SplitDirection,
         first: Box<PaneTree>,
@@ -377,11 +379,9 @@ impl PaneTree {
     pub fn remove(self, target: usize) -> Option<Self> {
         match self {
             Self::Leaf { index } if index == target => None,
-            Self::Leaf { index } => Some(Self::leaf(if index > target {
-                index - 1
-            } else {
-                index
-            })),
+            Self::Leaf { index } => {
+                Some(Self::leaf(if index > target { index - 1 } else { index }))
+            }
             Self::Split {
                 direction,
                 first,
@@ -439,9 +439,9 @@ impl WindowSession {
         };
         let session: Self = serde_json::from_str(&text)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        session.validate().map_err(|reason| {
-            io::Error::new(io::ErrorKind::InvalidData, reason)
-        })?;
+        session
+            .validate()
+            .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
         Ok(Some(session))
     }
 
@@ -515,7 +515,9 @@ mod tests {
         );
         assert_eq!(ShellCommand::NewTerminalTab.id(), "terminal.newTab");
         assert_eq!(
-            keymap.chord_for(ShellCommand::ShowCommandPalette).as_deref(),
+            keymap
+                .chord_for(ShellCommand::ShowCommandPalette)
+                .as_deref(),
             Some("Ctrl+Shift+P")
         );
     }
@@ -593,7 +595,10 @@ mod tests {
 
     #[test]
     fn every_command_has_a_unique_id_and_round_trips() {
-        let mut ids: Vec<_> = ShellCommand::ALL.iter().map(|command| command.id()).collect();
+        let mut ids: Vec<_> = ShellCommand::ALL
+            .iter()
+            .map(|command| command.id())
+            .collect();
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), ShellCommand::ALL.len());
