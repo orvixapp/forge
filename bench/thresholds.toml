@@ -8,3 +8,6 @@ max_frames = 0
 
 [ipc_round_trip]
 p95_ms = 1.0
+
+[grid_full]
+p95_ms = 4.0

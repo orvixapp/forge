@@ -2,10 +2,11 @@ use anyhow::{Context as _, Result, bail};
 use forge_gui::{TerminalGrid, encode_terminal_key};
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, KeyDownEvent, Render, Timer, Window,
-    WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
+    WindowBounds, WindowHandle, WindowOptions, div, prelude::*, px, rgb, size,
 };
 use proto_ipc::{
-    ClientMessage, FrameKind, PROTOCOL_VERSION, Rgb, ServerMessage, read_message, write_message,
+    ClientMessage, FrameKind, PROTOCOL_VERSION, Rgb, ScreenCell, ScreenRow, ServerMessage,
+    read_message, write_message,
 };
 use serde::Serialize;
 use std::{
@@ -196,6 +197,7 @@ fn main() {
     let options = run_options();
     let started = Instant::now();
     let socket = options.socket;
+    let grid_frames = options.benchmark_grid_frames;
     let (event_tx, event_rx) = mpsc::channel();
     let (input_tx, input_rx) = async_mpsc::unbounded_channel();
     let render_count = Arc::new(AtomicU64::new(0));
@@ -230,6 +232,7 @@ fn main() {
                         emit_metrics(&GuiMetrics {
                             scenario: "startup_empty",
                             elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                            samples_ms: None,
                             frames: 1,
                             pss_kib: process_pss_kib(),
                         });
@@ -237,7 +240,7 @@ fn main() {
                     });
                 })
                 .expect("schedule startup measurement");
-        } else if options.benchmark_idle_ms.is_none() {
+        } else if options.benchmark_idle_ms.is_none() && grid_frames.is_none() {
             window
                 .update(cx, |_, window, _| {
                     window.on_next_frame(move |_, _| {
@@ -255,6 +258,7 @@ fn main() {
                 emit_metrics(&GuiMetrics {
                     scenario: "idle",
                     elapsed_ms: Duration::from_millis(idle_ms).as_secs_f64() * 1_000.0,
+                    samples_ms: None,
                     frames: count.load(Ordering::Relaxed).saturating_sub(baseline),
                     pss_kib: process_pss_kib(),
                 });
@@ -262,8 +266,48 @@ fn main() {
             })
             .detach();
         }
+        if let Some(iterations) = grid_frames {
+            spawn_grid_benchmark(iterations, window, cx);
+        }
         cx.activate(true);
     });
+}
+
+fn spawn_grid_benchmark(iterations: usize, window: WindowHandle<ForgeWindow>, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        Timer::after(Duration::from_secs(1)).await;
+        let mut samples_ms = Vec::with_capacity(iterations);
+        for revision in 1..=iterations {
+            let (presented_tx, presented_rx) = tokio::sync::oneshot::channel();
+            let started = Instant::now();
+            if window
+                .update(cx, |view, window, cx| {
+                    view.grid
+                        .apply_server_message(&synthetic_grid_patch(revision))
+                        .expect("synthetic grid patch");
+                    cx.notify();
+                    window.on_next_frame(move |_, _| {
+                        let _ = presented_tx.send(started.elapsed().as_secs_f64() * 1_000.0);
+                    });
+                })
+                .is_err()
+            {
+                break;
+            }
+            if let Ok(sample) = presented_rx.await {
+                samples_ms.push(sample);
+            }
+        }
+        emit_metrics(&GuiMetrics {
+            scenario: "grid_full",
+            elapsed_ms: samples_ms.last().copied().unwrap_or_default(),
+            samples_ms: Some(samples_ms),
+            frames: u64::try_from(iterations).unwrap_or(u64::MAX),
+            pss_kib: process_pss_kib(),
+        });
+        let _ = cx.update(|cx| cx.quit());
+    })
+    .detach();
 }
 
 fn spawn_ipc_worker(
@@ -448,6 +492,7 @@ struct RunOptions {
     socket: PathBuf,
     exit_after_first_frame: bool,
     benchmark_idle_ms: Option<u64>,
+    benchmark_grid_frames: Option<usize>,
 }
 
 fn run_options() -> RunOptions {
@@ -455,6 +500,7 @@ fn run_options() -> RunOptions {
     let mut socket = PathBuf::from("/tmp/forge-prototype.sock");
     let mut exit_after_first_frame = false;
     let mut benchmark_idle_ms = None;
+    let mut benchmark_grid_frames = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--socket" => {
@@ -466,6 +512,9 @@ fn run_options() -> RunOptions {
             "--benchmark-idle-ms" => {
                 benchmark_idle_ms = args.next().and_then(|value| value.parse().ok());
             }
+            "--benchmark-grid-frames" => {
+                benchmark_grid_frames = args.next().and_then(|value| value.parse().ok());
+            }
             _ => {}
         }
     }
@@ -473,6 +522,7 @@ fn run_options() -> RunOptions {
         socket,
         exit_after_first_frame,
         benchmark_idle_ms,
+        benchmark_grid_frames,
     }
 }
 
@@ -480,8 +530,40 @@ fn run_options() -> RunOptions {
 struct GuiMetrics {
     scenario: &'static str,
     elapsed_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    samples_ms: Option<Vec<f64>>,
     frames: u64,
     pss_kib: Option<u64>,
+}
+
+fn synthetic_grid_patch(revision: usize) -> ServerMessage {
+    let marker = if revision.is_multiple_of(2) { "x" } else { "y" };
+    let cells = (0..200)
+        .map(|column| ScreenCell {
+            text: marker.into(),
+            foreground: Some(Rgb {
+                r: 0x88,
+                g: u8::try_from(column % 128).expect("bounded synthetic color") + 0x40,
+                b: 0xd0,
+            }),
+            background: None,
+            styled: true,
+        })
+        .collect::<Vec<_>>();
+    ServerMessage::ScreenPatch {
+        session_id: 0,
+        revision: u64::try_from(revision).unwrap_or(u64::MAX),
+        cols: 200,
+        rows: 60,
+        full: true,
+        dirty_rows: (0..60)
+            .map(|y| ScreenRow {
+                y,
+                cells: cells.clone(),
+            })
+            .collect(),
+        cursor: None,
+    }
 }
 
 fn emit_metrics(metrics: &GuiMetrics) {
@@ -554,5 +636,23 @@ mod tests {
         assert!(runs[1].cursor);
         assert_eq!(runs[2].foreground, Some(Rgb { r: 1, g: 2, b: 3 }));
         assert_eq!(runs[2].text, "bb");
+    }
+
+    #[test]
+    fn synthetic_benchmark_builds_a_fully_dirty_200_by_60_grid() {
+        let ServerMessage::ScreenPatch {
+            cols,
+            rows,
+            full,
+            dirty_rows,
+            ..
+        } = synthetic_grid_patch(1)
+        else {
+            panic!("expected screen patch");
+        };
+        assert_eq!((cols, rows), (200, 60));
+        assert!(full);
+        assert_eq!(dirty_rows.len(), 60);
+        assert!(dirty_rows.iter().all(|row| row.cells.len() == 200));
     }
 }

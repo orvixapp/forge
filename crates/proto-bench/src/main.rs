@@ -7,6 +7,7 @@ use std::{path::PathBuf, process::Command, time::Instant};
 #[derive(Deserialize)]
 struct GuiMetrics {
     elapsed_ms: f64,
+    samples_ms: Option<Vec<f64>>,
     frames: u64,
     pss_kib: Option<u64>,
 }
@@ -24,8 +25,15 @@ async fn main() -> Result<()> {
             options.iterations,
             &["--exit-after-first-frame"],
         )?,
+        "grid_full" => gui_scenario(
+            "grid_full",
+            1,
+            &["--benchmark-grid-frames", &options.iterations.to_string()],
+        )?,
         "idle" => gui_scenario("idle", 1, &["--benchmark-idle-ms", "60000"])?,
-        _ => bail!("unknown scenario {scenario}; use ipc_round_trip, startup_empty, or idle"),
+        _ => bail!(
+            "unknown scenario {scenario}; use ipc_round_trip, startup_empty, idle, or grid_full"
+        ),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
     if options.check {
@@ -90,7 +98,11 @@ fn gui_scenario(scenario: &str, iterations: usize, args: &[&str]) -> Result<Benc
             .rev()
             .find_map(|line| serde_json::from_str(line).ok())
             .context("forge-gui emitted no JSON metrics")?;
-        samples.push(metrics.elapsed_ms);
+        if let Some(frame_samples) = metrics.samples_ms {
+            samples.extend(frame_samples);
+        } else {
+            samples.push(metrics.elapsed_ms);
+        }
         pss.extend(metrics.pss_kib);
         frames = Some(metrics.frames);
     }
