@@ -563,6 +563,10 @@ impl ForgeWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The terminal consumes every key. Without this, GPUI's Linux backends
+        // would also hand `key_char` to the IME input handler and each typed
+        // character would reach the shell twice.
+        cx.stop_propagation();
         let keystroke = &event.keystroke;
         let modifiers = KeyModifiers {
             control: keystroke.modifiers.control,
