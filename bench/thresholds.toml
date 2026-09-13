@@ -1,3 +1,6 @@
+# Product budgets from docs/ARCHITECTURE.md §5.2 and §29, meant for the
+# reference machines in MACHINES.md. CI runners use thresholds.ci.toml.
+
 [startup_empty]
 p95_ms = 100.0
 max_pss_kib = 81920
@@ -11,3 +14,6 @@ p95_ms = 1.0
 
 [grid_full]
 p95_ms = 4.0
+
+[panes_20]
+p95_ms = 2.0

@@ -1,0 +1,20 @@
+# Regression budgets for GitHub-hosted Linux runners (Xvfb + lavapipe, no
+# GPU, shared CPU). They catch order-of-magnitude regressions, not the
+# product targets in thresholds.toml.
+
+[startup_empty]
+p95_ms = 1500.0
+max_pss_kib = 262144
+
+[idle]
+duration_ms = 60000
+max_frames = 0
+
+[ipc_round_trip]
+p95_ms = 5.0
+
+[grid_full]
+p95_ms = 40.0
+
+[panes_20]
+p95_ms = 20.0

@@ -412,8 +412,16 @@ impl ForgeWindow {
         self.tabs.iter_mut().find(|tab| tab.id == id)
     }
 
-    pub fn terminal_surface_at(&mut self, index: usize) -> &mut TerminalSurface {
-        &mut self.tabs[index].terminal
+    /// Surface of pane `index`, called from the grid element's paint with the
+    /// area it fills; the PTY is resized when that area changes.
+    pub fn pane_surface(&mut self, index: usize, bounds: Bounds<Pixels>) -> &mut TerminalSurface {
+        let (cols, rows) = crate::grid_dimensions(bounds.size, self.factory.metrics, 0.0);
+        let tab = &mut self.tabs[index];
+        if tab.viewport != Some((cols, rows)) {
+            tab.viewport = Some((cols, rows));
+            let _ = tab.input.send(IpcCommand::Resize { cols, rows });
+        }
+        &mut tab.terminal
     }
 
     /// Creates a tab (and its daemon session) and makes it active.
@@ -470,20 +478,6 @@ impl ForgeWindow {
         };
         self.split = self.split.take().and_then(|tree| tree.remove(index));
         cx.notify();
-    }
-
-    /// Records the cell size a pane was painted at and asks the daemon to
-    /// resize the PTY when it changed.
-    pub fn pane_painted(&mut self, index: usize, bounds: Bounds<Pixels>) {
-        let metrics = self.factory.metrics;
-        let (cols, rows) = crate::grid_dimensions(bounds.size, metrics, 0.0);
-        let Some(tab) = self.tabs.get_mut(index) else {
-            return;
-        };
-        if tab.viewport != Some((cols, rows)) {
-            tab.viewport = Some((cols, rows));
-            let _ = tab.input.send(IpcCommand::Resize { cols, rows });
-        }
     }
 
     /// The split tree to render: the stored one when it still contains the
@@ -833,11 +827,13 @@ impl ForgeWindow {
 
     // ----- benchmarks ----------------------------------------------------
 
-    /// Opens `count` empty panes in a balanced split tree.
+    /// Opens `count` empty panes in a balanced split tree: leaf `k` is split
+    /// by the panes `2k+1` and `2k+2`, like a binary heap, so the depth stays
+    /// logarithmic. (A chain of nested splits makes flex layout superlinear.)
     pub fn open_benchmark_panes(&mut self, count: usize, cx: &mut Context<Self>) {
         while self.tabs.len() < count {
-            let target = self.tabs.len() % self.tabs.len().max(1);
             let new = self.create_terminal_tab(None, cx);
+            let target = (new - 1) / 2;
             let direction = if new.is_multiple_of(2) {
                 SplitDirection::Vertical
             } else {

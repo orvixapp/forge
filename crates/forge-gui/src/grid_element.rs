@@ -15,7 +15,7 @@ use gpui::{
     App, BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, Font, FontId, GlobalElementId, GlyphId, Hsla, InspectorElementId, IntoElement,
     LayoutId, Pixels, Point, Rgba, Size, Style, TextRun, Window, WindowTextSystem, black, fill,
-    outline, point, px, rgb, size,
+    outline, point, px, relative, rgb, size,
 };
 use proto_ipc::{CursorStyle, Rgb};
 use std::{collections::HashMap, ops::Range};
@@ -344,22 +344,25 @@ impl ColorCache {
 }
 
 /// Element that paints a [`TerminalSurface`] owned by view `V`.
+/// Fills its container; the view learns the painted size through the
+/// accessor so it can resize the PTY to match.
 pub struct TerminalGridElement<V: EntityInputHandler> {
     view: Entity<V>,
     index: usize,
-    surface: fn(&mut V, usize) -> &mut TerminalSurface,
+    surface: fn(&mut V, usize, Bounds<Pixels>) -> &mut TerminalSurface,
     /// When set, this pane receives IME text (dead keys, CJK composition)
     /// through the view's [`EntityInputHandler`].
     input_focus: Option<FocusHandle>,
 }
 
 impl<V: EntityInputHandler> TerminalGridElement<V> {
-    /// Selects one surface from a view. Keeping the index in the element (and
-    /// not in a closure) lets one Forge window paint several live terminals.
+    /// Selects one surface from a view given the bounds it is painted at.
+    /// Keeping the index in the element (and not in a closure) lets one Forge
+    /// window paint several live terminals.
     pub fn new(
         view: Entity<V>,
         index: usize,
-        surface: fn(&mut V, usize) -> &mut TerminalSurface,
+        surface: fn(&mut V, usize, Bounds<Pixels>) -> &mut TerminalSurface,
     ) -> Self {
         Self {
             view,
@@ -405,17 +408,9 @@ impl<V: EntityInputHandler> Element for TerminalGridElement<V> {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let surface = self.surface;
-        let index = self.index;
-        let grid_size = self.view.update(cx, |view, _| {
-            let surface = surface(view, index);
-            let (cols, rows) = surface.grid.dimensions();
-            surface.metrics.grid_size(cols, rows)
-        });
         let mut style = Style::default();
-        style.size.width = grid_size.width.into();
-        style.size.height = grid_size.height.into();
-        style.flex_shrink = 0.0;
+        style.size.width = relative(1.0).into();
+        style.size.height = relative(1.0).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -450,7 +445,7 @@ impl<V: EntityInputHandler> Element for TerminalGridElement<V> {
             );
         }
         self.view.update(cx, |view, _| {
-            paint_grid(surface(view, index), bounds, window);
+            paint_grid(surface(view, index, bounds), bounds, window);
         });
     }
 }

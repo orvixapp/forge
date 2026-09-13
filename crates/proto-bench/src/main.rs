@@ -2,7 +2,11 @@ use anyhow::{Context, Result, bail};
 use forge_bench::{BenchmarkResult, Thresholds, summarize};
 use proto_ipc::{ClientMessage, FrameKind, read_message, write_message};
 use serde::Deserialize;
-use std::{path::PathBuf, process::Command, time::Instant};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+    time::Instant,
+};
 
 #[derive(Deserialize)]
 struct GuiMetrics {
@@ -30,9 +34,19 @@ async fn main() -> Result<()> {
             1,
             &["--benchmark-grid-frames", &options.iterations.to_string()],
         )?,
+        "panes_20" => gui_scenario(
+            "panes_20",
+            1,
+            &[
+                "--benchmark-panes",
+                "20",
+                "--benchmark-frames",
+                &options.iterations.to_string(),
+            ],
+        )?,
         "idle" => gui_scenario("idle", 1, &["--benchmark-idle-ms", "60000"])?,
         _ => bail!(
-            "unknown scenario {scenario}; use ipc_round_trip, startup_empty, idle, or grid_full"
+            "unknown scenario {scenario}; use ipc_round_trip, startup_empty, idle, grid_full, or panes_20"
         ),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -40,7 +54,7 @@ async fn main() -> Result<()> {
         save_result(path, &result)?;
     }
     if options.check {
-        check_thresholds(&result)?;
+        check_thresholds(&result, options.thresholds.as_deref())?;
     }
     Ok(())
 }
@@ -50,6 +64,8 @@ struct Options {
     iterations: usize,
     check: bool,
     output: Option<PathBuf>,
+    /// Budget file for `--check`; defaults to `bench/thresholds.toml`.
+    thresholds: Option<PathBuf>,
 }
 
 fn save_result(path: &std::path::Path, result: &BenchmarkResult) -> Result<()> {
@@ -139,8 +155,11 @@ fn forge_gui_executable() -> PathBuf {
     profile_directory.join("forge-gui")
 }
 
-fn check_thresholds(result: &BenchmarkResult) -> Result<()> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/thresholds.toml");
+fn check_thresholds(result: &BenchmarkResult, thresholds: Option<&Path>) -> Result<()> {
+    let path = thresholds.map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/thresholds.toml"),
+        Path::to_path_buf,
+    );
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("read thresholds from {}", path.display()))?;
     let thresholds: Thresholds = toml::from_str(&contents).context("parse benchmark thresholds")?;
@@ -158,11 +177,17 @@ fn parse_options(args: &[String]) -> Result<Options> {
         iterations: 10,
         check: false,
         output: None,
+        thresholds: None,
     };
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--check" => options.check = true,
+            "--thresholds" => {
+                index += 1;
+                let value = args.get(index).context("--thresholds requires a path")?;
+                options.thresholds = Some(PathBuf::from(value));
+            }
             "--output" => {
                 index += 1;
                 options.output = Some(args.get(index).context("--output requires a path")?.into());
@@ -194,14 +219,23 @@ mod tests {
                 iterations: 10,
                 check: false,
                 output: None,
+                thresholds: None,
             }
         );
         assert_eq!(
-            parse_options(&["--check".into(), "--iterations".into(), "3".into()]).unwrap(),
+            parse_options(&[
+                "--check".into(),
+                "--iterations".into(),
+                "3".into(),
+                "--thresholds".into(),
+                "bench/thresholds.ci.toml".into(),
+            ])
+            .unwrap(),
             Options {
                 iterations: 3,
                 check: true,
                 output: None,
+                thresholds: Some(PathBuf::from("bench/thresholds.ci.toml")),
             }
         );
         assert!(parse_options(&["--iterations".into(), "0".into()]).is_err());

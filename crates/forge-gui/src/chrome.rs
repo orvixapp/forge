@@ -12,7 +12,7 @@ use forge_gui::{
 };
 use gpui::{
     AnyElement, Context, CursorStyle, ImageSource, MouseButton, ResizeEdge, Resource, SharedString,
-    Window, canvas, div, img, prelude::*, px, rgb,
+    Window, div, img, prelude::*, px, rgb,
 };
 
 pub const TOPBAR_HEIGHT: f32 = 36.0;
@@ -271,11 +271,7 @@ fn pane_leaf(view: &ForgeWindow, index: usize, cx: &mut Context<ForgeWindow>) ->
         Some(marked) if active => format!("{cols}×{rows} · {} · IME: {marked}", tab.status),
         _ => format!("{cols}×{rows} · {}", tab.status),
     };
-    let entity = cx.entity();
-    let mut grid =
-        TerminalGridElement::new(entity.clone(), index, |view: &mut ForgeWindow, index| {
-            view.terminal_surface_at(index)
-        });
+    let mut grid = TerminalGridElement::new(cx.entity(), index, ForgeWindow::pane_surface);
     if active {
         grid = grid.with_input_focus(view.focus.clone());
     }
@@ -298,24 +294,9 @@ fn pane_leaf(view: &ForgeWindow, index: usize, cx: &mut Context<ForgeWindow>) ->
             div()
                 .flex_1()
                 .min_h(px(0.0))
+                .overflow_hidden()
                 .p(px(view.config.terminal.padding))
-                .child(
-                    div()
-                        .relative()
-                        .size_full()
-                        .overflow_hidden()
-                        .child(
-                            canvas(
-                                |bounds, _, _| bounds,
-                                move |_, bounds, _, cx| {
-                                    entity.update(cx, |view, _| view.pane_painted(index, bounds));
-                                },
-                            )
-                            .absolute()
-                            .size_full(),
-                        )
-                        .child(grid),
-                ),
+                .child(grid),
         )
         .when(view.config.terminal.show_status, |pane| {
             pane.child(
