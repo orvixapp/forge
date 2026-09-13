@@ -1,0 +1,14 @@
+[package]
+name = "proto-term-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+proto-ipc = { path = "../proto-ipc" }
+tokio.workspace = true
+
+[lints]
+workspace = true
+
