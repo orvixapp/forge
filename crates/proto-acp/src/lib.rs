@@ -86,7 +86,11 @@ impl ClientSurface {
         }
     }
 
+    /// Registers unsaved editor content. The key is canonical so a request
+    /// for the same file through a symlink (`/var` → `/private/var` on
+    /// macOS) or a relative path still finds it.
     pub fn set_buffer(&mut self, path: PathBuf, content: String) {
+        let path = path.canonicalize().unwrap_or(path);
         self.buffers.insert(path, content);
     }
 
