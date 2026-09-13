@@ -5,6 +5,7 @@ use forge_gui::{
     KeyModifiers, Selection, TerminalGrid,
     config::{Config, resolve_font_family},
     encode_terminal_key,
+    shell::{ShellCommand, ShellContext, ShellKeymap, ShellKeystroke},
 };
 use gpui::{
     App, Application, AssetSource, Bounds, ClipboardItem, Context,
@@ -23,7 +24,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
     },
@@ -99,6 +100,7 @@ impl WindowFactory {
         let (input_tx, input_rx) = async_mpsc::unbounded_channel();
         let factory = self.clone();
         let resize_tx = input_tx.clone();
+        let last_resize = Arc::new(Mutex::new(None));
         let bounds = Bounds::centered(None, self.window_size, cx);
         let window = cx.open_window(
             WindowOptions {
@@ -115,14 +117,20 @@ impl WindowFactory {
             },
             move |window, cx| {
                 let resize_tx = resize_tx.clone();
+                let last_resize = Arc::clone(&last_resize);
                 let view = cx.new(|cx| {
                     let resize_tx = resize_tx.clone();
+                    let last_resize = Arc::clone(&last_resize);
                     let metrics = factory.metrics;
                     let chrome_height = factory.chrome_height;
                     cx.observe_window_bounds(window, move |_, window, _| {
                         let (cols, rows) =
                             grid_dimensions(window.bounds().size, metrics, chrome_height);
-                        let _ = resize_tx.send(IpcCommand::Resize { cols, rows });
+                        let mut last = last_resize.lock().expect("resize state mutex poisoned");
+                        if *last != Some((cols, rows)) {
+                            *last = Some((cols, rows));
+                            let _ = resize_tx.send(IpcCommand::Resize { cols, rows });
+                        }
                     })
                     .detach();
                     ForgeWindow::new(
@@ -165,6 +173,7 @@ struct ForgeWindow {
     factory: WindowFactory,
     /// Cell where the current left-button drag started.
     drag_anchor: Option<forge_gui::CellPos>,
+    keymap: ShellKeymap,
 }
 
 impl ForgeWindow {
@@ -207,6 +216,7 @@ impl ForgeWindow {
             frame_probe: None,
             factory,
             drag_anchor: None,
+            keymap: ShellKeymap::default(),
         }
     }
 
@@ -246,10 +256,14 @@ impl ForgeWindow {
             shift: keystroke.modifiers.shift,
         };
         let copy_paste = modifiers.control && modifiers.shift && !modifiers.alt;
-        if modifiers.control
-            && !modifiers.shift
-            && !modifiers.alt
-            && keystroke.key.eq_ignore_ascii_case("t")
+        let shell_key = ShellKeystroke::new(
+            &keystroke.key,
+            modifiers.control,
+            modifiers.alt,
+            modifiers.shift,
+        );
+        if self.keymap.resolve(&shell_key, ShellContext::Terminal)
+            == Some(ShellCommand::NewTerminalWindow)
         {
             let factory = self.factory.clone();
             cx.spawn(async move |_this, cx| {
@@ -447,8 +461,15 @@ impl Render for ForgeWindow {
                             .items_center()
                             .gap(px(8.0))
                             .cursor_default()
-                            .on_mouse_down(MouseButton::Left, |_, window, _| {
-                                window.start_window_move();
+                            .on_mouse_down(MouseButton::Left, |event, window, _| {
+                                if event.click_count >= 2 {
+                                    window.zoom_window();
+                                } else {
+                                    window.start_window_move();
+                                }
+                            })
+                            .on_mouse_down(MouseButton::Right, |event, window, _| {
+                                window.show_window_menu(event.position);
                             })
                             .child(img("forge-logo.svg").size(px(21.0)))
                             .child(div().text_size(px(13.0)).child("Terminal")),
@@ -835,15 +856,46 @@ async fn run_ipc(
     });
     let mut outgoing = tokio::spawn(async move {
         while let Some(command) = input.recv().await {
-            let message = match command {
-                IpcCommand::Input(data) => ClientMessage::Input { session_id, data },
-                IpcCommand::Resize { cols, rows } => ClientMessage::Resize {
-                    session_id,
-                    cols,
-                    rows,
-                },
-            };
-            write_message(&mut writer, FrameKind::Notification, &message).await?;
+            match command {
+                IpcCommand::Input(data) => {
+                    write_message(
+                        &mut writer,
+                        FrameKind::Notification,
+                        &ClientMessage::Input { session_id, data },
+                    )
+                    .await?;
+                }
+                IpcCommand::Resize { cols, rows } => {
+                    let mut latest = (cols, rows);
+                    // Interactive window resize can generate hundreds of
+                    // bounds updates. A PTY reflow is expensive and each one
+                    // produces a screen snapshot, so keep only the final cell
+                    // dimensions after a short quiet period.
+                    loop {
+                        match tokio::time::timeout(Duration::from_millis(60), input.recv()).await {
+                            Ok(Some(IpcCommand::Resize { cols, rows })) => latest = (cols, rows),
+                            Ok(Some(IpcCommand::Input(data))) => {
+                                send_resize(&mut writer, session_id, latest).await?;
+                                write_message(
+                                    &mut writer,
+                                    FrameKind::Notification,
+                                    &ClientMessage::Input { session_id, data },
+                                )
+                                .await?;
+                                break;
+                            }
+                            Ok(None) => {
+                                send_resize(&mut writer, session_id, latest).await?;
+                                return Ok::<(), anyhow::Error>(());
+                            }
+                            Err(_) => {
+                                send_resize(&mut writer, session_id, latest).await?;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
         Ok::<(), anyhow::Error>(())
     });
@@ -854,6 +906,23 @@ async fn run_ipc(
     incoming.abort();
     outgoing.abort();
     result
+}
+
+async fn send_resize<W>(writer: &mut W, session_id: u64, (cols, rows): (u16, u16)) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    write_message(
+        writer,
+        FrameKind::Notification,
+        &ClientMessage::Resize {
+            session_id,
+            cols,
+            rows,
+        },
+    )
+    .await
+    .context("send terminal resize")
 }
 
 struct DaemonGuard(Child);

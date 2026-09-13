@@ -1,6 +1,7 @@
 //! Headless terminal-grid state consumed by the GPUI frontend.
 
 pub mod config;
+pub mod shell;
 
 use proto_ipc::{CursorStyle, Rgb, ScreenCell, ScreenCursor, ScreenRow, ServerMessage};
 use std::ops::Range;
