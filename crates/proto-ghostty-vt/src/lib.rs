@@ -162,9 +162,7 @@ impl GhosttyLibrary {
         let mut render_state = ptr::null_mut();
         // SAFETY: `render_state` is a valid out pointer and null selects the
         // default allocator. On failure the already-created terminal is freed.
-        let result = unsafe {
-            (self.api.render_state_new)(ptr::null(), &raw mut render_state)
-        };
+        let result = unsafe { (self.api.render_state_new)(ptr::null(), &raw mut render_state) };
         if let Err(error) = check("render_state_new", result) {
             // SAFETY: `raw` was created successfully and is uniquely owned.
             unsafe { (self.api.terminal_free)(raw) };
@@ -251,11 +249,7 @@ impl GhosttyTerminal {
         // SAFETY: each private call site pairs the data tag with its documented
         // output type from the pinned Ghostty header.
         let result = unsafe {
-            (self.api.render_state_get)(
-                self.render_state,
-                data,
-                (&raw mut value).cast::<c_void>(),
-            )
+            (self.api.render_state_get)(self.render_state, data, (&raw mut value).cast::<c_void>())
         };
         check(operation, result)?;
         Ok(value)

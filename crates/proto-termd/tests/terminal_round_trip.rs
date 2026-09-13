@@ -54,7 +54,10 @@ async fn command_output_crosses_the_daemon_boundary() {
         &ClientMessage::CreateSession {
             request_id: 9,
             command: "/bin/sh".into(),
-            args: vec!["-lc".into(), "printf forge-terminal-ok".into()],
+            args: vec![
+                "-lc".into(),
+                "printf '\\033[31mforge-terminal-ok\\033[0m'".into(),
+            ],
             cols: 80,
             rows: 24,
         },
@@ -77,9 +80,10 @@ async fn command_output_crosses_the_daemon_boundary() {
     .await
     .unwrap();
 
-    let (output, screen) = timeout(Duration::from_secs(5), async {
+    let (output, screen, screen_meta) = timeout(Duration::from_secs(5), async {
         let mut output = Vec::new();
         let mut screen = String::new();
+        let mut screen_meta = None;
         loop {
             match read_message::<_, ServerMessage>(&mut reader)
                 .await
@@ -88,10 +92,19 @@ async fn command_output_crosses_the_daemon_boundary() {
             {
                 ServerMessage::Attached { backlog, .. } => output.extend(backlog),
                 ServerMessage::Output { data, .. } => output.extend(data),
-                ServerMessage::ScreenUpdated { text, .. } => screen = text,
+                ServerMessage::ScreenUpdated {
+                    revision,
+                    cols,
+                    rows,
+                    text,
+                    ..
+                } => {
+                    screen = text;
+                    screen_meta = Some((revision, cols, rows));
+                }
                 ServerMessage::Exited { exit_code, .. } => {
                     assert_eq!(exit_code, Some(0));
-                    return (output, screen);
+                    return (output, screen, screen_meta);
                 }
                 ServerMessage::Error { message } => panic!("daemon error: {message}"),
                 _ => {}
@@ -101,8 +114,11 @@ async fn command_output_crosses_the_daemon_boundary() {
     .await
     .expect("terminal command timed out");
 
-    assert_eq!(output, b"forge-terminal-ok");
-    assert!(screen.contains("forge-terminal-ok"));
+    assert_eq!(output, b"\x1b[31mforge-terminal-ok\x1b[0m");
+    assert_eq!(screen, "forge-terminal-ok");
+    let (revision, cols, rows) = screen_meta.expect("Ghostty render frame");
+    assert!(revision > 0);
+    assert_eq!((cols, rows), (80, 24));
     daemon.kill().await.expect("stop daemon");
     let _ = std::fs::remove_file(socket);
 }
