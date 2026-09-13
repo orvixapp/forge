@@ -25,14 +25,22 @@ bootstrap step.
 
 The benchmark runner emits JSON. With `--check`, it also enforces the versioned
 budgets in `bench/thresholds.toml`; the idle scenario runs for 60 seconds. Build
-`forge-gui` in the same profile before running the GUI scenarios.
+`forge-gui` in the same profile before running the GUI scenarios, and run them
+one at a time: a second window opening or closing on top counts as focus
+changes and redraws. `grid_full` measures state update → `present()` per frame
+and reports `painted_cells` so culling cannot hide work; set
+`ZED_MEASUREMENTS=1` to have GPUI print its own draw+present time per frame.
 
 ## Current scope
 
 - Implemented: versioned MessagePack framing, bounded frames, PTY lifecycle,
   attach/detach, bounded raw backlog, terminal resize/input, Ghostty VT parsing
-  and incremental styled screen cells, GPUI terminal grid and keyboard input,
-  rope edits and undo, JSON-RPC/JSONL transport primitives for the ACP spike,
-  benchmark harness for IPC latency, cold startup, PSS, and idle redraws.
-- Next: ACP capability flow, benchmark history persistence and the Open VSX API
-  scanner.
+  and incremental styled screen cells, a direct-paint GPUI grid element (one
+  quad per background run, one sprite per glyph, glyph cache, block/bar/
+  underline cursors) and keyboard input, rope edits and undo, JSON-RPC/JSONL
+  transport primitives for the ACP spike, benchmark harness for IPC latency,
+  cold startup, PSS, idle redraws and the fully dirty 200×60 grid.
+- Measured: see `bench/results/2026-09-13-grid-full.md` for the grid spike
+  numbers and the reading behind bet A.
+- Next: incremental terminal redraw (cached unchanged rows), ACP capability
+  flow, benchmark history persistence and the Open VSX API scanner.

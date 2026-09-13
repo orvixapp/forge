@@ -1,6 +1,6 @@
 //! Headless terminal-grid state consumed by the GPUI frontend.
 
-use proto_ipc::{ScreenCell, ScreenCursor, ScreenRow, ServerMessage};
+use proto_ipc::{CursorStyle, Rgb, ScreenCell, ScreenCursor, ScreenRow, ServerMessage};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -41,6 +41,8 @@ impl TerminalGrid {
 
     /// Applies a complete or incremental screen patch. Stale revisions are
     /// ignored so delayed IPC messages cannot roll the visible grid backward.
+    /// Rows are moved into the grid, not cloned: a full 200×60 frame carries
+    /// 12 000 strings and copying them costs as much as painting them.
     ///
     /// # Errors
     ///
@@ -51,19 +53,19 @@ impl TerminalGrid {
         cols: u16,
         rows: u16,
         full: bool,
-        dirty_rows: &[ScreenRow],
+        mut dirty_rows: Vec<ScreenRow>,
     ) -> Result<bool, GridError> {
         if revision <= self.revision {
             return Ok(false);
         }
         let (cols, rows) = (cols.max(1), rows.max(1));
-        validate_rows(cols, rows, full, dirty_rows)?;
+        validate_rows(cols, rows, full, &dirty_rows)?;
         if self.cols != cols || self.rows != rows {
             self.resize(cols, rows);
         }
-        for row in dirty_rows {
+        for row in &mut dirty_rows {
             let start = usize::from(row.y) * usize::from(cols);
-            self.cells[start..start + usize::from(cols)].clone_from_slice(&row.cells);
+            self.cells[start..start + usize::from(cols)].swap_with_slice(&mut row.cells);
         }
         self.revision = revision;
         Ok(true)
@@ -121,7 +123,7 @@ impl TerminalGrid {
     /// # Errors
     ///
     /// Returns the same validation errors as [`Self::apply_patch`].
-    pub fn apply_server_message(&mut self, message: &ServerMessage) -> Result<bool, GridError> {
+    pub fn apply_server_message(&mut self, message: ServerMessage) -> Result<bool, GridError> {
         let ServerMessage::ScreenPatch {
             revision,
             cols,
@@ -134,9 +136,9 @@ impl TerminalGrid {
         else {
             return Ok(false);
         };
-        let changed = self.apply_patch(*revision, *cols, *rows, *full, dirty_rows)?;
+        let changed = self.apply_patch(revision, cols, rows, full, dirty_rows)?;
         if changed {
-            self.cursor = *cursor;
+            self.cursor = cursor;
         }
         Ok(changed)
     }
@@ -180,6 +182,84 @@ fn validate_rows(
     Ok(())
 }
 
+/// Consecutive cells on one row that share an explicit background colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackgroundRun {
+    pub start: u16,
+    pub len: u16,
+    pub color: Rgb,
+}
+
+/// Merges neighbouring cells with the same explicit background so the
+/// renderer paints one quad per run instead of one per cell. Cells without a
+/// background are skipped: the surface behind the grid shows through.
+///
+/// # Panics
+///
+/// Panics if `cells` is wider than a terminal row can be (`u16::MAX`).
+pub fn background_runs(cells: &[ScreenCell]) -> impl Iterator<Item = BackgroundRun> + '_ {
+    let mut x = 0;
+    std::iter::from_fn(move || {
+        while x < cells.len() {
+            let Some(color) = cells[x].background else {
+                x += 1;
+                continue;
+            };
+            let start = x;
+            while x < cells.len() && cells[x].background == Some(color) {
+                x += 1;
+            }
+            return Some(BackgroundRun {
+                start: u16::try_from(start).expect("grid rows are at most u16::MAX cells wide"),
+                len: u16::try_from(x - start).expect("run fits inside a u16-wide row"),
+                color,
+            });
+        }
+        None
+    })
+}
+
+/// Cursor rectangle relative to the top-left corner of its cell, in pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CursorShape {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    /// Outline only; the cell text stays visible in its own colour.
+    pub hollow: bool,
+}
+
+/// Thickness of bar and underline cursors.
+pub const THIN_CURSOR_PX: f32 = 2.0;
+
+#[must_use]
+pub fn cursor_shape(style: CursorStyle, cell_width: f32, cell_height: f32) -> CursorShape {
+    match style {
+        CursorStyle::Block | CursorStyle::HollowBlock => CursorShape {
+            x: 0.0,
+            y: 0.0,
+            width: cell_width,
+            height: cell_height,
+            hollow: style == CursorStyle::HollowBlock,
+        },
+        CursorStyle::Underline => CursorShape {
+            x: 0.0,
+            y: (cell_height - THIN_CURSOR_PX).max(0.0),
+            width: cell_width,
+            height: THIN_CURSOR_PX.min(cell_height),
+            hollow: false,
+        },
+        CursorStyle::Bar => CursorShape {
+            x: 0.0,
+            y: 0.0,
+            width: THIN_CURSOR_PX.min(cell_width),
+            height: cell_height,
+            hollow: false,
+        },
+    }
+}
+
 fn blank_cell() -> ScreenCell {
     ScreenCell {
         text: String::new(),
@@ -215,7 +295,6 @@ pub fn encode_terminal_key(key: &str, key_char: Option<&str>, control: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto_ipc::{CursorStyle, Rgb};
 
     fn cell(text: &str) -> ScreenCell {
         ScreenCell {
@@ -237,8 +316,14 @@ mod tests {
     fn applies_full_frame_and_preserves_cell_metadata() {
         let mut grid = TerminalGrid::new(1, 1);
         assert!(
-            grid.apply_patch(1, 2, 2, true, &[row(0, &["a", "b"]), row(1, &["c", "d"])])
-                .unwrap()
+            grid.apply_patch(
+                1,
+                2,
+                2,
+                true,
+                vec![row(0, &["a", "b"]), row(1, &["c", "d"])]
+            )
+            .unwrap()
         );
         assert_eq!(grid.dimensions(), (2, 2));
         assert_eq!(grid.cell(1, 1), Some(&cell("d")));
@@ -247,9 +332,15 @@ mod tests {
     #[test]
     fn partial_patch_only_replaces_dirty_row() {
         let mut grid = TerminalGrid::new(2, 2);
-        grid.apply_patch(1, 2, 2, true, &[row(0, &["a", "b"]), row(1, &["c", "d"])])
-            .unwrap();
-        grid.apply_patch(2, 2, 2, false, &[row(1, &["x", "y"])])
+        grid.apply_patch(
+            1,
+            2,
+            2,
+            true,
+            vec![row(0, &["a", "b"]), row(1, &["c", "d"])],
+        )
+        .unwrap();
+        grid.apply_patch(2, 2, 2, false, vec![row(1, &["x", "y"])])
             .unwrap();
         assert_eq!(grid.cell(0, 0).unwrap().text, "a");
         assert_eq!(grid.cell(0, 1).unwrap().text, "x");
@@ -258,11 +349,11 @@ mod tests {
     #[test]
     fn ignores_stale_patch() {
         let mut grid = TerminalGrid::new(1, 1);
-        grid.apply_patch(2, 1, 1, true, &[row(0, &["new"])])
+        grid.apply_patch(2, 1, 1, true, vec![row(0, &["new"])])
             .unwrap();
         assert!(
             !grid
-                .apply_patch(1, 1, 1, true, &[row(0, &["old"])])
+                .apply_patch(1, 1, 1, true, vec![row(0, &["old"])])
                 .unwrap()
         );
         assert_eq!(grid.cell(0, 0).unwrap().text, "new");
@@ -271,7 +362,7 @@ mod tests {
     #[test]
     fn exposes_a_renderable_row_without_losing_graphemes() {
         let mut grid = TerminalGrid::new(2, 1);
-        grid.apply_patch(1, 2, 1, true, &[row(0, &["🦀", "e\u{301}"])])
+        grid.apply_patch(1, 2, 1, true, vec![row(0, &["🦀", "e\u{301}"])])
             .unwrap();
         assert_eq!(grid.row_text(0).as_deref(), Some("🦀e\u{301}"));
         assert_eq!(grid.row_text(1), None);
@@ -280,9 +371,9 @@ mod tests {
     #[test]
     fn resize_clears_cells_missing_from_partial_patch() {
         let mut grid = TerminalGrid::new(2, 1);
-        grid.apply_patch(1, 2, 1, true, &[row(0, &["a", "b"])])
+        grid.apply_patch(1, 2, 1, true, vec![row(0, &["a", "b"])])
             .unwrap();
-        grid.apply_patch(2, 3, 2, false, &[row(1, &["x", "y", "z"])])
+        grid.apply_patch(2, 3, 2, false, vec![row(1, &["x", "y", "z"])])
             .unwrap();
         assert_eq!(grid.dimensions(), (3, 2));
         assert_eq!(grid.cell(0, 0).unwrap().text, "");
@@ -293,12 +384,12 @@ mod tests {
         let mut grid = TerminalGrid::new(2, 2);
         let before = grid.clone();
         assert_eq!(
-            grid.apply_patch(1, 2, 2, false, &[row(2, &["x", "y"])]),
+            grid.apply_patch(1, 2, 2, false, vec![row(2, &["x", "y"])]),
             Err(GridError::RowOutOfBounds { row: 2, rows: 2 })
         );
         assert_eq!(grid, before);
         assert!(matches!(
-            grid.apply_patch(1, 2, 2, true, &[row(0, &["x", "y"])]),
+            grid.apply_patch(1, 2, 2, true, vec![row(0, &["x", "y"])]),
             Err(GridError::MissingFullRow { row: 1 })
         ));
     }
@@ -307,7 +398,7 @@ mod tests {
     fn reducer_ignores_non_screen_messages() {
         let mut grid = TerminalGrid::new(1, 1);
         let changed = grid
-            .apply_server_message(&ServerMessage::Initialized {
+            .apply_server_message(ServerMessage::Initialized {
                 protocol_version: 2,
             })
             .unwrap();
@@ -325,7 +416,7 @@ mod tests {
             blinking: false,
             style: CursorStyle::Block,
         };
-        grid.apply_server_message(&ServerMessage::ScreenPatch {
+        grid.apply_server_message(ServerMessage::ScreenPatch {
             session_id: 1,
             revision: 1,
             cols: 1,
@@ -336,6 +427,55 @@ mod tests {
         })
         .unwrap();
         assert_eq!(grid.cursor(), Some(cursor));
+    }
+
+    #[test]
+    fn background_runs_merge_neighbours_and_skip_transparent_cells() {
+        let red = Rgb { r: 255, g: 0, b: 0 };
+        let blue = Rgb { r: 0, g: 0, b: 255 };
+        let mut cells = vec![cell("a"), cell("b"), cell("c"), cell("d"), cell("e")];
+        cells[0].background = Some(red);
+        cells[1].background = Some(red);
+        cells[3].background = Some(blue);
+        cells[4].background = Some(red);
+        let runs = background_runs(&cells).collect::<Vec<_>>();
+        assert_eq!(
+            runs,
+            vec![
+                BackgroundRun {
+                    start: 0,
+                    len: 2,
+                    color: red
+                },
+                BackgroundRun {
+                    start: 3,
+                    len: 1,
+                    color: blue
+                },
+                BackgroundRun {
+                    start: 4,
+                    len: 1,
+                    color: red
+                },
+            ]
+        );
+        assert_eq!(background_runs(&[]).count(), 0);
+    }
+
+    #[test]
+    fn cursor_shapes_stay_inside_their_cell() {
+        let block = cursor_shape(CursorStyle::Block, 9.0, 18.0);
+        assert_eq!(
+            (block.width, block.height, block.hollow),
+            (9.0, 18.0, false)
+        );
+        assert!(cursor_shape(CursorStyle::HollowBlock, 9.0, 18.0).hollow);
+        let underline = cursor_shape(CursorStyle::Underline, 9.0, 18.0);
+        assert_eq!((underline.y, underline.height), (16.0, 2.0));
+        let bar = cursor_shape(CursorStyle::Bar, 9.0, 18.0);
+        assert_eq!((bar.width, bar.height), (2.0, 18.0));
+        let tiny = cursor_shape(CursorStyle::Underline, 1.0, 1.0);
+        assert_eq!((tiny.y, tiny.height), (0.0, 1.0));
     }
 
     #[test]

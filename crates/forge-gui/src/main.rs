@@ -1,12 +1,17 @@
+mod grid_element;
+
 use anyhow::{Context as _, Result, bail};
 use forge_gui::{TerminalGrid, encode_terminal_key};
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, KeyDownEvent, Render, Timer, Window,
     WindowBounds, WindowHandle, WindowOptions, div, prelude::*, px, rgb, size,
 };
+use grid_element::{
+    CellMetrics, DEFAULT_FOREGROUND, TerminalGridElement, TerminalSurface, WINDOW_BACKGROUND,
+};
 use proto_ipc::{
-    ClientMessage, FrameKind, PROTOCOL_VERSION, Rgb, ScreenCell, ScreenRow, ServerMessage,
-    read_message, write_message,
+    ClientMessage, CursorStyle, FrameKind, PROTOCOL_VERSION, Rgb, ScreenCell, ScreenCursor,
+    ScreenRow, ServerMessage, read_message, write_message,
 };
 use serde::Serialize;
 use std::{
@@ -23,7 +28,7 @@ use std::{
 use tokio::{
     net::UnixStream,
     process::{Child, Command},
-    sync::mpsc as async_mpsc,
+    sync::{mpsc as async_mpsc, oneshot},
 };
 
 enum UiEvent {
@@ -36,12 +41,21 @@ enum IpcCommand {
     Resize { cols: u16, rows: u16 },
 }
 
+/// Resolves once the frame that first renders a state change has been handed
+/// to the GPU, so benchmarks measure update → present instead of the wait for
+/// the next compositor tick.
+struct FrameProbe {
+    started: Instant,
+    presented: oneshot::Sender<f64>,
+}
+
 struct ForgeWindow {
-    grid: TerminalGrid,
+    terminal: TerminalSurface,
     status: String,
     input: async_mpsc::UnboundedSender<IpcCommand>,
     focus: FocusHandle,
     render_count: Arc<AtomicU64>,
+    frame_probe: Option<FrameProbe>,
 }
 
 impl ForgeWindow {
@@ -49,6 +63,7 @@ impl ForgeWindow {
         events: Receiver<UiEvent>,
         input: async_mpsc::UnboundedSender<IpcCommand>,
         render_count: Arc<AtomicU64>,
+        metrics: CellMetrics,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.spawn(async move |this, cx| {
@@ -68,19 +83,21 @@ impl ForgeWindow {
         })
         .detach();
         Self {
-            grid: TerminalGrid::new(80, 24),
+            terminal: TerminalSurface::new(TerminalGrid::new(80, 24), metrics),
             status: "Conectando a forge-termd…".into(),
             input,
             focus: cx.focus_handle(),
             render_count,
+            frame_probe: None,
         }
     }
 
     fn handle_event(&mut self, event: UiEvent) {
         match event {
-            UiEvent::Message(message) => match self.grid.apply_server_message(&message) {
+            UiEvent::Message(message) => match self.terminal.grid.apply_server_message(message) {
                 Ok(true) => {
-                    self.status = format!("Sesión activa · revisión {}", self.grid.revision());
+                    self.status =
+                        format!("Sesión activa · revisión {}", self.terminal.grid.revision());
                 }
                 Ok(false) => {}
                 Err(error) => self.status = format!("Patch inválido: {error}"),
@@ -103,25 +120,24 @@ impl ForgeWindow {
 impl Render for ForgeWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.render_count.fetch_add(1, Ordering::Relaxed);
-        let (cols, rows) = self.grid.dimensions();
-        let cursor = self.grid.cursor();
-        let screen_rows = (0..rows)
-            .filter_map(|y| {
-                self.grid.row(y).map(|cells| {
-                    let cursor_x = cursor
-                        .filter(|cursor| cursor.visible && cursor.y == y)
-                        .map(|cursor| cursor.x);
-                    cell_runs(cells, cursor_x)
-                })
-            })
-            .collect::<Vec<_>>();
+        if let Some(probe) = self.frame_probe.take() {
+            // Deferred callbacks run when the outermost update finishes, which
+            // during a draw is right after GPUI presented this frame.
+            cx.defer(move |_| {
+                let _ = probe
+                    .presented
+                    .send(probe.started.elapsed().as_secs_f64() * 1_000.0);
+            });
+        }
+        let (cols, rows) = self.terminal.grid.dimensions();
         div()
             .id("forge-terminal")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|view, event, _, _| view.on_key_down(event)))
             .size_full()
-            .bg(rgb(0x11_13_18))
-            .text_color(rgb(0xd8_de_e9))
+            .overflow_hidden()
+            .bg(rgb(WINDOW_BACKGROUND))
+            .text_color(rgb(DEFAULT_FOREGROUND))
             .p_4()
             .font_family("monospace")
             .child(
@@ -130,67 +146,10 @@ impl Render for ForgeWindow {
                     .text_color(rgb(0x88_c0_d0))
                     .child(format!("Forge · {cols}×{rows} · {}", self.status)),
             )
-            .children(screen_rows.into_iter().map(|runs| {
-                div()
-                    .flex()
-                    .flex_row()
-                    .h(px(18.0))
-                    .children(runs.into_iter().map(|run| {
-                        div()
-                            .w(px(run.width))
-                            .h(px(18.0))
-                            .text_size(px(14.0))
-                            .when_some(run.foreground, |element, color| {
-                                element.text_color(rgb(rgb_value(color)))
-                            })
-                            .when_some(run.background, |element, color| {
-                                element.bg(rgb(rgb_value(color)))
-                            })
-                            .when(run.cursor, |element| {
-                                element.border_1().border_color(rgb(0xeb_cb_8b))
-                            })
-                            .child(run.text)
-                    }))
+            .child(TerminalGridElement::new(cx.entity(), |view: &mut Self| {
+                &mut view.terminal
             }))
     }
-}
-
-#[derive(Debug, PartialEq)]
-struct CellRun {
-    text: String,
-    width: f32,
-    foreground: Option<Rgb>,
-    background: Option<Rgb>,
-    cursor: bool,
-}
-
-fn cell_runs(cells: &[proto_ipc::ScreenCell], cursor_x: Option<u16>) -> Vec<CellRun> {
-    let mut runs: Vec<CellRun> = Vec::new();
-    for (x, cell) in cells.iter().enumerate() {
-        let cursor = cursor_x.is_some_and(|cursor_x| usize::from(cursor_x) == x);
-        let text = if cell.text.is_empty() {
-            " "
-        } else {
-            &cell.text
-        };
-        if let Some(run) = runs.last_mut()
-            && run.foreground == cell.foreground
-            && run.background == cell.background
-            && run.cursor == cursor
-        {
-            run.text.push_str(text);
-            run.width += 9.0;
-        } else {
-            runs.push(CellRun {
-                text: text.into(),
-                width: 9.0,
-                foreground: cell.foreground,
-                background: cell.background,
-                cursor,
-            });
-        }
-    }
-    runs
 }
 
 fn main() {
@@ -201,9 +160,15 @@ fn main() {
     let (event_tx, event_rx) = mpsc::channel();
     let (input_tx, input_rx) = async_mpsc::unbounded_channel();
     let render_count = Arc::new(AtomicU64::new(0));
+    // The grid benchmark needs every one of its 200×60 cells on screen.
+    let (metrics, window_size) = if grid_frames.is_some() {
+        (CellMetrics::BENCHMARK, size(px(1300.0), px(700.0)))
+    } else {
+        (CellMetrics::DEFAULT, size(px(960.0), px(600.0)))
+    };
 
     Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(960.0), px(600.0)), cx);
+        let bounds = Bounds::centered(None, window_size, cx);
         let window = cx
             .open_window(
                 WindowOptions {
@@ -214,11 +179,11 @@ fn main() {
                     let resize_tx = input_tx.clone();
                     let view = cx.new(|cx| {
                         cx.observe_window_bounds(window, move |_, window, _| {
-                            let (cols, rows) = grid_dimensions(window.bounds().size);
+                            let (cols, rows) = grid_dimensions(window.bounds().size, metrics);
                             let _ = resize_tx.send(IpcCommand::Resize { cols, rows });
                         })
                         .detach();
-                        ForgeWindow::new(event_rx, input_tx, Arc::clone(&render_count), cx)
+                        ForgeWindow::new(event_rx, input_tx, Arc::clone(&render_count), metrics, cx)
                     });
                     window.focus(&view.read(cx).focus);
                     view
@@ -235,6 +200,7 @@ fn main() {
                             samples_ms: None,
                             frames: 1,
                             pss_kib: process_pss_kib(),
+                            painted_cells: None,
                         });
                         cx.quit();
                     });
@@ -261,6 +227,7 @@ fn main() {
                     samples_ms: None,
                     frames: count.load(Ordering::Relaxed).saturating_sub(baseline),
                     pss_kib: process_pss_kib(),
+                    painted_cells: None,
                 });
                 let _ = cx.update(|cx| cx.quit());
             })
@@ -276,34 +243,50 @@ fn main() {
 fn spawn_grid_benchmark(iterations: usize, window: WindowHandle<ForgeWindow>, cx: &mut App) {
     cx.spawn(async move |cx| {
         Timer::after(Duration::from_secs(1)).await;
+        let Ok(view) = window.update(cx, |_, _, cx| cx.entity()) else {
+            return;
+        };
         let mut samples_ms = Vec::with_capacity(iterations);
         for revision in 1..=iterations {
-            let (presented_tx, presented_rx) = tokio::sync::oneshot::channel();
-            let started = Instant::now();
-            if window
-                .update(cx, |view, window, cx| {
-                    view.grid
-                        .apply_server_message(&synthetic_grid_patch(revision))
-                        .expect("synthetic grid patch");
-                    cx.notify();
-                    window.on_next_frame(move |_, _| {
-                        let _ = presented_tx.send(started.elapsed().as_secs_f64() * 1_000.0);
+            let (presented_tx, presented_rx) = oneshot::channel();
+            let view = view.clone();
+            // Apply the patch at the start of a frame tick so the sample covers
+            // state update → draw → present, not the wait for the compositor.
+            let scheduled = window.update(cx, |_, window, _| {
+                window.on_next_frame(move |_, cx| {
+                    let patch = synthetic_grid_patch(revision);
+                    let started = Instant::now();
+                    view.update(cx, |view, cx| {
+                        view.terminal
+                            .grid
+                            .apply_server_message(patch)
+                            .expect("synthetic grid patch");
+                        view.frame_probe = Some(FrameProbe {
+                            started,
+                            presented: presented_tx,
+                        });
+                        cx.notify();
                     });
-                })
-                .is_err()
-            {
+                });
+            });
+            if scheduled.is_err() {
                 break;
             }
             if let Ok(sample) = presented_rx.await {
                 samples_ms.push(sample);
             }
         }
+        let painted_cells = window
+            .update(cx, |view, _, _| view.terminal.painted_cells)
+            .ok()
+            .and_then(|cells| u64::try_from(cells).ok());
         emit_metrics(&GuiMetrics {
             scenario: "grid_full",
             elapsed_ms: samples_ms.last().copied().unwrap_or_default(),
             samples_ms: Some(samples_ms),
             frames: u64::try_from(iterations).unwrap_or(u64::MAX),
             pss_kib: process_pss_kib(),
+            painted_cells,
         });
         let _ = cx.update(|cx| cx.quit());
     })
@@ -477,14 +460,14 @@ fn ghostty_library() -> PathBuf {
     )
 }
 
-fn rgb_value(color: Rgb) -> u32 {
-    (u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b)
-}
+/// Vertical space taken by window padding and the status line above the grid.
+const CHROME_HEIGHT: f32 = 56.0;
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn grid_dimensions(size: gpui::Size<gpui::Pixels>) -> (u16, u16) {
-    let cols = ((size.width / px(9.0)).floor() as u16).clamp(1, 500);
-    let rows = (((size.height - px(56.0)) / px(18.0)).floor() as u16).clamp(1, 300);
+fn grid_dimensions(size: gpui::Size<gpui::Pixels>, metrics: CellMetrics) -> (u16, u16) {
+    let cols = ((size.width / px(metrics.width)).floor() as u16).clamp(1, 500);
+    let rows =
+        (((size.height - px(CHROME_HEIGHT)) / px(metrics.height)).floor() as u16).clamp(1, 300);
     (cols, rows)
 }
 
@@ -534,22 +517,29 @@ struct GuiMetrics {
     samples_ms: Option<Vec<f64>>,
     frames: u64,
     pss_kib: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    painted_cells: Option<u64>,
 }
 
+/// Full 200×60 frame where every cell changes glyph and colour each revision,
+/// so the renderer cannot reuse anything from the previous frame.
 fn synthetic_grid_patch(revision: usize) -> ServerMessage {
-    let marker = if revision.is_multiple_of(2) { "x" } else { "y" };
-    let cells = (0..200)
-        .map(|column| ScreenCell {
-            text: marker.into(),
+    const PRINTABLE_ASCII: usize = 94;
+    let cell = |x: usize, y: usize| {
+        let glyph = u8::try_from((x + y * 7 + revision * 13) % PRINTABLE_ASCII)
+            .expect("index below 94 fits a byte")
+            + b'!';
+        ScreenCell {
+            text: char::from(glyph).into(),
             foreground: Some(Rgb {
                 r: 0x88,
-                g: u8::try_from(column % 128).expect("bounded synthetic color") + 0x40,
+                g: u8::try_from((x + revision) % 128).expect("bounded synthetic color") + 0x40,
                 b: 0xd0,
             }),
             background: None,
             styled: true,
-        })
-        .collect::<Vec<_>>();
+        }
+    };
     ServerMessage::ScreenPatch {
         session_id: 0,
         revision: u64::try_from(revision).unwrap_or(u64::MAX),
@@ -559,10 +549,16 @@ fn synthetic_grid_patch(revision: usize) -> ServerMessage {
         dirty_rows: (0..60)
             .map(|y| ScreenRow {
                 y,
-                cells: cells.clone(),
+                cells: (0..200).map(|x| cell(x, usize::from(y))).collect(),
             })
             .collect(),
-        cursor: None,
+        cursor: Some(ScreenCursor {
+            x: u16::try_from(revision % 200).expect("column below 200"),
+            y: u16::try_from(revision % 60).expect("row below 60"),
+            visible: true,
+            blinking: false,
+            style: CursorStyle::Block,
+        }),
     }
 }
 
@@ -607,35 +603,19 @@ mod tests {
     }
 
     #[test]
-    fn converts_colors_and_window_size_for_renderer() {
+    fn derives_grid_dimensions_from_window_size_and_cell_metrics() {
         assert_eq!(
-            rgb_value(Rgb {
-                r: 0x12,
-                g: 0x34,
-                b: 0x56
-            }),
-            0x12_34_56
+            grid_dimensions(size(px(900.0), px(416.0)), CellMetrics::DEFAULT),
+            (100, 20)
         );
-        assert_eq!(grid_dimensions(size(px(900.0), px(416.0))), (100, 20));
-    }
-
-    #[test]
-    fn groups_adjacent_terminal_cells_into_render_runs() {
-        let plain = proto_ipc::ScreenCell {
-            text: "a".into(),
-            foreground: None,
-            background: None,
-            styled: false,
-        };
-        let mut colored = plain.clone();
-        colored.text = "b".into();
-        colored.foreground = Some(Rgb { r: 1, g: 2, b: 3 });
-        let runs = cell_runs(&[plain.clone(), plain, colored.clone(), colored], Some(1));
-        assert_eq!(runs.len(), 3, "cursor and style boundaries split runs");
-        assert_eq!(runs[0].text, "a");
-        assert!(runs[1].cursor);
-        assert_eq!(runs[2].foreground, Some(Rgb { r: 1, g: 2, b: 3 }));
-        assert_eq!(runs[2].text, "bb");
+        assert_eq!(
+            grid_dimensions(size(px(1300.0), px(700.0)), CellMetrics::BENCHMARK),
+            (216, 64)
+        );
+        assert_eq!(
+            grid_dimensions(size(px(1.0), px(1.0)), CellMetrics::DEFAULT),
+            (1, 1)
+        );
     }
 
     #[test]
@@ -654,5 +634,25 @@ mod tests {
         assert!(full);
         assert_eq!(dirty_rows.len(), 60);
         assert!(dirty_rows.iter().all(|row| row.cells.len() == 200));
+        assert!(
+            dirty_rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .all(|cell| cell.text.len() == 1 && cell.text.is_ascii() && cell.text != " ")
+        );
+        let ServerMessage::ScreenPatch {
+            dirty_rows: next, ..
+        } = synthetic_grid_patch(2)
+        else {
+            panic!("expected screen patch");
+        };
+        assert!(
+            dirty_rows.iter().zip(&next).all(|(a, b)| a
+                .cells
+                .iter()
+                .zip(&b.cells)
+                .all(|(a, b)| a != b)),
+            "every cell changes between revisions"
+        );
     }
 }
