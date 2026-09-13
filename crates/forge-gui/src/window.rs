@@ -249,6 +249,8 @@ impl ForgeWindow {
     pub fn notify_user(&mut self, level: NotificationLevel, text: impl Into<String>) {
         let text = text.into();
         eprintln!("forge: {text}");
+        // One line in the top bar; the full text went to stderr.
+        let text = single_line(&text, 160);
         self.notifications.push(Notification {
             text,
             level,
@@ -909,6 +911,9 @@ impl EntityInputHandler for ForgeWindow {
         }
     }
 
+    // Wayland sends an IME `done` without preedit on every focus change, so
+    // these only redraw when something visible actually changed: otherwise
+    // an idle window would render for nothing.
     fn replace_text_in_range(
         &mut self,
         _range: Option<Range<usize>>,
@@ -916,11 +921,12 @@ impl EntityInputHandler for ForgeWindow {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.marked_text = None;
+        let had_preedit = self.marked_text.take().is_some();
         if !text.is_empty() {
             self.send_input(text.as_bytes().to_vec(), cx);
+        } else if had_preedit {
+            cx.notify();
         }
-        cx.notify();
     }
 
     fn replace_and_mark_text_in_range(
@@ -931,8 +937,11 @@ impl EntityInputHandler for ForgeWindow {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.marked_text = (!new_text.is_empty()).then(|| new_text.to_string());
-        cx.notify();
+        let marked = (!new_text.is_empty()).then(|| new_text.to_string());
+        if self.marked_text != marked {
+            self.marked_text = marked;
+            cx.notify();
+        }
     }
 
     fn bounds_for_range(
@@ -994,6 +1003,15 @@ fn load_theme(factory: &WindowFactory) -> (ThemeColors, String) {
     }
 }
 
+/// Collapses whitespace and truncates for display in a single-line bar.
+fn single_line(text: &str, max_chars: usize) -> String {
+    let mut line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() > max_chars {
+        line = line.chars().take(max_chars - 1).collect::<String>() + "…";
+    }
+    line
+}
+
 /// Where the configured `cwd` for new tabs comes from at startup.
 pub fn initial_cwd(session_cwd: Option<&Path>) -> PathBuf {
     session_cwd
@@ -1001,4 +1019,16 @@ pub fn initial_cwd(session_cwd: Option<&Path>) -> PathBuf {
         .map(Path::to_path_buf)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notifications_collapse_to_one_line() {
+        assert_eq!(single_line("a\n  b\tc", 10), "a b c");
+        assert_eq!(single_line("abcdefghij", 5), "abcd…");
+        assert_eq!(single_line("", 5), "");
+    }
 }

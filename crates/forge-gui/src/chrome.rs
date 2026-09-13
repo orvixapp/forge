@@ -205,6 +205,7 @@ fn topbar_notice(view: &ForgeWindow) -> impl IntoElement {
             .text_color(color(tint))
             .max_w(px(420.0))
             .overflow_hidden()
+            .whitespace_nowrap()
             .child(note.text.clone());
     }
     let hint = view

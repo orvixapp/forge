@@ -281,6 +281,12 @@ mod unix {
                 Ok(stream) => return Ok((stream, Some(daemon))),
                 Err(_) if Instant::now() < deadline => {
                     if let Some(status) = daemon.0.try_wait().context("consultar forge-termd")? {
+                        // Several tabs may race to start the daemon; the
+                        // losers exit because the socket is taken, and the
+                        // winner is the one to connect to.
+                        if let Ok(stream) = UnixStream::connect(socket).await {
+                            return Ok((stream, None));
+                        }
                         bail!("forge-termd terminó durante el arranque: {status}");
                     }
                     tokio::time::sleep(Duration::from_millis(25)).await;

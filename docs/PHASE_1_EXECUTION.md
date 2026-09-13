@@ -106,6 +106,9 @@ Cada prueba anota compositor, sesión (Wayland/X11), escala, tamaño y commit.
 ## Deuda conocida que pasa a Fase 2
 
 - Windows: la GUI compila pero no hay daemon (ConPTY/named pipes: Fase 2).
+- El IME de Wayland envía `done` sin preedit en cada cambio de foco; el
+  manejador solo redibuja cuando cambia algo visible (verificado: `idle`
+  sigue en 0 frames con el input handler registrado).
 - Scrollback en la GUI: el protocolo no expone el viewport (Fase 2).
 - El daemon reporta el cursor como no visible en prompts de p10k (Fase 2).
 - `startup_empty` depende de GPUI (fuentes + Vulkan); revisar en R1 y
