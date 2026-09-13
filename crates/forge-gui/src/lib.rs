@@ -1,6 +1,6 @@
 //! Headless terminal-grid state consumed by the GPUI frontend.
 
-use proto_ipc::{ScreenCell, ScreenRow};
+use proto_ipc::{ScreenCell, ScreenRow, ServerMessage};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -100,6 +100,26 @@ impl TerminalGrid {
         )
     }
 
+    /// Applies a screen-bearing IPC message and ignores unrelated messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::apply_patch`].
+    pub fn apply_server_message(&mut self, message: &ServerMessage) -> Result<bool, GridError> {
+        let ServerMessage::ScreenPatch {
+            revision,
+            cols,
+            rows,
+            full,
+            dirty_rows,
+            ..
+        } = message
+        else {
+            return Ok(false);
+        };
+        self.apply_patch(*revision, *cols, *rows, *full, dirty_rows)
+    }
+
     fn resize(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
@@ -130,7 +150,8 @@ fn validate_rows(
     if full {
         for (row, exists) in present.into_iter().enumerate() {
             if !exists {
-                return Err(GridError::MissingFullRow { row: row as u16 });
+                let row = u16::try_from(row).expect("row index came from a u16 grid height");
+                return Err(GridError::MissingFullRow { row });
             }
         }
     }
@@ -144,6 +165,29 @@ fn blank_cell() -> ScreenCell {
         background: None,
         styled: false,
     }
+}
+
+/// Maps a platform-independent key description to terminal input bytes.
+#[must_use]
+pub fn encode_terminal_key(key: &str, key_char: Option<&str>, control: bool) -> Option<Vec<u8>> {
+    if control {
+        let byte = key.as_bytes().first()?.to_ascii_lowercase();
+        if byte.is_ascii_lowercase() {
+            return Some(vec![byte - b'a' + 1]);
+        }
+    }
+    let sequence: &[u8] = match key {
+        "enter" => b"\r",
+        "backspace" => b"\x7f",
+        "tab" => b"\t",
+        "escape" => b"\x1b",
+        "up" => b"\x1b[A",
+        "down" => b"\x1b[B",
+        "right" => b"\x1b[C",
+        "left" => b"\x1b[D",
+        _ => return key_char.map(|value| value.as_bytes().to_vec()),
+    };
+    Some(sequence.to_vec())
 }
 
 #[cfg(test)]
@@ -235,5 +279,25 @@ mod tests {
             grid.apply_patch(1, 2, 2, true, &[row(0, &["x", "y"])]),
             Err(GridError::MissingFullRow { row: 1 })
         ));
+    }
+
+    #[test]
+    fn reducer_ignores_non_screen_messages() {
+        let mut grid = TerminalGrid::new(1, 1);
+        let changed = grid
+            .apply_server_message(&ServerMessage::Initialized {
+                protocol_version: 2,
+            })
+            .unwrap();
+        assert!(!changed);
+        assert_eq!(grid.revision(), 0);
+    }
+
+    #[test]
+    fn encodes_text_navigation_and_control_keys() {
+        assert_eq!(encode_terminal_key("x", Some("ñ"), false), Some("ñ".as_bytes().to_vec()));
+        assert_eq!(encode_terminal_key("enter", None, false), Some(vec![b'\r']));
+        assert_eq!(encode_terminal_key("up", None, false), Some(b"\x1b[A".to_vec()));
+        assert_eq!(encode_terminal_key("c", None, true), Some(vec![3]));
     }
 }
