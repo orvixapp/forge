@@ -1,5 +1,5 @@
 [package]
-name = "proto-bench"
+name = "forge-bench"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,7 +10,7 @@ proto-ipc = { path = "../proto-ipc" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true
-

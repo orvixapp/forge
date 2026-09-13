@@ -5,12 +5,17 @@ use gpui::{
     WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
 use proto_ipc::{
-    ClientMessage, FrameKind, PROTOCOL_VERSION, ServerMessage, read_message, write_message,
+    ClientMessage, FrameKind, PROTOCOL_VERSION, Rgb, ServerMessage, read_message, write_message,
 };
+use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -25,17 +30,24 @@ enum UiEvent {
     Status(String),
 }
 
+enum IpcCommand {
+    Input(Vec<u8>),
+    Resize { cols: u16, rows: u16 },
+}
+
 struct ForgeWindow {
     grid: TerminalGrid,
     status: String,
-    input: async_mpsc::UnboundedSender<Vec<u8>>,
+    input: async_mpsc::UnboundedSender<IpcCommand>,
     focus: FocusHandle,
+    render_count: Arc<AtomicU64>,
 }
 
 impl ForgeWindow {
     fn new(
         events: Receiver<UiEvent>,
-        input: async_mpsc::UnboundedSender<Vec<u8>>,
+        input: async_mpsc::UnboundedSender<IpcCommand>,
+        render_count: Arc<AtomicU64>,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.spawn(async move |this, cx| {
@@ -59,6 +71,7 @@ impl ForgeWindow {
             status: "Conectando a forge-termd…".into(),
             input,
             focus: cx.focus_handle(),
+            render_count,
         }
     }
 
@@ -81,15 +94,26 @@ impl ForgeWindow {
             event.keystroke.key_char.as_deref(),
             event.keystroke.modifiers.control,
         ) {
-            let _ = self.input.send(bytes);
+            let _ = self.input.send(IpcCommand::Input(bytes));
         }
     }
 }
 
 impl Render for ForgeWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_count.fetch_add(1, Ordering::Relaxed);
         let (cols, rows) = self.grid.dimensions();
-        let lines = (0..rows).filter_map(|y| self.grid.row_text(y));
+        let cursor = self.grid.cursor();
+        let screen_rows = (0..rows)
+            .filter_map(|y| {
+                self.grid.row(y).map(|cells| {
+                    let cursor_x = cursor
+                        .filter(|cursor| cursor.visible && cursor.y == y)
+                        .map(|cursor| cursor.x);
+                    cell_runs(cells, cursor_x)
+                })
+            })
+            .collect::<Vec<_>>();
         div()
             .id("forge-terminal")
             .track_focus(&self.focus)
@@ -105,30 +129,139 @@ impl Render for ForgeWindow {
                     .text_color(rgb(0x88_c0_d0))
                     .child(format!("Forge · {cols}×{rows} · {}", self.status)),
             )
-            .children(lines.map(|line| div().h(px(18.0)).text_size(px(14.0)).child(line)))
+            .children(screen_rows.into_iter().map(|runs| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .h(px(18.0))
+                    .children(runs.into_iter().map(|run| {
+                        div()
+                            .w(px(run.width))
+                            .h(px(18.0))
+                            .text_size(px(14.0))
+                            .when_some(run.foreground, |element, color| {
+                                element.text_color(rgb(rgb_value(color)))
+                            })
+                            .when_some(run.background, |element, color| {
+                                element.bg(rgb(rgb_value(color)))
+                            })
+                            .when(run.cursor, |element| {
+                                element.border_1().border_color(rgb(0xeb_cb_8b))
+                            })
+                            .child(run.text)
+                    }))
+            }))
     }
 }
 
+#[derive(Debug, PartialEq)]
+struct CellRun {
+    text: String,
+    width: f32,
+    foreground: Option<Rgb>,
+    background: Option<Rgb>,
+    cursor: bool,
+}
+
+fn cell_runs(cells: &[proto_ipc::ScreenCell], cursor_x: Option<u16>) -> Vec<CellRun> {
+    let mut runs: Vec<CellRun> = Vec::new();
+    for (x, cell) in cells.iter().enumerate() {
+        let cursor = cursor_x.is_some_and(|cursor_x| usize::from(cursor_x) == x);
+        let text = if cell.text.is_empty() {
+            " "
+        } else {
+            &cell.text
+        };
+        if let Some(run) = runs.last_mut()
+            && run.foreground == cell.foreground
+            && run.background == cell.background
+            && run.cursor == cursor
+        {
+            run.text.push_str(text);
+            run.width += 9.0;
+        } else {
+            runs.push(CellRun {
+                text: text.into(),
+                width: 9.0,
+                foreground: cell.foreground,
+                background: cell.background,
+                cursor,
+            });
+        }
+    }
+    runs
+}
+
 fn main() {
-    let socket = socket_arg();
+    let options = run_options();
+    let started = Instant::now();
+    let socket = options.socket;
     let (event_tx, event_rx) = mpsc::channel();
     let (input_tx, input_rx) = async_mpsc::unbounded_channel();
-    spawn_ipc_worker(socket, event_tx, input_rx);
+    let render_count = Arc::new(AtomicU64::new(0));
 
-    Application::new().run(|cx: &mut App| {
+    Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(960.0), px(600.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |window, cx| {
-                let view = cx.new(|cx| ForgeWindow::new(event_rx, input_tx, cx));
-                window.focus(&view.read(cx).focus);
-                view
-            },
-        )
-        .expect("open Forge window");
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let resize_tx = input_tx.clone();
+                    let view = cx.new(|cx| {
+                        cx.observe_window_bounds(window, move |_, window, _| {
+                            let (cols, rows) = grid_dimensions(window.bounds().size);
+                            let _ = resize_tx.send(IpcCommand::Resize { cols, rows });
+                        })
+                        .detach();
+                        ForgeWindow::new(event_rx, input_tx, Arc::clone(&render_count), cx)
+                    });
+                    window.focus(&view.read(cx).focus);
+                    view
+                },
+            )
+            .expect("open Forge window");
+        if options.exit_after_first_frame {
+            window
+                .update(cx, |_, window, _| {
+                    window.on_next_frame(move |_, cx| {
+                        emit_metrics(&GuiMetrics {
+                            scenario: "startup_empty",
+                            elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                            frames: 1,
+                            pss_kib: process_pss_kib(),
+                        });
+                        cx.quit();
+                    });
+                })
+                .expect("schedule startup measurement");
+        } else if options.benchmark_idle_ms.is_none() {
+            window
+                .update(cx, |_, window, _| {
+                    window.on_next_frame(move |_, _| {
+                        spawn_ipc_worker(socket, event_tx, input_rx);
+                    });
+                })
+                .expect("schedule terminal startup");
+        }
+        if let Some(idle_ms) = options.benchmark_idle_ms {
+            let count = Arc::clone(&render_count);
+            cx.spawn(async move |cx| {
+                Timer::after(Duration::from_secs(1)).await;
+                let baseline = count.load(Ordering::Relaxed);
+                Timer::after(Duration::from_millis(idle_ms)).await;
+                emit_metrics(&GuiMetrics {
+                    scenario: "idle",
+                    elapsed_ms: Duration::from_millis(idle_ms).as_secs_f64() * 1_000.0,
+                    frames: count.load(Ordering::Relaxed).saturating_sub(baseline),
+                    pss_kib: process_pss_kib(),
+                });
+                let _ = cx.update(|cx| cx.quit());
+            })
+            .detach();
+        }
         cx.activate(true);
     });
 }
@@ -136,7 +269,7 @@ fn main() {
 fn spawn_ipc_worker(
     socket: PathBuf,
     events: Sender<UiEvent>,
-    input: async_mpsc::UnboundedReceiver<Vec<u8>>,
+    input: async_mpsc::UnboundedReceiver<IpcCommand>,
 ) {
     thread::Builder::new()
         .name("forge-gui-ipc".into())
@@ -156,7 +289,7 @@ fn spawn_ipc_worker(
 async fn run_ipc(
     socket: PathBuf,
     events: Sender<UiEvent>,
-    mut input: async_mpsc::UnboundedReceiver<Vec<u8>>,
+    mut input: async_mpsc::UnboundedReceiver<IpcCommand>,
 ) -> Result<()> {
     let (stream, _daemon) = connect_or_start_daemon(&socket).await?;
     let (mut reader, mut writer) = stream.into_split();
@@ -202,9 +335,14 @@ async fn run_ipc(
     loop {
         tokio::select! {
             data = input.recv() => {
-                let Some(data) = data else { return Ok(()); };
-                write_message(&mut writer, FrameKind::Notification,
-                    &ClientMessage::Input { session_id, data }).await?;
+                let Some(command) = data else { return Ok(()); };
+                let message = match command {
+                    IpcCommand::Input(data) => ClientMessage::Input { session_id, data },
+                    IpcCommand::Resize { cols, rows } => ClientMessage::Resize {
+                        session_id, cols, rows,
+                    },
+                };
+                write_message(&mut writer, FrameKind::Notification, &message).await?;
             }
             message = read_message::<_, ServerMessage>(&mut reader) => {
                 let message = message?.1;
@@ -295,17 +433,72 @@ fn ghostty_library() -> PathBuf {
     )
 }
 
-fn socket_arg() -> PathBuf {
+fn rgb_value(color: Rgb) -> u32 {
+    (u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn grid_dimensions(size: gpui::Size<gpui::Pixels>) -> (u16, u16) {
+    let cols = ((size.width / px(9.0)).floor() as u16).clamp(1, 500);
+    let rows = (((size.height - px(56.0)) / px(18.0)).floor() as u16).clamp(1, 300);
+    (cols, rows)
+}
+
+struct RunOptions {
+    socket: PathBuf,
+    exit_after_first_frame: bool,
+    benchmark_idle_ms: Option<u64>,
+}
+
+fn run_options() -> RunOptions {
     let mut args = std::env::args().skip(1);
     let mut socket = PathBuf::from("/tmp/forge-prototype.sock");
+    let mut exit_after_first_frame = false;
+    let mut benchmark_idle_ms = None;
     while let Some(arg) = args.next() {
-        if arg == "--socket"
-            && let Some(path) = args.next()
-        {
-            socket = path.into();
+        match arg.as_str() {
+            "--socket" => {
+                if let Some(path) = args.next() {
+                    socket = path.into();
+                }
+            }
+            "--exit-after-first-frame" => exit_after_first_frame = true,
+            "--benchmark-idle-ms" => {
+                benchmark_idle_ms = args.next().and_then(|value| value.parse().ok());
+            }
+            _ => {}
         }
     }
-    socket
+    RunOptions {
+        socket,
+        exit_after_first_frame,
+        benchmark_idle_ms,
+    }
+}
+
+#[derive(Serialize)]
+struct GuiMetrics {
+    scenario: &'static str,
+    elapsed_ms: f64,
+    frames: u64,
+    pss_kib: Option<u64>,
+}
+
+fn emit_metrics(metrics: &GuiMetrics) {
+    if let Ok(json) = serde_json::to_string(metrics) {
+        println!("{json}");
+    }
+}
+
+fn process_pss_kib() -> Option<u64> {
+    let contents = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+    contents.lines().find_map(|line| {
+        line.strip_prefix("Pss:")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    })
 }
 
 #[cfg(test)]
@@ -329,5 +522,36 @@ mod tests {
             PathBuf::from("/tmp/forge-prototype.sock").extension(),
             Some("sock".as_ref())
         );
+    }
+
+    #[test]
+    fn converts_colors_and_window_size_for_renderer() {
+        assert_eq!(
+            rgb_value(Rgb {
+                r: 0x12,
+                g: 0x34,
+                b: 0x56
+            }),
+            0x12_34_56
+        );
+        assert_eq!(grid_dimensions(size(px(900.0), px(416.0))), (100, 20));
+    }
+
+    #[test]
+    fn groups_adjacent_terminal_cells_into_render_runs() {
+        let plain = proto_ipc::ScreenCell {
+            text: "a".into(),
+            foreground: None,
+            background: None,
+            styled: false,
+        };
+        let mut colored = plain.clone();
+        colored.text = "b".into();
+        colored.foreground = Some(Rgb { r: 1, g: 2, b: 3 });
+        let runs = cell_runs(&[plain.clone(), plain, colored.clone(), colored], Some(1));
+        assert_eq!(runs.len(), 4, "cursor and style boundaries split runs");
+        assert_eq!(runs[0].text, "a");
+        assert!(runs[1].cursor);
+        assert_eq!(runs[2].foreground, Some(Rgb { r: 1, g: 2, b: 3 }));
     }
 }

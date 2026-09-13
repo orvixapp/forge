@@ -1,0 +1,10 @@
+[startup_empty]
+p95_ms = 100.0
+max_pss_kib = 81920
+
+[idle]
+duration_ms = 60000
+max_frames = 0
+
+[ipc_round_trip]
+p95_ms = 1.0

@@ -60,7 +60,7 @@ async fn command_output_crosses_the_daemon_boundary() {
             command: "/bin/sh".into(),
             args: vec![
                 "-lc".into(),
-                "printf '\\033[31mforge-terminal-ok\\033[0m'".into(),
+                "printf '\\033[31mforge-terminal-ok\\033[0m'; sleep 0.2".into(),
             ],
             cols: 80,
             rows: 24,
@@ -83,8 +83,19 @@ async fn command_output_crosses_the_daemon_boundary() {
     )
     .await
     .unwrap();
+    write_message(
+        &mut writer,
+        FrameKind::Notification,
+        &ClientMessage::Resize {
+            session_id,
+            cols: 100,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
 
-    let (output, screen, screen_meta, colored) =
+    let (output, screen, screen_meta, colored, cursor_seen) =
         timeout(Duration::from_secs(5), collect_output(&mut reader))
             .await
             .expect("terminal command timed out");
@@ -93,19 +104,21 @@ async fn command_output_crosses_the_daemon_boundary() {
     assert_eq!(screen, "forge-terminal-ok");
     let (revision, cols, rows) = screen_meta.expect("Ghostty render frame");
     assert!(revision > 0);
-    assert_eq!((cols, rows), (80, 24));
+    assert_eq!((cols, rows), (100, 30));
     assert!(colored, "ANSI foreground color was not resolved by Ghostty");
+    assert!(cursor_seen, "Ghostty cursor state did not cross IPC");
     daemon.kill().await.expect("stop daemon");
     let _ = std::fs::remove_file(socket);
 }
 
 async fn collect_output(
     reader: &mut OwnedReadHalf,
-) -> (Vec<u8>, String, Option<(u64, u16, u16)>, bool) {
+) -> (Vec<u8>, String, Option<(u64, u16, u16)>, bool, bool) {
     let mut output = Vec::new();
     let mut screen = String::new();
     let mut screen_meta = None;
     let mut colored = false;
+    let mut cursor_seen = false;
     loop {
         match read_message::<_, ServerMessage>(reader).await.unwrap().1 {
             ServerMessage::Attached { backlog, .. } => output.extend(backlog),
@@ -115,8 +128,10 @@ async fn collect_output(
                 cols,
                 rows,
                 dirty_rows,
+                cursor,
                 ..
             } => {
+                cursor_seen |= cursor.is_some_and(|cursor| cursor.visible);
                 colored |= dirty_rows
                     .iter()
                     .flat_map(|row| &row.cells)
@@ -130,7 +145,7 @@ async fn collect_output(
             }
             ServerMessage::Exited { exit_code, .. } => {
                 assert_eq!(exit_code, Some(0));
-                return (output, screen, screen_meta, colored);
+                return (output, screen, screen_meta, colored, cursor_seen);
             }
             ServerMessage::Error { message } => panic!("daemon error: {message}"),
             _ => {}
