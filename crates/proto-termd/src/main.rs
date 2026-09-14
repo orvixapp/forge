@@ -8,10 +8,14 @@ fn main() {
 mod unix {
     use anyhow::{Context, Result, bail};
     use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-    use proto_ghostty_vt::{DirtyState, GhosttyLibrary, GhosttyTerminal};
+    use proto_ghostty_vt::{
+        DirtyState, GhosttyLibrary, GhosttyTerminal, KeyEncoder, KeyInput, MouseEncoder,
+        MouseInput, RenderSnapshot, ScrollViewport, SessionState,
+    };
     use proto_ipc::{
-        ClientMessage, CursorStyle, FrameKind, PROTOCOL_VERSION, Rgb, ScreenCell, ScreenCursor,
-        ScreenRow, ServerMessage, read_message, write_message,
+        ClientMessage, CursorStyle, FrameKind, KeyAction, KeyEvent, KeyMods, MouseAction,
+        MouseButton, MouseEvent, PROTOCOL_VERSION, Rgb, ScreenCell, ScreenCursor, ScreenRow,
+        ScrollRequest, ServerMessage, TerminalKey, Viewport, read_message, write_message,
     };
     use std::{
         collections::{HashMap, VecDeque},
@@ -40,7 +44,9 @@ mod unix {
             full: bool,
             dirty_rows: Vec<ScreenRow>,
             cursor: Option<ScreenCursor>,
+            viewport: Viewport,
         },
+        Info(SessionState),
         Exited(Option<u32>),
     }
 
@@ -50,11 +56,17 @@ mod unix {
         child: Mutex<Box<dyn Child + Send + Sync>>,
         backlog: Mutex<VecDeque<u8>>,
         terminal: Mutex<GhosttyTerminal>,
+        key_encoder: Mutex<KeyEncoder>,
+        mouse_encoder: Mutex<MouseEncoder>,
         cols: std::sync::atomic::AtomicU16,
         rows: std::sync::atomic::AtomicU16,
         revision: std::sync::atomic::AtomicU64,
         exit_code: Mutex<Option<u32>>,
         events: broadcast::Sender<SessionEvent>,
+        /// What the clients last saw, so cursor moves and viewport changes
+        /// without dirty rows still produce a patch.
+        last_frame: Mutex<(Option<ScreenCursor>, Viewport)>,
+        last_state: Mutex<SessionState>,
     }
 
     impl Session {
@@ -107,15 +119,39 @@ mod unix {
         }
 
         fn emit_screen(&self) -> Result<()> {
-            let frame = self
-                .terminal
-                .lock()
-                .expect("terminal mutex poisoned")
-                .render_snapshot()
-                .context("update Ghostty render state")?;
-            if frame.dirty == DirtyState::Clean {
-                return Ok(());
+            let (frame, viewport, state) = {
+                let mut terminal = self.terminal.lock().expect("terminal mutex poisoned");
+                let frame = terminal
+                    .render_snapshot()
+                    .context("update Ghostty render state")?;
+                let viewport = viewport_of(&terminal)?;
+                let state = terminal.session_state().context("read session state")?;
+                (frame, viewport, state)
+            };
+            let cursor = frame.cursor.map(convert_cursor);
+            let changed = {
+                let mut last = self.last_frame.lock().expect("last frame mutex poisoned");
+                let changed = frame.dirty != DirtyState::Clean || *last != (cursor, viewport);
+                *last = (cursor, viewport);
+                changed
+            };
+            if changed {
+                self.publish_frame(frame, cursor, viewport);
             }
+            let mut last_state = self.last_state.lock().expect("state mutex poisoned");
+            if *last_state != state {
+                *last_state = state.clone();
+                let _ = self.events.send(SessionEvent::Info(state));
+            }
+            Ok(())
+        }
+
+        fn publish_frame(
+            &self,
+            frame: RenderSnapshot,
+            cursor: Option<ScreenCursor>,
+            viewport: Viewport,
+        ) {
             let revision = self
                 .revision
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -125,45 +161,360 @@ mod unix {
                 cols: frame.cols,
                 rows: frame.rows,
                 full: frame.dirty == DirtyState::Full,
-                dirty_rows: frame
-                    .dirty_rows
-                    .into_iter()
-                    .map(|row| ScreenRow {
-                        y: row.y,
-                        cells: row
-                            .cells
-                            .into_iter()
-                            .map(|cell| ScreenCell {
-                                text: cell.text,
-                                foreground: cell.foreground.map(|color| Rgb {
-                                    r: color.r,
-                                    g: color.g,
-                                    b: color.b,
-                                }),
-                                background: cell.background.map(|color| Rgb {
-                                    r: color.r,
-                                    g: color.g,
-                                    b: color.b,
-                                }),
-                                styled: cell.styled,
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-                cursor: frame.cursor.map(|cursor| ScreenCursor {
-                    x: cursor.x,
-                    y: cursor.y,
-                    visible: cursor.visible,
-                    blinking: cursor.blinking,
-                    style: match cursor.style {
-                        proto_ghostty_vt::CursorStyle::Bar => CursorStyle::Bar,
-                        proto_ghostty_vt::CursorStyle::Block => CursorStyle::Block,
-                        proto_ghostty_vt::CursorStyle::Underline => CursorStyle::Underline,
-                        proto_ghostty_vt::CursorStyle::HollowBlock => CursorStyle::HollowBlock,
-                    },
-                }),
+                dirty_rows: frame.dirty_rows.into_iter().map(convert_row).collect(),
+                cursor,
+                viewport,
             });
+        }
+
+        /// Everything a client that attaches mid-session needs to draw.
+        fn full_frame(&self) -> Result<(SessionEvent, SessionState)> {
+            let mut terminal = self.terminal.lock().expect("terminal mutex poisoned");
+            let frame = terminal.full_snapshot().context("read full frame")?;
+            let viewport = viewport_of(&terminal)?;
+            let state = terminal.session_state().context("read session state")?;
+            let cursor = frame.cursor.map(convert_cursor);
+            *self.last_frame.lock().expect("last frame mutex poisoned") = (cursor, viewport);
+            let revision = self
+                .revision
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            Ok((
+                SessionEvent::ScreenPatch {
+                    revision,
+                    cols: frame.cols,
+                    rows: frame.rows,
+                    full: true,
+                    dirty_rows: frame.dirty_rows.into_iter().map(convert_row).collect(),
+                    cursor,
+                    viewport,
+                },
+                state,
+            ))
+        }
+
+        /// Encodes a key with the terminal's current modes and writes it to
+        /// the PTY. Typing while scrolled back jumps to the live screen.
+        fn key(&self, event: &KeyEvent) -> Result<()> {
+            let bytes = {
+                let mut terminal = self.terminal.lock().expect("terminal mutex poisoned");
+                let bytes = self
+                    .key_encoder
+                    .lock()
+                    .expect("key encoder mutex poisoned")
+                    .encode(&terminal, &key_input(event))
+                    .context("encode key")?;
+                if event.action != KeyAction::Release && !bytes.is_empty() {
+                    terminal.scroll_viewport(ScrollViewport::Bottom);
+                }
+                bytes
+            };
+            if !bytes.is_empty() {
+                self.input.send(bytes).context("PTY input queue closed")?;
+                self.emit_screen()?;
+            }
             Ok(())
+        }
+
+        fn mouse(&self, event: MouseEvent) -> Result<()> {
+            let bytes = {
+                let terminal = self.terminal.lock().expect("terminal mutex poisoned");
+                let cols = self.cols.load(std::sync::atomic::Ordering::Relaxed);
+                let rows = self.rows.load(std::sync::atomic::Ordering::Relaxed);
+                self.mouse_encoder
+                    .lock()
+                    .expect("mouse encoder mutex poisoned")
+                    .encode(&terminal, cols, rows, mouse_input(event))
+                    .context("encode mouse event")?
+            };
+            if !bytes.is_empty() {
+                self.input.send(bytes).context("PTY input queue closed")?;
+            }
+            Ok(())
+        }
+
+        fn paste(&self, text: &str) -> Result<()> {
+            let bytes = {
+                let mut terminal = self.terminal.lock().expect("terminal mutex poisoned");
+                terminal.scroll_viewport(ScrollViewport::Bottom);
+                terminal.encode_paste(text).context("encode paste")?
+            };
+            self.input.send(bytes).context("PTY input queue closed")?;
+            self.emit_screen()
+        }
+
+        fn scroll(&self, scroll: ScrollRequest) -> Result<()> {
+            self.terminal
+                .lock()
+                .expect("terminal mutex poisoned")
+                .scroll_viewport(match scroll {
+                    ScrollRequest::Top => ScrollViewport::Top,
+                    ScrollRequest::Bottom => ScrollViewport::Bottom,
+                    ScrollRequest::Delta(delta) => ScrollViewport::Delta(delta),
+                    ScrollRequest::Row(row) => ScrollViewport::Row(row),
+                });
+            self.emit_screen()
+        }
+    }
+
+    fn viewport_of(terminal: &GhosttyTerminal) -> Result<Viewport> {
+        let scrollbar = terminal.scrollbar().context("read scrollbar")?;
+        Ok(Viewport {
+            total: scrollbar.total,
+            offset: scrollbar.offset,
+            len: scrollbar.len,
+        })
+    }
+
+    fn convert_cursor(cursor: proto_ghostty_vt::RenderCursor) -> ScreenCursor {
+        ScreenCursor {
+            x: cursor.x,
+            y: cursor.y,
+            visible: cursor.visible,
+            blinking: cursor.blinking,
+            style: match cursor.style {
+                proto_ghostty_vt::CursorStyle::Bar => CursorStyle::Bar,
+                proto_ghostty_vt::CursorStyle::Block => CursorStyle::Block,
+                proto_ghostty_vt::CursorStyle::Underline => CursorStyle::Underline,
+                proto_ghostty_vt::CursorStyle::HollowBlock => CursorStyle::HollowBlock,
+            },
+        }
+    }
+
+    fn convert_row(row: proto_ghostty_vt::RenderRow) -> ScreenRow {
+        ScreenRow {
+            y: row.y,
+            cells: row
+                .cells
+                .into_iter()
+                .map(|cell| ScreenCell {
+                    text: cell.text,
+                    foreground: cell.foreground.map(|color| Rgb {
+                        r: color.r,
+                        g: color.g,
+                        b: color.b,
+                    }),
+                    background: cell.background.map(|color| Rgb {
+                        r: color.r,
+                        g: color.g,
+                        b: color.b,
+                    }),
+                    styled: cell.styled,
+                })
+                .collect(),
+        }
+    }
+
+    fn session_info(session_id: u64, state: &SessionState) -> ServerMessage {
+        ServerMessage::SessionInfo {
+            session_id,
+            title: state.title.clone(),
+            pwd: decode_pwd(&state.pwd),
+            mouse_tracking: state.mouse_tracking,
+            alternate_screen: state.alternate_screen,
+        }
+    }
+
+    /// OSC 7 carries a `file://host/path` URI; OSC 9/1337 a bare path.
+    fn decode_pwd(raw: &str) -> Option<String> {
+        if raw.is_empty() {
+            return None;
+        }
+        let path = raw.strip_prefix("file://").map_or(raw, |rest| {
+            rest.find('/').map_or("", |slash| &rest[slash..])
+        });
+        (!path.is_empty()).then(|| percent_decode(path))
+    }
+
+    fn percent_decode(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%'
+                && index + 2 < bytes.len()
+                && let Ok(value) = u8::from_str_radix(&text[index + 1..index + 3], 16)
+            {
+                out.push(value);
+                index += 3;
+            } else {
+                out.push(bytes[index]);
+                index += 1;
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn mods_bits(mods: KeyMods) -> u16 {
+        u16::from(mods.shift)
+            | (u16::from(mods.control) << 1)
+            | (u16::from(mods.alt) << 2)
+            | (u16::from(mods.super_key) << 3)
+    }
+
+    fn key_input(event: &KeyEvent) -> KeyInput {
+        KeyInput {
+            action: match event.action {
+                KeyAction::Release => 0,
+                KeyAction::Press => 1,
+                KeyAction::Repeat => 2,
+            },
+            key: ghostty_key(event.key),
+            mods: mods_bits(event.mods),
+            text: event.text.clone(),
+            unshifted_codepoint: event.unshifted_codepoint,
+        }
+    }
+
+    fn mouse_input(event: MouseEvent) -> MouseInput {
+        MouseInput {
+            action: match event.action {
+                MouseAction::Press => 0,
+                MouseAction::Release => 1,
+                MouseAction::Motion => 2,
+            },
+            button: event.button.map(|button| match button {
+                MouseButton::Left => 1,
+                MouseButton::Right => 2,
+                MouseButton::Middle => 3,
+                MouseButton::WheelUp => 4,
+                MouseButton::WheelDown => 5,
+                MouseButton::WheelLeft => 6,
+                MouseButton::WheelRight => 7,
+                MouseButton::Back => 8,
+                MouseButton::Forward => 9,
+            }),
+            mods: mods_bits(event.mods),
+            col: event.col,
+            row: event.row,
+        }
+    }
+
+    /// `GHOSTTY_KEY_*` codes from `include/ghostty/vt/key/event.h` of the
+    /// pinned commit; the enum is dense so the discriminant is the index.
+    #[allow(clippy::too_many_lines)]
+    fn ghostty_key(key: TerminalKey) -> i32 {
+        use TerminalKey as K;
+        match key {
+            K::Unidentified => 0,
+            K::Backquote => 1,
+            K::Backslash => 2,
+            K::BracketLeft => 3,
+            K::BracketRight => 4,
+            K::Comma => 5,
+            K::Digit0 => 6,
+            K::Digit1 => 7,
+            K::Digit2 => 8,
+            K::Digit3 => 9,
+            K::Digit4 => 10,
+            K::Digit5 => 11,
+            K::Digit6 => 12,
+            K::Digit7 => 13,
+            K::Digit8 => 14,
+            K::Digit9 => 15,
+            K::Equal => 16,
+            K::IntlBackslash => 17,
+            K::A => 20,
+            K::B => 21,
+            K::C => 22,
+            K::D => 23,
+            K::E => 24,
+            K::F => 25,
+            K::G => 26,
+            K::H => 27,
+            K::I => 28,
+            K::J => 29,
+            K::K => 30,
+            K::L => 31,
+            K::M => 32,
+            K::N => 33,
+            K::O => 34,
+            K::P => 35,
+            K::Q => 36,
+            K::R => 37,
+            K::S => 38,
+            K::T => 39,
+            K::U => 40,
+            K::V => 41,
+            K::W => 42,
+            K::X => 43,
+            K::Y => 44,
+            K::Z => 45,
+            K::Minus => 46,
+            K::Period => 47,
+            K::Quote => 48,
+            K::Semicolon => 49,
+            K::Slash => 50,
+            K::AltLeft => 51,
+            K::AltRight => 52,
+            K::Backspace => 53,
+            K::CapsLock => 54,
+            K::ContextMenu => 55,
+            K::ControlLeft => 56,
+            K::ControlRight => 57,
+            K::Enter => 58,
+            K::MetaLeft => 59,
+            K::MetaRight => 60,
+            K::ShiftLeft => 61,
+            K::ShiftRight => 62,
+            K::Space => 63,
+            K::Tab => 64,
+            K::Delete => 68,
+            K::End => 69,
+            K::Home => 71,
+            K::Insert => 72,
+            K::PageDown => 73,
+            K::PageUp => 74,
+            K::ArrowDown => 75,
+            K::ArrowLeft => 76,
+            K::ArrowRight => 77,
+            K::ArrowUp => 78,
+            K::NumLock => 79,
+            K::Numpad0 => 80,
+            K::Numpad1 => 81,
+            K::Numpad2 => 82,
+            K::Numpad3 => 83,
+            K::Numpad4 => 84,
+            K::Numpad5 => 85,
+            K::Numpad6 => 86,
+            K::Numpad7 => 87,
+            K::Numpad8 => 88,
+            K::Numpad9 => 89,
+            K::NumpadAdd => 90,
+            K::NumpadDecimal => 95,
+            K::NumpadDivide => 96,
+            K::NumpadEnter => 97,
+            K::NumpadEqual => 98,
+            K::NumpadMultiply => 104,
+            K::NumpadSubtract => 107,
+            K::Escape => 120,
+            K::F1 => 121,
+            K::F2 => 122,
+            K::F3 => 123,
+            K::F4 => 124,
+            K::F5 => 125,
+            K::F6 => 126,
+            K::F7 => 127,
+            K::F8 => 128,
+            K::F9 => 129,
+            K::F10 => 130,
+            K::F11 => 131,
+            K::F12 => 132,
+            K::F13 => 133,
+            K::F14 => 134,
+            K::F15 => 135,
+            K::F16 => 136,
+            K::F17 => 137,
+            K::F18 => 138,
+            K::F19 => 139,
+            K::F20 => 140,
+            K::F21 => 141,
+            K::F22 => 142,
+            K::F23 => 143,
+            K::F24 => 144,
+            K::PrintScreen => 148,
+            K::ScrollLock => 149,
+            K::Pause => 150,
         }
     }
 
@@ -209,21 +560,38 @@ mod unix {
             let writer = pair.master.take_writer().context("take PTY writer")?;
             let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(128);
             let (events, _) = broadcast::channel(256);
-            let terminal = self
+            let mut terminal = self
                 .ghostty
                 .terminal(cols, rows)
                 .context("create Ghostty terminal")?;
+            // Replies to the application's queries (DA, DSR, mode reports)
+            // go straight back to the PTY.
+            let replies = input_tx.clone();
+            terminal
+                .set_write_pty(move |bytes| {
+                    let _ = replies.send(bytes.to_vec());
+                })
+                .context("install PTY reply callback")?;
+            let key_encoder = self.ghostty.key_encoder().context("create key encoder")?;
+            let mouse_encoder = self
+                .ghostty
+                .mouse_encoder()
+                .context("create mouse encoder")?;
             let session = Arc::new(Session {
                 input: input_tx,
                 master: Mutex::new(pair.master),
                 child: Mutex::new(child),
                 backlog: Mutex::new(VecDeque::with_capacity(64 * 1024)),
                 terminal: Mutex::new(terminal),
+                key_encoder: Mutex::new(key_encoder),
+                mouse_encoder: Mutex::new(mouse_encoder),
                 cols: std::sync::atomic::AtomicU16::new(cols.max(1)),
                 rows: std::sync::atomic::AtomicU16::new(rows.max(1)),
                 revision: std::sync::atomic::AtomicU64::new(0),
                 exit_code: Mutex::new(None),
                 events,
+                last_frame: Mutex::new((None, Viewport::default())),
+                last_state: Mutex::new(SessionState::default()),
             });
             let session_id = self
                 .next_session_id
@@ -522,6 +890,18 @@ mod unix {
             ClientMessage::ShutdownSession { session_id } => {
                 daemon.session(session_id).await?.shutdown()?;
             }
+            ClientMessage::Key { session_id, event } => {
+                daemon.session(session_id).await?.key(&event)?;
+            }
+            ClientMessage::Mouse { session_id, event } => {
+                daemon.session(session_id).await?.mouse(event)?;
+            }
+            ClientMessage::Paste { session_id, text } => {
+                daemon.session(session_id).await?.paste(&text)?;
+            }
+            ClientMessage::Scroll { session_id, scroll } => {
+                daemon.session(session_id).await?.scroll(scroll)?;
+            }
             ClientMessage::Detach { .. } => {
                 // Attach forwarding tasks end when this connection closes. Per-session
                 // detach tokens arrive in the next protocol iteration.
@@ -536,7 +916,7 @@ mod unix {
         session: Arc<Session>,
         out_tx: &async_mpsc::Sender<(FrameKind, ServerMessage)>,
     ) -> Result<()> {
-        let mut events = session.events.subscribe();
+        let events = session.events.subscribe();
         out_tx
             .send((
                 FrameKind::Response,
@@ -560,7 +940,49 @@ mod unix {
             return Ok(());
         }
 
-        let forwarding = out_tx.clone();
+        // A client that attaches to a running session starts from a full
+        // frame; later patches are relative to it.
+        let (frame, state) = session.full_frame()?;
+        out_tx
+            .send((FrameKind::StreamItem, session_info(session_id, &state)))
+            .await?;
+        if let SessionEvent::ScreenPatch {
+            revision,
+            cols,
+            rows,
+            full,
+            dirty_rows,
+            cursor,
+            viewport,
+        } = frame
+        {
+            out_tx
+                .send((
+                    FrameKind::StreamItem,
+                    ServerMessage::ScreenPatch {
+                        session_id,
+                        revision,
+                        cols,
+                        rows,
+                        full,
+                        dirty_rows,
+                        cursor,
+                        viewport,
+                    },
+                ))
+                .await?;
+        }
+
+        forward_events(session_id, events, out_tx.clone());
+        Ok(())
+    }
+
+    /// Streams session events to one client until it disconnects.
+    fn forward_events(
+        session_id: u64,
+        mut events: broadcast::Receiver<SessionEvent>,
+        forwarding: async_mpsc::Sender<(FrameKind, ServerMessage)>,
+    ) {
         tokio::spawn(async move {
             loop {
                 let message = match events.recv().await {
@@ -572,6 +994,7 @@ mod unix {
                         full,
                         dirty_rows,
                         cursor,
+                        viewport,
                     }) => ServerMessage::ScreenPatch {
                         session_id,
                         revision,
@@ -580,7 +1003,9 @@ mod unix {
                         full,
                         dirty_rows,
                         cursor,
+                        viewport,
                     },
+                    Ok(SessionEvent::Info(state)) => session_info(session_id, &state),
                     Ok(SessionEvent::Exited(exit_code)) => {
                         let _ = forwarding
                             .send((
@@ -608,7 +1033,6 @@ mod unix {
                 }
             }
         });
-        Ok(())
     }
 
     async fn send_error(sender: &async_mpsc::Sender<(FrameKind, ServerMessage)>, message: String) {

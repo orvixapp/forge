@@ -46,6 +46,23 @@ pub fn render_window(
             MouseButton::Left,
             cx.listener(|view, event, _, cx| view.on_mouse_up(event, cx)),
         )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(|view, event, _, cx| view.on_mouse_down(event, cx)),
+        )
+        .on_mouse_up(
+            MouseButton::Right,
+            cx.listener(|view, event, _, cx| view.on_mouse_up(event, cx)),
+        )
+        .on_mouse_down(
+            MouseButton::Middle,
+            cx.listener(|view, event, _, cx| view.on_mouse_down(event, cx)),
+        )
+        .on_mouse_up(
+            MouseButton::Middle,
+            cx.listener(|view, event, _, cx| view.on_mouse_up(event, cx)),
+        )
+        .on_scroll_wheel(cx.listener(|view, event, _, cx| view.on_scroll_wheel(event, cx)))
         .size_full()
         .flex()
         .flex_col()
@@ -127,7 +144,7 @@ fn tab_buttons(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> Vec<AnyElem
         .tabs
         .iter()
         .enumerate()
-        .map(|(index, tab)| (index, tab.title.clone(), tab.id))
+        .map(|(index, tab)| (index, tab.title().to_string(), tab.id))
         .collect();
     tabs.into_iter()
         .map(|(index, title, id)| tab_button(view, index, &title, id, cx).into_any_element())
@@ -287,8 +304,17 @@ fn pane_leaf(
     let active = index == view.active_tab;
     let tab = &view.tabs[index];
     let (cols, rows) = tab.terminal.grid.dimensions();
+    let viewport = tab.terminal.grid.viewport();
+    let scrolled = viewport.scrolled_back();
     let status = match &view.marked_text {
         Some(marked) if active => format!("{cols}×{rows} · {} · IME: {marked}", tab.status),
+        _ if scrolled => format!(
+            "{cols}×{rows} · scrollback −{} · {}",
+            viewport
+                .total
+                .saturating_sub(viewport.offset + viewport.len),
+            tab.status
+        ),
         _ => format!("{cols}×{rows} · {}", tab.status),
     };
     let mut grid = TerminalGridElement::new(cx.entity(), index, ForgeWindow::pane_surface)
@@ -314,6 +340,9 @@ fn pane_leaf(
         }))
         .cursor(CursorStyle::IBeam)
         .child(grid)
+        .when(scrolled, |pane| {
+            pane.child(scrollbar(viewport, rect, theme))
+        })
         // The status line belongs to the focused pane; inactive panes keep
         // every pixel for their grid.
         .when(view.config.terminal.show_status && active, |pane| {
@@ -330,6 +359,28 @@ fn pane_leaf(
             )
         })
         .into_any_element()
+}
+
+/// Thin indicator at the pane's right edge while the viewport is scrolled
+/// back; hidden on the live screen so an idle terminal paints nothing extra.
+fn scrollbar(
+    viewport: proto_ipc::Viewport,
+    rect: Rect,
+    theme: forge_gui::theme::ThemeColors,
+) -> impl IntoElement {
+    #[allow(clippy::cast_precision_loss)]
+    let fraction = |rows: u64| rows as f32 / viewport.total.max(1) as f32;
+    let track = (rect.height - STATUS_HEIGHT).max(0.0);
+    let top = track * fraction(viewport.offset);
+    let height = (track * fraction(viewport.len)).max(12.0);
+    div()
+        .absolute()
+        .right(px(2.0))
+        .top(px(top))
+        .w(px(4.0))
+        .h(px(height))
+        .rounded(px(2.0))
+        .bg(color(theme.muted))
 }
 
 /// Eight invisible strips over the window edges; each starts a native resize
@@ -477,7 +528,7 @@ fn process_explorer(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> impl I
             let (cols, rows) = tab.terminal.grid.dimensions();
             div()
                 .mt(px(4.0))
-                .child(format!("{} · {cols}×{rows} · {}", tab.title, tab.status))
+                .child(format!("{} · {cols}×{rows} · {}", tab.title(), tab.status))
         }))
 }
 

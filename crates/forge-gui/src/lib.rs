@@ -4,7 +4,10 @@ pub mod config;
 pub mod shell;
 pub mod theme;
 
-use proto_ipc::{CursorStyle, Rgb, ScreenCell, ScreenCursor, ScreenRow, ServerMessage};
+use proto_ipc::{
+    CursorStyle, KeyAction, KeyEvent, KeyMods, Rgb, ScreenCell, ScreenCursor, ScreenRow,
+    ServerMessage, TerminalKey, Viewport,
+};
 use std::ops::Range;
 use thiserror::Error;
 
@@ -29,6 +32,7 @@ pub struct TerminalGrid {
     revision: u64,
     cells: Vec<ScreenCell>,
     cursor: Option<ScreenCursor>,
+    viewport: Viewport,
 }
 
 impl TerminalGrid {
@@ -41,7 +45,14 @@ impl TerminalGrid {
             revision: 0,
             cells: vec![blank_cell(); usize::from(cols) * usize::from(rows)],
             cursor: None,
+            viewport: Viewport::default(),
         }
+    }
+
+    /// Where the visible rows sit inside the scrollback.
+    #[must_use]
+    pub fn viewport(&self) -> Viewport {
+        self.viewport
     }
 
     /// Applies a complete or incremental screen patch. Stale revisions are
@@ -136,6 +147,7 @@ impl TerminalGrid {
             full,
             dirty_rows,
             cursor,
+            viewport,
             ..
         } = message
         else {
@@ -144,6 +156,7 @@ impl TerminalGrid {
         let changed = self.apply_patch(revision, cols, rows, full, dirty_rows)?;
         if changed {
             self.cursor = cursor;
+            self.viewport = viewport;
         }
         Ok(changed)
     }
@@ -405,101 +418,134 @@ fn blank_cell() -> ScreenCell {
 }
 
 /// Modifier state of a key press, independent of the windowing toolkit.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct KeyModifiers {
-    pub control: bool,
-    pub alt: bool,
-    pub shift: bool,
-}
+pub type KeyModifiers = KeyMods;
 
-impl KeyModifiers {
-    /// xterm modifier parameter: 1 + shift + 2·alt + 4·control.
-    fn xterm_parameter(self) -> u8 {
-        1 + u8::from(self.shift) + 2 * u8::from(self.alt) + 4 * u8::from(self.control)
-    }
-}
-
-/// Maps a platform-independent key description to terminal input bytes using
-/// xterm conventions: CSI sequences with the modifier parameter for editing
-/// and navigation keys, `ESC` prefix for Alt, and C0 controls for Ctrl.
+/// Builds the key event the daemon encodes, from a toolkit key name (the
+/// W3C-style names GPUI uses: `a`, `enter`, `f5`, `pageup`…) and the text the
+/// key produced. Text is only attached when no control/alt/super modifier is
+/// held: the daemon derives control sequences from the key itself.
 #[must_use]
-pub fn encode_terminal_key(
-    key: &str,
-    key_char: Option<&str>,
-    modifiers: KeyModifiers,
-) -> Option<Vec<u8>> {
-    let parameter = modifiers.xterm_parameter();
-    // Keys whose plain form is `ESC [ final` (or `ESC O final` for F1–F4)
-    // and whose modified form is `ESC [ 1 ; m final`.
-    let csi_final = match key {
-        "up" => Some(b'A'),
-        "down" => Some(b'B'),
-        "right" => Some(b'C'),
-        "left" => Some(b'D'),
-        "home" => Some(b'H'),
-        "end" => Some(b'F'),
-        "f1" => Some(b'P'),
-        "f2" => Some(b'Q'),
-        "f3" => Some(b'R'),
-        "f4" => Some(b'S'),
-        _ => None,
+pub fn key_event(name: &str, key_char: Option<&str>, mods: KeyMods, action: KeyAction) -> KeyEvent {
+    let text = key_char
+        .filter(|_| !(mods.control || mods.alt || mods.super_key))
+        .map(str::to_string);
+    let unshifted_codepoint = match name.chars().collect::<Vec<_>>().as_slice() {
+        [single] => u32::from(single.to_ascii_lowercase()),
+        _ => 0,
     };
-    if let Some(last) = csi_final {
-        let function_key = key.starts_with('f');
-        return Some(if parameter == 1 {
-            vec![0x1b, if function_key { b'O' } else { b'[' }, last]
-        } else {
-            format!("\x1b[1;{parameter}{}", char::from(last)).into_bytes()
-        });
+    KeyEvent {
+        action,
+        key: terminal_key(name),
+        mods,
+        text,
+        unshifted_codepoint,
     }
-    // Keys of the form `ESC [ n ~` / `ESC [ n ; m ~`.
-    let tilde_code: Option<u8> = match key {
-        "insert" => Some(2),
-        "delete" => Some(3),
-        "pageup" => Some(5),
-        "pagedown" => Some(6),
-        "f5" => Some(15),
-        "f6" => Some(17),
-        "f7" => Some(18),
-        "f8" => Some(19),
-        "f9" => Some(20),
-        "f10" => Some(21),
-        "f11" => Some(23),
-        "f12" => Some(24),
-        _ => None,
-    };
-    if let Some(code) = tilde_code {
-        return Some(if parameter == 1 {
-            format!("\x1b[{code}~").into_bytes()
-        } else {
-            format!("\x1b[{code};{parameter}~").into_bytes()
-        });
+}
+
+/// Toolkit key name to the physical key the daemon understands.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn terminal_key(name: &str) -> TerminalKey {
+    use TerminalKey as K;
+    match name {
+        "a" => K::A,
+        "b" => K::B,
+        "c" => K::C,
+        "d" => K::D,
+        "e" => K::E,
+        "f" => K::F,
+        "g" => K::G,
+        "h" => K::H,
+        "i" => K::I,
+        "j" => K::J,
+        "k" => K::K,
+        "l" => K::L,
+        "m" => K::M,
+        "n" => K::N,
+        "o" => K::O,
+        "p" => K::P,
+        "q" => K::Q,
+        "r" => K::R,
+        "s" => K::S,
+        "t" => K::T,
+        "u" => K::U,
+        "v" => K::V,
+        "w" => K::W,
+        "x" => K::X,
+        "y" => K::Y,
+        "z" => K::Z,
+        "0" => K::Digit0,
+        "1" => K::Digit1,
+        "2" => K::Digit2,
+        "3" => K::Digit3,
+        "4" => K::Digit4,
+        "5" => K::Digit5,
+        "6" => K::Digit6,
+        "7" => K::Digit7,
+        "8" => K::Digit8,
+        "9" => K::Digit9,
+        "`" => K::Backquote,
+        "\\" => K::Backslash,
+        "[" => K::BracketLeft,
+        "]" => K::BracketRight,
+        "," => K::Comma,
+        "=" => K::Equal,
+        "-" => K::Minus,
+        "." => K::Period,
+        "'" => K::Quote,
+        ";" => K::Semicolon,
+        "/" => K::Slash,
+        "space" | " " => K::Space,
+        "tab" => K::Tab,
+        "enter" => K::Enter,
+        "escape" => K::Escape,
+        "backspace" => K::Backspace,
+        "delete" => K::Delete,
+        "insert" => K::Insert,
+        "home" => K::Home,
+        "end" => K::End,
+        "pageup" => K::PageUp,
+        "pagedown" => K::PageDown,
+        "up" => K::ArrowUp,
+        "down" => K::ArrowDown,
+        "left" => K::ArrowLeft,
+        "right" => K::ArrowRight,
+        "shift" => K::ShiftLeft,
+        "control" => K::ControlLeft,
+        "alt" => K::AltLeft,
+        "platform" => K::MetaLeft,
+        "capslock" => K::CapsLock,
+        "numlock" => K::NumLock,
+        "scrolllock" => K::ScrollLock,
+        "printscreen" => K::PrintScreen,
+        "pause" => K::Pause,
+        "menu" => K::ContextMenu,
+        "f1" => K::F1,
+        "f2" => K::F2,
+        "f3" => K::F3,
+        "f4" => K::F4,
+        "f5" => K::F5,
+        "f6" => K::F6,
+        "f7" => K::F7,
+        "f8" => K::F8,
+        "f9" => K::F9,
+        "f10" => K::F10,
+        "f11" => K::F11,
+        "f12" => K::F12,
+        "f13" => K::F13,
+        "f14" => K::F14,
+        "f15" => K::F15,
+        "f16" => K::F16,
+        "f17" => K::F17,
+        "f18" => K::F18,
+        "f19" => K::F19,
+        "f20" => K::F20,
+        "f21" => K::F21,
+        "f22" => K::F22,
+        "f23" => K::F23,
+        "f24" => K::F24,
+        _ => K::Unidentified,
     }
-    let mut bytes = match key {
-        "enter" => b"\r".to_vec(),
-        "backspace" if modifiers.control => vec![0x08],
-        "backspace" => vec![0x7f],
-        "tab" if modifiers.shift => b"\x1b[Z".to_vec(),
-        "tab" => b"\t".to_vec(),
-        "escape" => vec![0x1b],
-        "space" if modifiers.control => vec![0x00],
-        _ if modifiers.control => {
-            let byte = key.as_bytes().first()?.to_ascii_lowercase();
-            match byte {
-                b'a'..=b'z' => vec![byte - b'a' + 1],
-                b'[' => vec![0x1b],
-                b'\\' => vec![0x1c],
-                b']' => vec![0x1d],
-                b'/' => vec![0x1f],
-                _ => key_char?.as_bytes().to_vec(),
-            }
-        }
-        _ => key_char?.as_bytes().to_vec(),
-    };
-    if modifiers.alt {
-        bytes.insert(0, 0x1b);
-    }
-    Some(bytes)
 }
 
 #[cfg(test)]
@@ -634,6 +680,7 @@ mod tests {
             full: true,
             dirty_rows: vec![row(0, &["x"])],
             cursor: Some(cursor),
+            viewport: Viewport::default(),
         })
         .unwrap();
         assert_eq!(grid.cursor(), Some(cursor));
@@ -772,55 +819,25 @@ mod tests {
     }
 
     #[test]
-    fn encodes_text_navigation_and_control_keys() {
-        let plain = KeyModifiers::default();
-        let control = KeyModifiers {
+    fn key_events_carry_text_only_without_control_modifiers() {
+        let plain = KeyMods::default();
+        let control = KeyMods {
             control: true,
             ..plain
         };
-        let alt = KeyModifiers { alt: true, ..plain };
-        let shift = KeyModifiers {
-            shift: true,
-            ..plain
-        };
+        let typed = key_event("x", Some("ñ"), plain, KeyAction::Press);
+        assert_eq!(typed.key, TerminalKey::X);
+        assert_eq!(typed.text.as_deref(), Some("ñ"));
+        assert_eq!(typed.unshifted_codepoint, u32::from('x'));
+        let ctrl = key_event("c", Some("c"), control, KeyAction::Press);
+        assert_eq!(ctrl.text, None);
+        assert_eq!(ctrl.key, TerminalKey::C);
+        assert_eq!(terminal_key("pageup"), TerminalKey::PageUp);
+        assert_eq!(terminal_key("f12"), TerminalKey::F12);
+        assert_eq!(terminal_key("ñ"), TerminalKey::Unidentified);
         assert_eq!(
-            encode_terminal_key("x", Some("ñ"), plain),
-            Some("ñ".as_bytes().to_vec())
+            key_event("ñ", Some("ñ"), plain, KeyAction::Press).unshifted_codepoint,
+            u32::from('ñ')
         );
-        assert_eq!(encode_terminal_key("enter", None, plain), Some(vec![b'\r']));
-        assert_eq!(
-            encode_terminal_key("up", None, plain),
-            Some(b"\x1b[A".to_vec())
-        );
-        assert_eq!(encode_terminal_key("c", None, control), Some(vec![3]));
-        assert_eq!(
-            encode_terminal_key("space", Some(" "), control),
-            Some(vec![0])
-        );
-        assert_eq!(
-            encode_terminal_key("x", Some("x"), alt),
-            Some(b"\x1bx".to_vec())
-        );
-        assert_eq!(
-            encode_terminal_key("tab", None, shift),
-            Some(b"\x1b[Z".to_vec())
-        );
-        assert_eq!(
-            encode_terminal_key("right", None, control),
-            Some(b"\x1b[1;5C".to_vec())
-        );
-        assert_eq!(
-            encode_terminal_key("f1", None, plain),
-            Some(b"\x1bOP".to_vec())
-        );
-        assert_eq!(
-            encode_terminal_key("f5", None, shift),
-            Some(b"\x1b[15;2~".to_vec())
-        );
-        assert_eq!(
-            encode_terminal_key("delete", None, plain),
-            Some(b"\x1b[3~".to_vec())
-        );
-        assert_eq!(encode_terminal_key("shift", None, shift), None);
     }
 }

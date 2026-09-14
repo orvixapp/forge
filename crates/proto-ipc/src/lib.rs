@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const HEADER_BYTES: usize = 8;
 
@@ -274,6 +274,247 @@ pub enum ClientMessage {
     ShutdownSession {
         session_id: u64,
     },
+    /// A key press to encode according to the terminal's current modes
+    /// (cursor keys, keypad, Kitty keyboard protocol). Encoding happens in
+    /// the daemon because that is where the modes live.
+    Key {
+        session_id: u64,
+        event: KeyEvent,
+    },
+    /// A mouse event in cell coordinates, forwarded only while the
+    /// application has mouse tracking enabled.
+    Mouse {
+        session_id: u64,
+        event: MouseEvent,
+    },
+    /// Text to paste; the daemon applies bracketed paste when the mode is on.
+    Paste {
+        session_id: u64,
+        text: String,
+    },
+    /// Moves the viewport over the scrollback.
+    Scroll {
+        session_id: u64,
+        scroll: ScrollRequest,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyAction {
+    Press,
+    Release,
+    Repeat,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct KeyMods {
+    pub shift: bool,
+    pub control: bool,
+    pub alt: bool,
+    pub super_key: bool,
+}
+
+/// Physical key, named after the W3C `KeyboardEvent.code` values that
+/// libghostty-vt understands. `Unidentified` with `text` still types.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+#[allow(missing_docs)]
+pub enum TerminalKey {
+    Unidentified,
+    Backquote,
+    Backslash,
+    BracketLeft,
+    BracketRight,
+    Comma,
+    Digit0,
+    Digit1,
+    Digit2,
+    Digit3,
+    Digit4,
+    Digit5,
+    Digit6,
+    Digit7,
+    Digit8,
+    Digit9,
+    Equal,
+    IntlBackslash,
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
+    V,
+    W,
+    X,
+    Y,
+    Z,
+    Minus,
+    Period,
+    Quote,
+    Semicolon,
+    Slash,
+    AltLeft,
+    AltRight,
+    Backspace,
+    CapsLock,
+    ContextMenu,
+    ControlLeft,
+    ControlRight,
+    Enter,
+    MetaLeft,
+    MetaRight,
+    ShiftLeft,
+    ShiftRight,
+    Space,
+    Tab,
+    Delete,
+    End,
+    Home,
+    Insert,
+    PageDown,
+    PageUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    NumLock,
+    Numpad0,
+    Numpad1,
+    Numpad2,
+    Numpad3,
+    Numpad4,
+    Numpad5,
+    Numpad6,
+    Numpad7,
+    Numpad8,
+    Numpad9,
+    NumpadAdd,
+    NumpadDecimal,
+    NumpadDivide,
+    NumpadEnter,
+    NumpadEqual,
+    NumpadMultiply,
+    NumpadSubtract,
+    Escape,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+    F13,
+    F14,
+    F15,
+    F16,
+    F17,
+    F18,
+    F19,
+    F20,
+    F21,
+    F22,
+    F23,
+    F24,
+    PrintScreen,
+    ScrollLock,
+    Pause,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeyEvent {
+    pub action: KeyAction,
+    pub key: TerminalKey,
+    pub mods: KeyMods,
+    /// Text the key produces with the current layout, if any.
+    pub text: Option<String>,
+    /// Codepoint of the key without shift/altgr, for Kitty's protocol.
+    pub unshifted_codepoint: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseAction {
+    Press,
+    Release,
+    Motion,
+}
+
+/// Buttons in xterm numbering; `WheelUp`/`WheelDown` are buttons 4 and 5.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+    WheelLeft,
+    WheelRight,
+    Back,
+    Forward,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MouseEvent {
+    pub action: MouseAction,
+    /// `None` for motion without a pressed button.
+    pub button: Option<MouseButton>,
+    pub mods: KeyMods,
+    pub col: u16,
+    pub row: u16,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollRequest {
+    Top,
+    Bottom,
+    /// Rows; negative scrolls up into the scrollback.
+    Delta(i64),
+    /// Absolute row from the top of the scrollback.
+    Row(u64),
+}
+
+/// Position of the viewport inside the scrollable area, in rows.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Viewport {
+    /// Scrollback rows plus the active screen.
+    pub total: u64,
+    /// First visible row.
+    pub offset: u64,
+    /// Visible rows.
+    pub len: u64,
+}
+
+impl Viewport {
+    /// Whether the viewport is scrolled away from the live screen.
+    #[must_use]
+    pub fn scrolled_back(&self) -> bool {
+        self.offset + self.len < self.total
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -302,6 +543,19 @@ pub enum ServerMessage {
         full: bool,
         dirty_rows: Vec<ScreenRow>,
         cursor: Option<ScreenCursor>,
+        #[serde(default)]
+        viewport: Viewport,
+    },
+    /// Slow-changing session state, sent on attach and whenever it changes.
+    SessionInfo {
+        session_id: u64,
+        /// Title set by OSC 0/2; empty when the application set none.
+        title: String,
+        /// Working directory reported by OSC 7 (decoded from its URI).
+        pwd: Option<String>,
+        /// The application wants mouse events (modes 9/1000/1002/1003).
+        mouse_tracking: bool,
+        alternate_screen: bool,
     },
     Exited {
         session_id: u64,

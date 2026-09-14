@@ -5,7 +5,7 @@
 //! in-flight reads on every keystroke and desynchronize the framed stream
 //! under heavy output.
 
-use proto_ipc::ServerMessage;
+use proto_ipc::{KeyEvent, MouseEvent, ScrollRequest, ServerMessage};
 use std::{path::PathBuf, sync::mpsc::Sender};
 use tokio::sync::mpsc as async_mpsc;
 
@@ -19,7 +19,10 @@ pub enum UiEvent {
 
 #[cfg_attr(not(unix), allow(dead_code))]
 pub enum IpcCommand {
-    Input(Vec<u8>),
+    Key(KeyEvent),
+    Mouse(MouseEvent),
+    Paste(String),
+    Scroll(ScrollRequest),
     Resize { cols: u16, rows: u16 },
 }
 
@@ -175,11 +178,14 @@ mod unix {
         let mut outgoing = tokio::spawn(async move {
             while let Some(command) = input.recv().await {
                 match command {
-                    IpcCommand::Input(data) => {
+                    IpcCommand::Key(_)
+                    | IpcCommand::Mouse(_)
+                    | IpcCommand::Paste(_)
+                    | IpcCommand::Scroll(_) => {
                         write_message(
                             &mut writer,
                             FrameKind::Notification,
-                            &ClientMessage::Input { session_id, data },
+                            &client_message(session_id, command),
                         )
                         .await?;
                     }
@@ -196,12 +202,12 @@ mod unix {
                                 Ok(Some(IpcCommand::Resize { cols, rows })) => {
                                     latest = (cols, rows);
                                 }
-                                Ok(Some(IpcCommand::Input(data))) => {
+                                Ok(Some(other)) => {
                                     send_resize(&mut writer, session_id, latest).await?;
                                     write_message(
                                         &mut writer,
                                         FrameKind::Notification,
-                                        &ClientMessage::Input { session_id, data },
+                                        &client_message(session_id, other),
                                     )
                                     .await?;
                                     break;
@@ -228,6 +234,21 @@ mod unix {
         incoming.abort();
         outgoing.abort();
         result
+    }
+
+    /// The wire form of a non-resize command.
+    fn client_message(session_id: u64, command: IpcCommand) -> ClientMessage {
+        match command {
+            IpcCommand::Key(event) => ClientMessage::Key { session_id, event },
+            IpcCommand::Mouse(event) => ClientMessage::Mouse { session_id, event },
+            IpcCommand::Paste(text) => ClientMessage::Paste { session_id, text },
+            IpcCommand::Scroll(scroll) => ClientMessage::Scroll { session_id, scroll },
+            IpcCommand::Resize { cols, rows } => ClientMessage::Resize {
+                session_id,
+                cols,
+                rows,
+            },
+        }
     }
 
     async fn send_resize<W>(writer: &mut W, session_id: u64, (cols, rows): (u16, u16)) -> Result<()>

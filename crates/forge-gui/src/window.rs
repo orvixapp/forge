@@ -7,9 +7,9 @@ use crate::{
     ipc::{IpcCommand, SessionSpec, UiEvent, spawn_ipc_worker},
 };
 use forge_gui::{
-    KeyModifiers, Selection, TerminalGrid,
+    CellPos, Selection, TerminalGrid,
     config::{Config, ConfigSources, resolve_font_family},
-    encode_terminal_key,
+    key_event,
     shell::{
         PaneTree, ShellCommand, ShellContext, ShellKeymap, ShellKeystroke, SplitDirection,
         WindowSession, search_commands,
@@ -17,12 +17,15 @@ use forge_gui::{
     theme::{self, ThemeColors},
 };
 use gpui::{
-    App, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle, KeyDownEvent,
+    App, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle, KeyDownEvent, Modifiers,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels,
-    PromptLevel, Render, Timer, UTF16Selection, Window, WindowBounds, WindowDecorations,
-    WindowHandle, WindowOptions, prelude::*, px, size,
+    PromptLevel, Render, ScrollDelta, ScrollWheelEvent, Timer, UTF16Selection, Window,
+    WindowBounds, WindowDecorations, WindowHandle, WindowOptions, prelude::*, px, size,
 };
-use proto_ipc::ServerMessage;
+use proto_ipc::{
+    KeyAction, KeyMods, MouseAction, MouseButton as TerminalMouseButton, MouseEvent, ScrollRequest,
+    ServerMessage, TerminalKey,
+};
 use std::{
     ops::Range,
     path::{Path, PathBuf},
@@ -123,13 +126,40 @@ impl WindowFactory {
 /// never overwrite the grid the user is looking at.
 pub struct TerminalTab {
     pub id: u64,
-    pub title: String,
+    /// Name shown when the application has not set a title.
+    pub default_title: String,
     pub terminal: TerminalSurface,
     pub status: String,
     pub input: async_mpsc::UnboundedSender<IpcCommand>,
-    drag_anchor: Option<forge_gui::CellPos>,
+    /// Title, cwd and input modes reported by the daemon.
+    pub info: SessionInfo,
+    drag_anchor: Option<CellPos>,
     /// Last `(cols, rows)` sent to the daemon; a pane resends only on change.
     viewport: Option<(u16, u16)>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub title: String,
+    pub pwd: Option<PathBuf>,
+    pub mouse_tracking: bool,
+    pub alternate_screen: bool,
+}
+
+impl TerminalTab {
+    pub fn title(&self) -> &str {
+        if self.info.title.is_empty() {
+            &self.default_title
+        } else {
+            &self.info.title
+        }
+    }
+
+    /// Whether the application, not Forge, should receive mouse events.
+    /// Shift bypasses the application, as in every terminal.
+    fn app_wants_mouse(&self, modifiers: Modifiers) -> bool {
+        self.info.mouse_tracking && !modifiers.shift
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,8 +456,15 @@ impl ForgeWindow {
         &mut tab.terminal
     }
 
-    /// Creates a tab (and its daemon session) and makes it active.
+    /// Creates a tab (and its daemon session) and makes it active. Without an
+    /// explicit directory the new shell starts where the active one is (OSC 7).
     pub fn create_terminal_tab(&mut self, cwd: Option<PathBuf>, cx: &mut Context<Self>) -> usize {
+        let cwd = cwd.or_else(|| {
+            self.tabs
+                .get(self.active_tab)
+                .and_then(|tab| tab.info.pwd.clone())
+                .filter(|path| path.is_dir())
+        });
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let (input, input_rx) = async_mpsc::unbounded_channel();
@@ -437,7 +474,7 @@ impl ForgeWindow {
         );
         self.tabs.push(TerminalTab {
             id,
-            title,
+            default_title: title,
             terminal: TerminalSurface::new(
                 TerminalGrid::new(80, 24),
                 self.factory.metrics,
@@ -449,6 +486,7 @@ impl ForgeWindow {
                 "Panel vacío".into()
             },
             input,
+            info: SessionInfo::default(),
             drag_anchor: None,
             viewport: None,
         });
@@ -532,6 +570,26 @@ impl ForgeWindow {
                     tab.status = format!("Error del daemon: {message}");
                 }
             }
+            UiEvent::Message {
+                tab_id,
+                message:
+                    ServerMessage::SessionInfo {
+                        title,
+                        pwd,
+                        mouse_tracking,
+                        alternate_screen,
+                        ..
+                    },
+            } => {
+                if let Some(tab) = self.tab_mut(tab_id) {
+                    tab.info = SessionInfo {
+                        title,
+                        pwd: pwd.map(PathBuf::from),
+                        mouse_tracking,
+                        alternate_screen,
+                    };
+                }
+            }
             UiEvent::Message { tab_id, message } => {
                 let Some(tab) = self.tab_mut(tab_id) else {
                     return;
@@ -570,11 +628,7 @@ impl ForgeWindow {
         // character would reach the shell twice.
         cx.stop_propagation();
         let keystroke = &event.keystroke;
-        let modifiers = KeyModifiers {
-            control: keystroke.modifiers.control,
-            alt: keystroke.modifiers.alt,
-            shift: keystroke.modifiers.shift,
-        };
+        let modifiers = key_mods(keystroke.modifiers);
         if self.palette.open {
             self.palette_key(
                 keystroke.key.as_str(),
@@ -596,6 +650,7 @@ impl ForgeWindow {
             return;
         }
         let copy_paste = modifiers.control && modifiers.shift && !modifiers.alt;
+        let scrollback = modifiers.shift && !modifiers.control && !modifiers.alt;
         match keystroke.key.as_str() {
             "c" if copy_paste => {
                 self.copy_selection(cx);
@@ -605,31 +660,109 @@ impl ForgeWindow {
                 self.paste(cx.read_from_clipboard());
                 return;
             }
-            "insert" if modifiers.shift && !modifiers.control => {
+            "insert" if scrollback => {
                 self.paste(read_primary(cx));
+                return;
+            }
+            "pageup" if scrollback => {
+                self.scroll_active(ScrollRequest::Delta(-self.page_rows()));
+                return;
+            }
+            "pagedown" if scrollback => {
+                self.scroll_active(ScrollRequest::Delta(self.page_rows()));
+                return;
+            }
+            "home" if scrollback => {
+                self.scroll_active(ScrollRequest::Top);
+                return;
+            }
+            "end" if scrollback => {
+                self.scroll_active(ScrollRequest::Bottom);
                 return;
             }
             _ => {}
         }
-        if let Some(bytes) =
-            encode_terminal_key(&keystroke.key, keystroke.key_char.as_deref(), modifiers)
-        {
-            self.send_input(bytes, cx);
+        let event = key_event(
+            &keystroke.key,
+            keystroke.key_char.as_deref(),
+            modifiers,
+            if event.is_held {
+                KeyAction::Repeat
+            } else {
+                KeyAction::Press
+            },
+        );
+        // Bare modifiers reach the daemon too: the Kitty protocol reports them.
+        if event.key != TerminalKey::Unidentified || event.text.is_some() {
+            let tab = self.active_tab_mut();
+            tab.terminal.selection = None;
+            let _ = tab.input.send(IpcCommand::Key(event));
+            cx.notify();
         }
     }
 
-    fn send_input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
-        let tab = self.active_tab_mut();
-        tab.terminal.selection = None;
-        let _ = tab.input.send(IpcCommand::Input(bytes));
-        cx.notify();
+    /// Rows scrolled by Shift+PageUp/PageDown: one screen minus a line.
+    fn page_rows(&self) -> i64 {
+        let (_, rows) = self.active_tab().terminal.grid.dimensions();
+        i64::from(rows.saturating_sub(1).max(1))
+    }
+
+    fn scroll_active(&mut self, scroll: ScrollRequest) {
+        let _ = self.active_tab().input.send(IpcCommand::Scroll(scroll));
+    }
+
+    /// Mouse wheel: the application gets it while it tracks the mouse;
+    /// otherwise it moves the viewport over the scrollback.
+    pub fn on_scroll_wheel(&mut self, event: &ScrollWheelEvent, _cx: &mut Context<Self>) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.terminal.contains(event.position))
+        else {
+            return;
+        };
+        let tab = &self.tabs[index];
+        let lines = match event.delta {
+            ScrollDelta::Lines(delta) => delta.y,
+            ScrollDelta::Pixels(delta) => f32::from(delta.y) / tab.terminal.metrics.height,
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let rows = lines.round() as i64;
+        if rows == 0 {
+            return;
+        }
+        if tab.app_wants_mouse(event.modifiers) {
+            let Some(cell) = tab.terminal.cell_at(event.position) else {
+                return;
+            };
+            let button = if rows > 0 {
+                TerminalMouseButton::WheelUp
+            } else {
+                TerminalMouseButton::WheelDown
+            };
+            for _ in 0..rows.unsigned_abs().min(8) {
+                let _ = tab.input.send(IpcCommand::Mouse(MouseEvent {
+                    action: MouseAction::Press,
+                    button: Some(button),
+                    mods: key_mods(event.modifiers),
+                    col: cell.x,
+                    row: cell.y,
+                }));
+            }
+        } else {
+            // Wheel up is a positive delta in GPUI and scrolls the viewport
+            // towards older rows, which is negative for the daemon.
+            let _ = tab
+                .input
+                .send(IpcCommand::Scroll(ScrollRequest::Delta(-rows)));
+        }
     }
 
     fn palette_key(
         &mut self,
         key: &str,
         key_char: Option<&str>,
-        modifiers: KeyModifiers,
+        modifiers: KeyMods,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -768,12 +901,10 @@ impl ForgeWindow {
         }
     }
 
-    /// Sends clipboard text as if typed; line breaks become carriage returns
-    /// like a terminal expects from the keyboard.
+    /// The daemon applies bracketed paste when the application asked for it.
     fn paste(&self, item: Option<ClipboardItem>) {
         if let Some(text) = item.and_then(|item| item.text()) {
-            let bytes = text.replace("\r\n", "\r").replace('\n', "\r").into_bytes();
-            let _ = self.active_tab().input.send(IpcCommand::Input(bytes));
+            let _ = self.active_tab().input.send(IpcCommand::Paste(text));
         }
     }
 
@@ -790,6 +921,20 @@ impl ForgeWindow {
             return;
         };
         let tab = self.active_tab_mut();
+        if tab.app_wants_mouse(event.modifiers) {
+            tab.drag_anchor = None;
+            let _ = tab.input.send(IpcCommand::Mouse(MouseEvent {
+                action: MouseAction::Press,
+                button: Some(gpui_button(event.button)),
+                mods: key_mods(event.modifiers),
+                col: cell.x,
+                row: cell.y,
+            }));
+            return;
+        }
+        if event.button != MouseButton::Left {
+            return;
+        }
         tab.terminal.selection = match event.click_count {
             2 => Some(tab.terminal.grid.word_at(cell)),
             n if n >= 3 => Some(tab.terminal.grid.line_at(cell.y)),
@@ -800,6 +945,19 @@ impl ForgeWindow {
     }
 
     pub fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let tab = self.active_tab();
+        if tab.app_wants_mouse(event.modifiers) && tab.terminal.contains(event.position) {
+            if let Some(cell) = tab.terminal.cell_at(event.position) {
+                let _ = tab.input.send(IpcCommand::Mouse(MouseEvent {
+                    action: MouseAction::Motion,
+                    button: event.pressed_button.map(gpui_button),
+                    mods: key_mods(event.modifiers),
+                    col: cell.x,
+                    row: cell.y,
+                }));
+            }
+            return;
+        }
         let Some(anchor) = self.active_tab().drag_anchor else {
             return;
         };
@@ -817,7 +975,20 @@ impl ForgeWindow {
         }
     }
 
-    pub fn on_mouse_up(&mut self, _event: &MouseUpEvent, cx: &mut Context<Self>) {
+    pub fn on_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        let tab = self.active_tab();
+        if tab.app_wants_mouse(event.modifiers) && tab.drag_anchor.is_none() {
+            if let Some(cell) = tab.terminal.cell_at(event.position) {
+                let _ = tab.input.send(IpcCommand::Mouse(MouseEvent {
+                    action: MouseAction::Release,
+                    button: Some(gpui_button(event.button)),
+                    mods: key_mods(event.modifiers),
+                    col: cell.x,
+                    row: cell.y,
+                }));
+            }
+            return;
+        }
         if self.active_tab_mut().drag_anchor.take().is_none() {
             return;
         }
@@ -923,7 +1094,15 @@ impl EntityInputHandler for ForgeWindow {
     ) {
         let had_preedit = self.marked_text.take().is_some();
         if !text.is_empty() {
-            self.send_input(text.as_bytes().to_vec(), cx);
+            let tab = self.active_tab_mut();
+            tab.terminal.selection = None;
+            let _ = tab.input.send(IpcCommand::Key(key_event(
+                "",
+                Some(text),
+                KeyMods::default(),
+                KeyAction::Press,
+            )));
+            cx.notify();
         } else if had_preedit {
             cx.notify();
         }
@@ -1010,6 +1189,25 @@ fn single_line(text: &str, max_chars: usize) -> String {
         line = line.chars().take(max_chars - 1).collect::<String>() + "…";
     }
     line
+}
+
+fn key_mods(modifiers: Modifiers) -> KeyMods {
+    KeyMods {
+        shift: modifiers.shift,
+        control: modifiers.control,
+        alt: modifiers.alt,
+        super_key: modifiers.platform,
+    }
+}
+
+fn gpui_button(button: MouseButton) -> TerminalMouseButton {
+    match button {
+        MouseButton::Left => TerminalMouseButton::Left,
+        MouseButton::Right => TerminalMouseButton::Right,
+        MouseButton::Middle => TerminalMouseButton::Middle,
+        MouseButton::Navigate(gpui::NavigationDirection::Back) => TerminalMouseButton::Back,
+        MouseButton::Navigate(gpui::NavigationDirection::Forward) => TerminalMouseButton::Forward,
+    }
 }
 
 /// Where the configured `cwd` for new tabs comes from at startup.

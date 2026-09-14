@@ -3,7 +3,7 @@
 
 use crate::window::{ForgeWindow, FrameProbe};
 use gpui::{App, Timer, WindowHandle};
-use proto_ipc::{CursorStyle, Rgb, ScreenCell, ScreenCursor, ScreenRow, ServerMessage};
+use proto_ipc::{CursorStyle, Rgb, ScreenCell, ScreenCursor, ScreenRow, ServerMessage, Viewport};
 use serde::Serialize;
 use std::{
     sync::{
@@ -199,6 +199,11 @@ pub fn synthetic_grid_patch(revision: usize) -> ServerMessage {
             blinking: false,
             style: CursorStyle::Block,
         }),
+        viewport: Viewport {
+            total: 60,
+            offset: 0,
+            len: 60,
+        },
     }
 }
 

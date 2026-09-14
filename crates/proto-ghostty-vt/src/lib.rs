@@ -44,6 +44,114 @@ type RowCellsNew = unsafe extern "C" fn(*const c_void, *mut RawRowCells) -> i32;
 type RowCellsFree = unsafe extern "C" fn(RawRowCells);
 type RowCellsNext = unsafe extern "C" fn(RawRowCells) -> bool;
 type RowCellsGet = unsafe extern "C" fn(RawRowCells, i32, *mut c_void) -> i32;
+type RowIteratorNext = unsafe extern "C" fn(RawRowIterator, *mut u16) -> bool;
+type TerminalSet = unsafe extern "C" fn(RawTerminal, i32, *const c_void) -> i32;
+type TerminalGet = unsafe extern "C" fn(RawTerminal, i32, *mut c_void) -> i32;
+type TerminalScrollViewport = unsafe extern "C" fn(RawTerminal, GhosttyScrollViewport);
+type RawKeyEncoder = *mut c_void;
+type RawKeyEvent = *mut c_void;
+type RawMouseEncoder = *mut c_void;
+type RawMouseEvent = *mut c_void;
+type KeyEncoderNew = unsafe extern "C" fn(*const c_void, *mut RawKeyEncoder) -> i32;
+type KeyEncoderFree = unsafe extern "C" fn(RawKeyEncoder);
+type KeyEncoderSetoptFromTerminal = unsafe extern "C" fn(RawKeyEncoder, RawTerminal);
+type KeyEncoderEncode =
+    unsafe extern "C" fn(RawKeyEncoder, RawKeyEvent, *mut u8, usize, *mut usize) -> i32;
+type KeyEventNew = unsafe extern "C" fn(*const c_void, *mut RawKeyEvent) -> i32;
+type KeyEventFree = unsafe extern "C" fn(RawKeyEvent);
+type KeyEventSetI32 = unsafe extern "C" fn(RawKeyEvent, i32);
+type KeyEventSetMods = unsafe extern "C" fn(RawKeyEvent, u16);
+type KeyEventSetBool = unsafe extern "C" fn(RawKeyEvent, bool);
+type KeyEventSetUtf8 = unsafe extern "C" fn(RawKeyEvent, *const u8, usize);
+type KeyEventSetU32 = unsafe extern "C" fn(RawKeyEvent, u32);
+type MouseEncoderNew = unsafe extern "C" fn(*const c_void, *mut RawMouseEncoder) -> i32;
+type MouseEncoderFree = unsafe extern "C" fn(RawMouseEncoder);
+type MouseEncoderSetopt = unsafe extern "C" fn(RawMouseEncoder, i32, *const c_void);
+type MouseEncoderSetoptFromTerminal = unsafe extern "C" fn(RawMouseEncoder, RawTerminal);
+type MouseEncoderEncode =
+    unsafe extern "C" fn(RawMouseEncoder, RawMouseEvent, *mut u8, usize, *mut usize) -> i32;
+type MouseEventNew = unsafe extern "C" fn(*const c_void, *mut RawMouseEvent) -> i32;
+type MouseEventFree = unsafe extern "C" fn(RawMouseEvent);
+type MouseEventSetI32 = unsafe extern "C" fn(RawMouseEvent, i32);
+type MouseEventClearButton = unsafe extern "C" fn(RawMouseEvent);
+type MouseEventSetMods = unsafe extern "C" fn(RawMouseEvent, u16);
+type MouseEventSetPosition = unsafe extern "C" fn(RawMouseEvent, GhosttyMousePosition);
+type PasteEncode = unsafe extern "C" fn(*mut u8, usize, bool, *mut u8, usize, *mut usize) -> i32;
+type WritePtyFn = unsafe extern "C" fn(RawTerminal, *mut c_void, *const u8, usize);
+
+const TERMINAL_OPT_USERDATA: i32 = 0;
+const TERMINAL_OPT_WRITE_PTY: i32 = 1;
+const TERMINAL_DATA_ACTIVE_SCREEN: i32 = 6;
+const TERMINAL_DATA_SCROLLBAR: i32 = 9;
+const TERMINAL_DATA_MOUSE_TRACKING: i32 = 11;
+const TERMINAL_DATA_TITLE: i32 = 12;
+const TERMINAL_DATA_PWD: i32 = 13;
+const TERMINAL_DATA_MODE: i32 = 37;
+const MOUSE_ENCODER_OPT_SIZE: i32 = 2;
+const SCROLL_VIEWPORT_TOP: i32 = 0;
+const SCROLL_VIEWPORT_BOTTOM: i32 = 1;
+const SCROLL_VIEWPORT_DELTA: i32 = 2;
+const SCROLL_VIEWPORT_ROW: i32 = 3;
+/// DEC private mode 2004.
+const MODE_BRACKETED_PASTE: u16 = 2004;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+union GhosttyScrollViewportValue {
+    delta: isize,
+    row: usize,
+    padding: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GhosttyScrollViewport {
+    tag: i32,
+    value: GhosttyScrollViewportValue,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GhosttyTerminalScrollbar {
+    total: u64,
+    offset: u64,
+    len: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GhosttyString {
+    ptr: *const u8,
+    len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GhosttyTerminalModeConfig {
+    mode: u16,
+    value: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GhosttyMousePosition {
+    x: f32,
+    y: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GhosttyMouseEncoderSize {
+    size: usize,
+    screen_width: u32,
+    screen_height: u32,
+    cell_width: u32,
+    cell_height: u32,
+    padding_top: u32,
+    padding_bottom: u32,
+    padding_right: u32,
+    padding_left: u32,
+}
 
 #[repr(C)]
 struct GhosttyBuffer {
@@ -144,6 +252,36 @@ struct Api {
     row_cells_free: RowCellsFree,
     row_cells_next: RowCellsNext,
     row_cells_get: RowCellsGet,
+    row_iterator_next: RowIteratorNext,
+    terminal_set: TerminalSet,
+    terminal_get: TerminalGet,
+    terminal_scroll_viewport: TerminalScrollViewport,
+    key_encoder_new: KeyEncoderNew,
+    key_encoder_free: KeyEncoderFree,
+    key_encoder_setopt_from_terminal: KeyEncoderSetoptFromTerminal,
+    key_encoder_encode: KeyEncoderEncode,
+    key_event_new: KeyEventNew,
+    key_event_free: KeyEventFree,
+    key_event_set_action: KeyEventSetI32,
+    key_event_set_key: KeyEventSetI32,
+    key_event_set_mods: KeyEventSetMods,
+    key_event_set_consumed_mods: KeyEventSetMods,
+    key_event_set_composing: KeyEventSetBool,
+    key_event_set_utf8: KeyEventSetUtf8,
+    key_event_set_unshifted_codepoint: KeyEventSetU32,
+    mouse_encoder_new: MouseEncoderNew,
+    mouse_encoder_free: MouseEncoderFree,
+    mouse_encoder_setopt: MouseEncoderSetopt,
+    mouse_encoder_setopt_from_terminal: MouseEncoderSetoptFromTerminal,
+    mouse_encoder_encode: MouseEncoderEncode,
+    mouse_event_new: MouseEventNew,
+    mouse_event_free: MouseEventFree,
+    mouse_event_set_action: MouseEventSetI32,
+    mouse_event_set_button: MouseEventSetI32,
+    mouse_event_clear_button: MouseEventClearButton,
+    mouse_event_set_mods: MouseEventSetMods,
+    mouse_event_set_position: MouseEventSetPosition,
+    paste_encode: PasteEncode,
 }
 
 impl Api {
@@ -184,6 +322,60 @@ impl Api {
             row_cells_free: symbol!(b"ghostty_render_state_row_cells_free\0", RowCellsFree),
             row_cells_next: symbol!(b"ghostty_render_state_row_cells_next\0", RowCellsNext),
             row_cells_get: symbol!(b"ghostty_render_state_row_cells_get\0", RowCellsGet),
+            row_iterator_next: symbol!(
+                b"ghostty_render_state_row_iterator_next\0",
+                RowIteratorNext
+            ),
+            terminal_set: symbol!(b"ghostty_terminal_set\0", TerminalSet),
+            terminal_get: symbol!(b"ghostty_terminal_get\0", TerminalGet),
+            terminal_scroll_viewport: symbol!(
+                b"ghostty_terminal_scroll_viewport\0",
+                TerminalScrollViewport
+            ),
+            key_encoder_new: symbol!(b"ghostty_key_encoder_new\0", KeyEncoderNew),
+            key_encoder_free: symbol!(b"ghostty_key_encoder_free\0", KeyEncoderFree),
+            key_encoder_setopt_from_terminal: symbol!(
+                b"ghostty_key_encoder_setopt_from_terminal\0",
+                KeyEncoderSetoptFromTerminal
+            ),
+            key_encoder_encode: symbol!(b"ghostty_key_encoder_encode\0", KeyEncoderEncode),
+            key_event_new: symbol!(b"ghostty_key_event_new\0", KeyEventNew),
+            key_event_free: symbol!(b"ghostty_key_event_free\0", KeyEventFree),
+            key_event_set_action: symbol!(b"ghostty_key_event_set_action\0", KeyEventSetI32),
+            key_event_set_key: symbol!(b"ghostty_key_event_set_key\0", KeyEventSetI32),
+            key_event_set_mods: symbol!(b"ghostty_key_event_set_mods\0", KeyEventSetMods),
+            key_event_set_consumed_mods: symbol!(
+                b"ghostty_key_event_set_consumed_mods\0",
+                KeyEventSetMods
+            ),
+            key_event_set_composing: symbol!(b"ghostty_key_event_set_composing\0", KeyEventSetBool),
+            key_event_set_utf8: symbol!(b"ghostty_key_event_set_utf8\0", KeyEventSetUtf8),
+            key_event_set_unshifted_codepoint: symbol!(
+                b"ghostty_key_event_set_unshifted_codepoint\0",
+                KeyEventSetU32
+            ),
+            mouse_encoder_new: symbol!(b"ghostty_mouse_encoder_new\0", MouseEncoderNew),
+            mouse_encoder_free: symbol!(b"ghostty_mouse_encoder_free\0", MouseEncoderFree),
+            mouse_encoder_setopt: symbol!(b"ghostty_mouse_encoder_setopt\0", MouseEncoderSetopt),
+            mouse_encoder_setopt_from_terminal: symbol!(
+                b"ghostty_mouse_encoder_setopt_from_terminal\0",
+                MouseEncoderSetoptFromTerminal
+            ),
+            mouse_encoder_encode: symbol!(b"ghostty_mouse_encoder_encode\0", MouseEncoderEncode),
+            mouse_event_new: symbol!(b"ghostty_mouse_event_new\0", MouseEventNew),
+            mouse_event_free: symbol!(b"ghostty_mouse_event_free\0", MouseEventFree),
+            mouse_event_set_action: symbol!(b"ghostty_mouse_event_set_action\0", MouseEventSetI32),
+            mouse_event_set_button: symbol!(b"ghostty_mouse_event_set_button\0", MouseEventSetI32),
+            mouse_event_clear_button: symbol!(
+                b"ghostty_mouse_event_clear_button\0",
+                MouseEventClearButton
+            ),
+            mouse_event_set_mods: symbol!(b"ghostty_mouse_event_set_mods\0", MouseEventSetMods),
+            mouse_event_set_position: symbol!(
+                b"ghostty_mouse_event_set_position\0",
+                MouseEventSetPosition
+            ),
+            paste_encode: symbol!(b"ghostty_paste_encode\0", PasteEncode),
             _library: library,
         })
     }
@@ -238,7 +430,227 @@ impl GhosttyLibrary {
             api: Arc::clone(&self.api),
             raw,
             render_state,
+            write_pty: None,
         })
+    }
+
+    /// Creates a key encoder; configure it from a terminal before encoding.
+    ///
+    /// # Errors
+    ///
+    /// Allocation failure inside Ghostty.
+    pub fn key_encoder(&self) -> Result<KeyEncoder, GhosttyError> {
+        let mut encoder = ptr::null_mut();
+        // SAFETY: valid out pointer; null selects Ghostty's allocator.
+        let result = unsafe { (self.api.key_encoder_new)(ptr::null(), &raw mut encoder) };
+        check("key_encoder_new", result)?;
+        let mut event = ptr::null_mut();
+        // SAFETY: as above.
+        let result = unsafe { (self.api.key_event_new)(ptr::null(), &raw mut event) };
+        if let Err(error) = check("key_event_new", result) {
+            // SAFETY: the encoder was created and is uniquely owned.
+            unsafe { (self.api.key_encoder_free)(encoder) };
+            return Err(error);
+        }
+        if encoder.is_null() || event.is_null() {
+            return Err(GhosttyError::NullHandle("key_encoder_new"));
+        }
+        Ok(KeyEncoder {
+            api: Arc::clone(&self.api),
+            encoder,
+            event,
+        })
+    }
+
+    /// Creates a mouse encoder; configure it from a terminal before encoding.
+    ///
+    /// # Errors
+    ///
+    /// Allocation failure inside Ghostty.
+    pub fn mouse_encoder(&self) -> Result<MouseEncoder, GhosttyError> {
+        let mut encoder = ptr::null_mut();
+        // SAFETY: valid out pointer; null selects Ghostty's allocator.
+        let result = unsafe { (self.api.mouse_encoder_new)(ptr::null(), &raw mut encoder) };
+        check("mouse_encoder_new", result)?;
+        let mut event = ptr::null_mut();
+        // SAFETY: as above.
+        let result = unsafe { (self.api.mouse_event_new)(ptr::null(), &raw mut event) };
+        if let Err(error) = check("mouse_event_new", result) {
+            // SAFETY: the encoder was created and is uniquely owned.
+            unsafe { (self.api.mouse_encoder_free)(encoder) };
+            return Err(error);
+        }
+        if encoder.is_null() || event.is_null() {
+            return Err(GhosttyError::NullHandle("mouse_encoder_new"));
+        }
+        Ok(MouseEncoder {
+            api: Arc::clone(&self.api),
+            encoder,
+            event,
+        })
+    }
+}
+
+/// Encodes key presses into the byte sequences the application expects.
+pub struct KeyEncoder {
+    api: Arc<Api>,
+    encoder: RawKeyEncoder,
+    event: RawKeyEvent,
+}
+
+// SAFETY: handles have no thread affinity; the daemon guards them by a mutex.
+unsafe impl Send for KeyEncoder {}
+
+impl KeyEncoder {
+    /// Encodes `input` with the modes currently active in `terminal`.
+    ///
+    /// # Errors
+    ///
+    /// Ghostty rejecting the event.
+    pub fn encode(
+        &mut self,
+        terminal: &GhosttyTerminal,
+        input: &KeyInput,
+    ) -> Result<Vec<u8>, GhosttyError> {
+        // SAFETY: all handles are valid and uniquely owned; the utf8 slice
+        // outlives the encode call.
+        unsafe {
+            (self.api.key_encoder_setopt_from_terminal)(self.encoder, terminal.raw);
+            (self.api.key_event_set_action)(self.event, input.action);
+            (self.api.key_event_set_key)(self.event, input.key);
+            (self.api.key_event_set_mods)(self.event, input.mods);
+            (self.api.key_event_set_consumed_mods)(self.event, 0);
+            (self.api.key_event_set_composing)(self.event, false);
+            let text = input.text.as_deref().unwrap_or("");
+            (self.api.key_event_set_utf8)(self.event, text.as_ptr(), text.len());
+            (self.api.key_event_set_unshifted_codepoint)(self.event, input.unshifted_codepoint);
+        }
+        let mut buffer = vec![0_u8; 64];
+        let mut written = 0;
+        // SAFETY: the buffer exposes exactly the capacity passed to Ghostty.
+        let result = unsafe {
+            (self.api.key_encoder_encode)(
+                self.encoder,
+                self.event,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &raw mut written,
+            )
+        };
+        if result == GHOSTTY_OUT_OF_SPACE {
+            buffer.resize(written, 0);
+            // SAFETY: as above, with the size Ghostty asked for.
+            let result = unsafe {
+                (self.api.key_encoder_encode)(
+                    self.encoder,
+                    self.event,
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                    &raw mut written,
+                )
+            };
+            check("key_encoder_encode", result)?;
+        } else {
+            check("key_encoder_encode", result)?;
+        }
+        buffer.truncate(written);
+        Ok(buffer)
+    }
+}
+
+impl Drop for KeyEncoder {
+    fn drop(&mut self) {
+        // SAFETY: both handles are uniquely owned and freed exactly once.
+        unsafe {
+            (self.api.key_event_free)(self.event);
+            (self.api.key_encoder_free)(self.encoder);
+        }
+    }
+}
+
+/// Encodes mouse events for applications that enabled mouse tracking.
+pub struct MouseEncoder {
+    api: Arc<Api>,
+    encoder: RawMouseEncoder,
+    event: RawMouseEvent,
+}
+
+// SAFETY: handles have no thread affinity; the daemon guards them by a mutex.
+unsafe impl Send for MouseEncoder {}
+
+impl MouseEncoder {
+    /// Encodes `input` with the tracking mode and format active in
+    /// `terminal`. Positions are cells, so the encoder is told the screen
+    /// is `cols`×`rows` "pixels" with 1×1 cells.
+    ///
+    /// # Errors
+    ///
+    /// Ghostty rejecting the event.
+    pub fn encode(
+        &mut self,
+        terminal: &GhosttyTerminal,
+        cols: u16,
+        rows: u16,
+        input: MouseInput,
+    ) -> Result<Vec<u8>, GhosttyError> {
+        let size = GhosttyMouseEncoderSize {
+            size: size_of::<GhosttyMouseEncoderSize>(),
+            screen_width: u32::from(cols.max(1)),
+            screen_height: u32::from(rows.max(1)),
+            cell_width: 1,
+            cell_height: 1,
+            padding_top: 0,
+            padding_bottom: 0,
+            padding_right: 0,
+            padding_left: 0,
+        };
+        // SAFETY: all handles are valid; `size` lives for the setopt call.
+        unsafe {
+            (self.api.mouse_encoder_setopt_from_terminal)(self.encoder, terminal.raw);
+            (self.api.mouse_encoder_setopt)(
+                self.encoder,
+                MOUSE_ENCODER_OPT_SIZE,
+                (&raw const size).cast(),
+            );
+            (self.api.mouse_event_set_action)(self.event, input.action);
+            match input.button {
+                Some(button) => (self.api.mouse_event_set_button)(self.event, button),
+                None => (self.api.mouse_event_clear_button)(self.event),
+            }
+            (self.api.mouse_event_set_mods)(self.event, input.mods);
+            (self.api.mouse_event_set_position)(
+                self.event,
+                GhosttyMousePosition {
+                    x: f32::from(input.col) + 0.5,
+                    y: f32::from(input.row) + 0.5,
+                },
+            );
+        }
+        let mut buffer = vec![0_u8; 64];
+        let mut written = 0;
+        // SAFETY: the buffer exposes exactly the capacity passed to Ghostty.
+        let result = unsafe {
+            (self.api.mouse_encoder_encode)(
+                self.encoder,
+                self.event,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &raw mut written,
+            )
+        };
+        check("mouse_encoder_encode", result)?;
+        buffer.truncate(written);
+        Ok(buffer)
+    }
+}
+
+impl Drop for MouseEncoder {
+    fn drop(&mut self) {
+        // SAFETY: both handles are uniquely owned and freed exactly once.
+        unsafe {
+            (self.api.mouse_event_free)(self.event);
+            (self.api.mouse_encoder_free)(self.encoder);
+        }
     }
 }
 
@@ -246,6 +658,80 @@ pub struct GhosttyTerminal {
     api: Arc<Api>,
     raw: RawTerminal,
     render_state: RawRenderState,
+    /// Owner of the `write_pty` closure handed to Ghostty as userdata.
+    write_pty: Option<Box<WritePtyCallback>>,
+}
+
+type WritePtyCallback = Box<dyn Fn(&[u8]) + Send>;
+
+/// Trampoline for `GHOSTTY_TERMINAL_OPT_WRITE_PTY`.
+unsafe extern "C" fn write_pty_trampoline(
+    _terminal: RawTerminal,
+    userdata: *mut c_void,
+    data: *const u8,
+    len: usize,
+) {
+    if userdata.is_null() || data.is_null() {
+        return;
+    }
+    // SAFETY: userdata is the `*mut WritePtyCallback` installed by
+    // `set_write_pty`, alive as long as the terminal; Ghostty guarantees
+    // `data` points to `len` readable bytes for the duration of the call.
+    let callback = unsafe { &*userdata.cast::<WritePtyCallback>() };
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    callback(bytes);
+}
+
+/// Where the viewport should move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollViewport {
+    Top,
+    Bottom,
+    /// Rows; negative is up into the scrollback.
+    Delta(i64),
+    Row(u64),
+}
+
+/// Scrollable area in rows: `offset` is the first visible row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Scrollbar {
+    pub total: u64,
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// Slow-changing terminal state an embedder mirrors in its UI.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionState {
+    pub title: String,
+    pub pwd: String,
+    pub mouse_tracking: bool,
+    pub alternate_screen: bool,
+}
+
+/// Key press described with libghostty-vt's own key codes (see `key/event.h`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyInput {
+    /// `GHOSTTY_KEY_ACTION_*`: 0 release, 1 press, 2 repeat.
+    pub action: i32,
+    /// `GHOSTTY_KEY_*` code; 0 is unidentified.
+    pub key: i32,
+    /// `GHOSTTY_MODS_*` bitmask.
+    pub mods: u16,
+    pub text: Option<String>,
+    pub unshifted_codepoint: u32,
+}
+
+/// Mouse event in cell coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MouseInput {
+    /// `GHOSTTY_MOUSE_ACTION_*`: 0 press, 1 release, 2 motion.
+    pub action: i32,
+    /// `GHOSTTY_MOUSE_BUTTON_*`; `None` for motion without a button.
+    pub button: Option<i32>,
+    pub mods: u16,
+    pub col: u16,
+    pub row: u16,
 }
 
 // SAFETY: libghostty-vt terminal handles have no thread affinity. Forge never
@@ -270,6 +756,227 @@ impl GhosttyTerminal {
         check("terminal_resize", result)
     }
 
+    /// Installs the callback Ghostty uses to answer queries from the
+    /// application (device attributes, cursor position reports, mode
+    /// reports). Without it those applications wait forever.
+    ///
+    /// # Errors
+    ///
+    /// Ghostty rejecting the option.
+    pub fn set_write_pty(
+        &mut self,
+        callback: impl Fn(&[u8]) + Send + 'static,
+    ) -> Result<(), GhosttyError> {
+        let boxed: Box<WritePtyCallback> = Box::new(Box::new(callback));
+        let userdata = Box::into_raw(boxed);
+        // SAFETY: pointer options are passed directly; `userdata` stays alive
+        // in `self.write_pty` until the terminal is dropped.
+        let result = unsafe {
+            (self.api.terminal_set)(
+                self.raw,
+                TERMINAL_OPT_USERDATA,
+                userdata.cast_const().cast(),
+            )
+        };
+        if let Err(error) = check("terminal_set(userdata)", result) {
+            // SAFETY: reclaiming the box we just leaked.
+            drop(unsafe { Box::from_raw(userdata) });
+            return Err(error);
+        }
+        let trampoline: WritePtyFn = write_pty_trampoline;
+        // SAFETY: function pointers are passed directly as the option value.
+        let result = unsafe {
+            (self.api.terminal_set)(
+                self.raw,
+                TERMINAL_OPT_WRITE_PTY,
+                trampoline as *const c_void,
+            )
+        };
+        check("terminal_set(write_pty)", result)?;
+        // SAFETY: `userdata` came from `Box::into_raw` above.
+        self.write_pty = Some(unsafe { Box::from_raw(userdata) });
+        Ok(())
+    }
+
+    /// Moves the viewport over the scrollback.
+    pub fn scroll_viewport(&mut self, scroll: ScrollViewport) {
+        let behavior = match scroll {
+            ScrollViewport::Top => GhosttyScrollViewport {
+                tag: SCROLL_VIEWPORT_TOP,
+                value: GhosttyScrollViewportValue { padding: [0; 2] },
+            },
+            ScrollViewport::Bottom => GhosttyScrollViewport {
+                tag: SCROLL_VIEWPORT_BOTTOM,
+                value: GhosttyScrollViewportValue { padding: [0; 2] },
+            },
+            ScrollViewport::Delta(delta) => GhosttyScrollViewport {
+                tag: SCROLL_VIEWPORT_DELTA,
+                value: GhosttyScrollViewportValue {
+                    delta: isize::try_from(delta).unwrap_or(isize::MAX),
+                },
+            },
+            ScrollViewport::Row(row) => GhosttyScrollViewport {
+                tag: SCROLL_VIEWPORT_ROW,
+                value: GhosttyScrollViewportValue {
+                    row: usize::try_from(row).unwrap_or(usize::MAX),
+                },
+            },
+        };
+        // SAFETY: the handle is valid and the struct matches the C layout.
+        unsafe { (self.api.terminal_scroll_viewport)(self.raw, behavior) };
+    }
+
+    /// Position of the viewport inside the scrollable area.
+    ///
+    /// # Errors
+    ///
+    /// Ghostty failing the query.
+    pub fn scrollbar(&self) -> Result<Scrollbar, GhosttyError> {
+        let value: GhosttyTerminalScrollbar =
+            self.terminal_value(TERMINAL_DATA_SCROLLBAR, "terminal_get(scrollbar)")?;
+        Ok(Scrollbar {
+            total: value.total,
+            offset: value.offset,
+            len: value.len,
+        })
+    }
+
+    /// Title, working directory, mouse tracking and active screen.
+    ///
+    /// # Errors
+    ///
+    /// Ghostty failing a query.
+    pub fn session_state(&self) -> Result<SessionState, GhosttyError> {
+        let mouse_tracking: bool =
+            self.terminal_value(TERMINAL_DATA_MOUSE_TRACKING, "terminal_get(mouse tracking)")?;
+        let screen: i32 =
+            self.terminal_value(TERMINAL_DATA_ACTIVE_SCREEN, "terminal_get(active screen)")?;
+        Ok(SessionState {
+            title: self.terminal_string(TERMINAL_DATA_TITLE, "terminal_get(title)")?,
+            pwd: self.terminal_string(TERMINAL_DATA_PWD, "terminal_get(pwd)")?,
+            mouse_tracking,
+            alternate_screen: screen == 1,
+        })
+    }
+
+    /// Whether a DEC private mode is set.
+    ///
+    /// # Errors
+    ///
+    /// Ghostty failing the query.
+    pub fn dec_mode(&self, mode: u16) -> Result<bool, GhosttyError> {
+        let mut config = GhosttyTerminalModeConfig {
+            mode: mode & 0x7fff,
+            value: false,
+        };
+        // SAFETY: the struct has the documented frozen layout.
+        let result = unsafe {
+            (self.api.terminal_get)(self.raw, TERMINAL_DATA_MODE, (&raw mut config).cast())
+        };
+        check("terminal_get(mode)", result)?;
+        Ok(config.value)
+    }
+
+    /// Bytes to write to the PTY for pasting `text`, bracketed when the
+    /// application enabled mode 2004.
+    ///
+    /// # Errors
+    ///
+    /// Ghostty failing to encode.
+    pub fn encode_paste(&self, text: &str) -> Result<Vec<u8>, GhosttyError> {
+        let bracketed = self.dec_mode(MODE_BRACKETED_PASTE)?;
+        let mut data = text.as_bytes().to_vec();
+        let mut buffer = vec![0_u8; data.len() + 16];
+        let mut written = 0;
+        // SAFETY: both buffers expose exactly the capacities passed.
+        let result = unsafe {
+            (self.api.paste_encode)(
+                data.as_mut_ptr(),
+                data.len(),
+                bracketed,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &raw mut written,
+            )
+        };
+        if result == GHOSTTY_OUT_OF_SPACE {
+            buffer.resize(written, 0);
+            // SAFETY: as above, with the size Ghostty asked for.
+            let result = unsafe {
+                (self.api.paste_encode)(
+                    data.as_mut_ptr(),
+                    data.len(),
+                    bracketed,
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                    &raw mut written,
+                )
+            };
+            check("paste_encode", result)?;
+        } else {
+            check("paste_encode", result)?;
+        }
+        buffer.truncate(written);
+        Ok(buffer)
+    }
+
+    fn terminal_value<T: Default>(
+        &self,
+        data: i32,
+        operation: &'static str,
+    ) -> Result<T, GhosttyError> {
+        let mut value = T::default();
+        // SAFETY: each call site pairs the data tag with its documented type.
+        let result =
+            unsafe { (self.api.terminal_get)(self.raw, data, (&raw mut value).cast::<c_void>()) };
+        check(operation, result)?;
+        Ok(value)
+    }
+
+    fn terminal_string(&self, data: i32, operation: &'static str) -> Result<String, GhosttyError> {
+        let mut value = GhosttyString {
+            ptr: ptr::null(),
+            len: 0,
+        };
+        // SAFETY: the output is a borrowed string valid until the next
+        // mutating call; it is copied immediately.
+        let result =
+            unsafe { (self.api.terminal_get)(self.raw, data, (&raw mut value).cast::<c_void>()) };
+        check(operation, result)?;
+        if value.ptr.is_null() || value.len == 0 {
+            return Ok(String::new());
+        }
+        // SAFETY: Ghostty guarantees `len` readable bytes at `ptr`.
+        let bytes = unsafe { std::slice::from_raw_parts(value.ptr, value.len) };
+        Ok(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    /// Every row of the viewport, for a client that attaches to a running
+    /// session and has no previous frame to patch.
+    ///
+    /// # Errors
+    ///
+    /// Ghostty failing to read its render state.
+    pub fn full_snapshot(&mut self) -> Result<RenderSnapshot, GhosttyError> {
+        // SAFETY: both handles are uniquely owned by this value and valid.
+        let result = unsafe { (self.api.render_state_update)(self.render_state, self.raw) };
+        check("render_state_update", result)?;
+        let cols = self.render_value::<u16>(1, "render_state_get(cols)")?;
+        let rows = self.render_value::<u16>(2, "render_state_get(rows)")?;
+        let cursor = self.render_cursor()?;
+        let dirty_rows = self.read_rows(false)?;
+        // SAFETY: the state is valid and the complete frame was read.
+        let result = unsafe { (self.api.render_state_clean)(self.render_state) };
+        check("render_state_clean", result)?;
+        Ok(RenderSnapshot {
+            cols,
+            rows,
+            dirty: DirtyState::Full,
+            dirty_rows,
+            cursor,
+        })
+    }
+
     /// Synchronizes Ghostty's incremental render state and returns the frame
     /// metadata together with a plain-text bridge for the prototype client.
     ///
@@ -289,7 +996,7 @@ impl GhosttyTerminal {
         let dirty_rows = if dirty == DirtyState::Clean {
             Vec::new()
         } else {
-            self.read_dirty_rows()?
+            self.read_rows(dirty != DirtyState::Full)?
         };
         // SAFETY: the state is valid and the complete prototype frame was read.
         let result = unsafe { (self.api.render_state_clean)(self.render_state) };
@@ -330,7 +1037,8 @@ impl GhosttyTerminal {
         }))
     }
 
-    fn read_dirty_rows(&self) -> Result<Vec<RenderRow>, GhosttyError> {
+    /// Rows of the viewport: only the dirty ones, or every row.
+    fn read_rows(&self, only_dirty: bool) -> Result<Vec<RenderRow>, GhosttyError> {
         let mut iterator = ptr::null_mut();
         let result = unsafe { (self.api.row_iterator_new)(ptr::null(), &raw mut iterator) };
         check("render_state_row_iterator_new", result)?;
@@ -359,7 +1067,12 @@ impl GhosttyTerminal {
         let mut rows = Vec::new();
         loop {
             let mut y = 0;
-            if !unsafe { (self.api.row_iterator_next_dirty)(iterator.raw, &raw mut y) } {
+            let more = if only_dirty {
+                unsafe { (self.api.row_iterator_next_dirty)(iterator.raw, &raw mut y) }
+            } else {
+                unsafe { (self.api.row_iterator_next)(iterator.raw, &raw mut y) }
+            };
+            if !more {
                 break;
             }
             let result =
