@@ -106,7 +106,10 @@ fn spawn_frame_benchmark(
             }
         }
         let painted_cells = window
-            .update(cx, |view, _, _| view.active_tab().terminal.painted_cells)
+            .update(cx, |view, _, _| {
+                view.active_terminal()
+                    .map_or(0, |tab| tab.terminal.painted_cells)
+            })
             .ok()
             .and_then(|cells| u64::try_from(cells).ok());
         emit_metrics(&GuiMetrics {
@@ -130,7 +133,8 @@ pub fn spawn_grid_benchmark(iterations: usize, window: WindowHandle<ForgeWindow>
         window,
         |view, revision| {
             let patch = synthetic_grid_patch(revision);
-            view.active_tab_mut()
+            view.active_terminal_mut()
+                .expect("benchmark tabs are terminals")
                 .terminal
                 .grid
                 .apply_server_message(patch)

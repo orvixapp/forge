@@ -1840,6 +1840,7 @@ name = "forge-gui"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "forge-buffer",
  "gpui",
  "proto-ipc",
  "schemars",

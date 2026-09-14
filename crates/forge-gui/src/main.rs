@@ -1,5 +1,6 @@
 mod bench;
 mod chrome;
+mod editor;
 mod grid_element;
 mod ipc;
 mod search;
@@ -155,6 +156,17 @@ fn main() {
                 let _span = tracing::info_span!("window.open").entered();
                 factory.open(cx).expect("open Forge window")
             };
+            if !options.files.is_empty() {
+                let files = options.files.clone();
+                window
+                    .update(cx, |view, _, cx| {
+                        for file in &files {
+                            let (path, line, column) = forge_gui::links::split_file_reference(file);
+                            view.open_file(std::path::Path::new(path), line, column, cx);
+                        }
+                    })
+                    .expect("open files from the command line");
+            }
             if options.exit_after_first_frame {
                 window
                     .update(cx, |_, window, _| {
@@ -263,6 +275,8 @@ struct RunOptions {
     benchmark_grid_frames: Option<usize>,
     benchmark_panes: Option<usize>,
     benchmark_frames: usize,
+    /// Files to open in editor tabs, as `path` or `path:line[:col]`.
+    files: Vec<String>,
 }
 
 fn run_options() -> RunOptions {
@@ -276,6 +290,7 @@ fn run_options() -> RunOptions {
         benchmark_grid_frames: None,
         benchmark_panes: None,
         benchmark_frames: 120,
+        files: Vec::new(),
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -301,6 +316,7 @@ fn run_options() -> RunOptions {
                     options.benchmark_frames = frames;
                 }
             }
+            other if !other.starts_with("--") => options.files.push(other.to_owned()),
             _ => {}
         }
     }

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+forge-buffer = { path = "../forge-buffer" }
 gpui.workspace = true
 proto-ipc = { path = "../proto-ipc" }
 schemars = "1"

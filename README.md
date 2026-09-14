@@ -144,6 +144,15 @@ for parser comparisons. On Windows the daemon listens on a named pipe and
 spawns shells through ConPTY (build-only so far; see
 `docs/PHASE_2_EXECUTION.md`). VT conformance procedure: `docs/CONFORMANCE.md`.
 
+Editor (Phase 3, in progress): `forge-gui path[:line[:col]]…`, `Ctrl+O`
+opens files, `Ctrl+N` a new buffer, `Ctrl+S` saves; editor tabs live in the
+same pane tree as terminals and `Ctrl+click` on `path:line` in a terminal
+opens the file in Forge. Editing: multi-cursor (`Ctrl+Alt+↑/↓`, `Alt+click`,
+`Ctrl+D` next occurrence), `Ctrl+Z`/`Ctrl+Shift+Z`, word motions with
+`Ctrl+←/→`, `Home` toggling indent/column 0. Unsaved buffers are journaled
+under `<config dir>/journal/` and recovered on the next open. `[editor]`
+config: `tab_size`, `indent_with_tabs`, `line_numbers`.
+
 Diagnostics: `FORGE_LOG=debug` prints tracing/GPUI logs; `FORGE_TRACE_FILE=trace.json`
 writes a Chrome trace of the startup spans that Perfetto can open.
 

@@ -4,7 +4,7 @@
 
 use crate::{
     grid_element::{TerminalGridElement, color},
-    window::{ConfirmationKind, ForgeWindow, NotificationLevel},
+    window::{ConfirmationKind, ForgeWindow, NotificationLevel, TabContent},
 };
 use forge_gui::{
     config::Language,
@@ -33,11 +33,8 @@ pub fn render_window(
         .id("forge-window")
         .track_focus(&view.focus)
         .on_key_down(cx.listener(ForgeWindow::on_key_down))
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|view, event, _, cx| view.on_mouse_down(event, cx)),
-        )
-        .on_mouse_move(cx.listener(|view, event, _, cx| view.on_mouse_move(event, cx)))
+        .on_mouse_down(MouseButton::Left, cx.listener(ForgeWindow::on_mouse_down))
+        .on_mouse_move(cx.listener(ForgeWindow::on_mouse_move))
         .on_mouse_up(
             MouseButton::Left,
             cx.listener(|view, event, _, cx| view.on_mouse_up(event, cx)),
@@ -46,18 +43,12 @@ pub fn render_window(
             MouseButton::Left,
             cx.listener(|view, event, _, cx| view.on_mouse_up(event, cx)),
         )
-        .on_mouse_down(
-            MouseButton::Right,
-            cx.listener(|view, event, _, cx| view.on_mouse_down(event, cx)),
-        )
+        .on_mouse_down(MouseButton::Right, cx.listener(ForgeWindow::on_mouse_down))
         .on_mouse_up(
             MouseButton::Right,
             cx.listener(|view, event, _, cx| view.on_mouse_up(event, cx)),
         )
-        .on_mouse_down(
-            MouseButton::Middle,
-            cx.listener(|view, event, _, cx| view.on_mouse_down(event, cx)),
-        )
+        .on_mouse_down(MouseButton::Middle, cx.listener(ForgeWindow::on_mouse_down))
         .on_mouse_up(
             MouseButton::Middle,
             cx.listener(|view, event, _, cx| view.on_mouse_up(event, cx)),
@@ -221,7 +212,9 @@ fn tab_button(
                     .justify_center()
                     .rounded(px(3.0))
                     .hover(move |style| style.bg(color(theme.chrome_active_border)))
-                    .on_click(cx.listener(move |view, _, _, cx| view.close_tab(index, cx)))
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        view.request_close_tab(index, window, cx);
+                    }))
                     .child("×"),
             )
         })
@@ -323,25 +316,56 @@ fn pane_leaf(
     let theme = view.theme;
     let active = index == view.active_tab;
     let tab = &view.tabs[index];
-    let (cols, rows) = tab.terminal.grid.dimensions();
-    let viewport = tab.terminal.grid.viewport();
-    let scrolled = viewport.scrolled_back();
-    let status = match &view.marked_text {
-        Some(marked) if active => format!("{cols}×{rows} · {} · IME: {marked}", tab.status),
-        _ if scrolled => format!(
-            "{cols}×{rows} · scrollback −{} · {}",
-            viewport
-                .total
-                .saturating_sub(viewport.offset + viewport.len),
-            tab.status
-        ),
-        _ => format!("{cols}×{rows} · {}", tab.status),
+    // Terminals show their viewport and scrollback; editors their cursor.
+    let (content, status, scrollbar): (AnyElement, String, Option<AnyElement>) = match &tab.content
+    {
+        TabContent::Terminal(terminal) => {
+            let (cols, rows) = terminal.terminal.grid.dimensions();
+            let viewport = terminal.terminal.grid.viewport();
+            let scrolled = viewport.scrolled_back();
+            let status = match &view.marked_text {
+                Some(marked) if active => {
+                    format!("{cols}×{rows} · {} · IME: {marked}", terminal.status)
+                }
+                _ if scrolled => format!(
+                    "{cols}×{rows} · scrollback −{} · {}",
+                    viewport
+                        .total
+                        .saturating_sub(viewport.offset + viewport.len),
+                    terminal.status
+                ),
+                _ => format!("{cols}×{rows} · {}", terminal.status),
+            };
+            let mut grid = TerminalGridElement::new(cx.entity(), index, ForgeWindow::pane_surface)
+                .with_padding(px(view.config.terminal.padding));
+            if active {
+                grid = grid.with_input_focus(view.focus.clone());
+            }
+            (
+                grid.into_any_element(),
+                status,
+                scrolled.then(|| scrollbar(viewport, rect, theme).into_any_element()),
+            )
+        }
+        TabContent::Editor(editor) => {
+            let visible = crate::editor::visible_range(editor);
+            let total = editor.buffer.len_lines() as u64;
+            let viewport = proto_ipc::Viewport {
+                total,
+                offset: visible.start as u64,
+                len: visible.len() as u64,
+            };
+            let status = match &view.marked_text {
+                Some(marked) if active => format!("{} · IME: {marked}", editor.status()),
+                _ => editor.status(),
+            };
+            (
+                crate::editor::EditorElement::new(cx.entity(), index).into_any_element(),
+                status,
+                (total > viewport.len).then(|| scrollbar(viewport, rect, theme).into_any_element()),
+            )
+        }
     };
-    let mut grid = TerminalGridElement::new(cx.entity(), index, ForgeWindow::pane_surface)
-        .with_padding(px(view.config.terminal.padding));
-    if active {
-        grid = grid.with_input_focus(view.focus.clone());
-    }
     div()
         .id(("pane", index))
         .absolute()
@@ -359,12 +383,10 @@ fn pane_leaf(
             theme.chrome_border
         }))
         .cursor(CursorStyle::IBeam)
-        .child(grid)
-        .when(scrolled, |pane| {
-            pane.child(scrollbar(viewport, rect, theme))
-        })
+        .child(content)
+        .children(scrollbar)
         // The status line belongs to the focused pane; inactive panes keep
-        // every pixel for their grid.
+        // every pixel for their content.
         .when(view.config.terminal.show_status && active, |pane| {
             pane.child(
                 div()
@@ -545,10 +567,16 @@ fn process_explorer(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> impl I
                 )),
         )
         .children(view.tabs.iter().map(|tab| {
-            let (cols, rows) = tab.terminal.grid.dimensions();
+            let size = match &tab.content {
+                TabContent::Terminal(terminal) => {
+                    let (cols, rows) = terminal.terminal.grid.dimensions();
+                    format!("{cols}×{rows}")
+                }
+                TabContent::Editor(editor) => format!("{} líneas", editor.buffer.len_lines()),
+            };
             div()
                 .mt(px(4.0))
-                .child(format!("{} · {cols}×{rows} · {}", tab.title(), tab.status))
+                .child(format!("{} · {size} · {}", tab.title(), tab.status()))
         }))
 }
 

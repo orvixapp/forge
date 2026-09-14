@@ -42,10 +42,31 @@ pub struct Config {
     pub colors: ColorOverrides,
     pub terminal: TerminalConfig,
     pub ui: UiConfig,
+    pub editor: EditorConfig,
     pub keybindings: Vec<UserKeyBinding>,
     /// Named terminal setups for `terminal.newTabWithProfile`. Ignored in
     /// the workspace layer, like `terminal.shell`.
     pub profiles: Vec<TerminalProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct EditorConfig {
+    /// Columns per tab stop; also the width of a soft tab.
+    pub tab_size: usize,
+    /// Insert `\t` instead of spaces on Tab.
+    pub indent_with_tabs: bool,
+    pub line_numbers: bool,
+}
+
+impl Default for EditorConfig {
+    fn default() -> Self {
+        Self {
+            tab_size: 4,
+            indent_with_tabs: false,
+            line_numbers: true,
+        }
+    }
 }
 
 /// A way to start a terminal: program, arguments, directory, environment.
@@ -342,6 +363,7 @@ impl Config {
         self.font.size = self.font.size.clamp(4.0, 200.0);
         self.font.line_height = self.font.line_height.clamp(0.8, 4.0);
         self.terminal.padding = self.terminal.padding.clamp(0.0, 200.0);
+        self.editor.tab_size = self.editor.tab_size.clamp(1, 16);
         self.colors.selection_opacity = self
             .colors
             .selection_opacity

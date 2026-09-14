@@ -9,11 +9,13 @@
 
 pub mod file;
 pub mod journal;
+pub mod motion;
 pub mod selection;
 pub mod transaction;
 
 pub use file::{LineEnding, LoadedFile};
 pub use journal::Journal;
+pub use motion::{Cursor, Motion};
 pub use selection::{Position, Selection, Selections};
 pub use transaction::{Edit, Transaction};
 

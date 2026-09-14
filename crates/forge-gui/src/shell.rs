@@ -41,10 +41,22 @@ pub enum ShellCommand {
     ZoomPane,
     Unsplit,
     NewTabWithProfile,
+    OpenFile,
+    NewFile,
+    SaveFile,
+    EditorUndo,
+    EditorRedo,
+    EditorSelectAll,
+    EditorCopy,
+    EditorCut,
+    EditorPaste,
+    EditorSelectNextMatch,
+    EditorAddCursorAbove,
+    EditorAddCursorBelow,
 }
 
 impl ShellCommand {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 41] = [
         Self::NewTerminalTab,
         Self::NewTerminalTabInDirectory,
         Self::CloseWindow,
@@ -74,6 +86,18 @@ impl ShellCommand {
         Self::ZoomPane,
         Self::Unsplit,
         Self::NewTabWithProfile,
+        Self::OpenFile,
+        Self::NewFile,
+        Self::SaveFile,
+        Self::EditorUndo,
+        Self::EditorRedo,
+        Self::EditorSelectAll,
+        Self::EditorCopy,
+        Self::EditorCut,
+        Self::EditorPaste,
+        Self::EditorSelectNextMatch,
+        Self::EditorAddCursorAbove,
+        Self::EditorAddCursorBelow,
     ];
 
     #[must_use]
@@ -108,6 +132,18 @@ impl ShellCommand {
             Self::ZoomPane => "layout.zoomPane",
             Self::Unsplit => "layout.unsplit",
             Self::NewTabWithProfile => "terminal.newTabWithProfile",
+            Self::OpenFile => "editor.open",
+            Self::NewFile => "editor.new",
+            Self::SaveFile => "editor.save",
+            Self::EditorUndo => "editor.undo",
+            Self::EditorRedo => "editor.redo",
+            Self::EditorSelectAll => "editor.selectAll",
+            Self::EditorCopy => "editor.copy",
+            Self::EditorCut => "editor.cut",
+            Self::EditorPaste => "editor.paste",
+            Self::EditorSelectNextMatch => "editor.selectNextMatch",
+            Self::EditorAddCursorAbove => "editor.addCursorAbove",
+            Self::EditorAddCursorBelow => "editor.addCursorBelow",
         }
     }
 
@@ -143,6 +179,18 @@ impl ShellCommand {
             Self::ZoomPane => "Toggle pane zoom (show only the active pane)",
             Self::Unsplit => "Unsplit: keep every terminal as a plain tab",
             Self::NewTabWithProfile => "New terminal tab with profile…",
+            Self::OpenFile => "Open file…",
+            Self::NewFile => "New file",
+            Self::SaveFile => "Save file",
+            Self::EditorUndo => "Undo",
+            Self::EditorRedo => "Redo",
+            Self::EditorSelectAll => "Select all",
+            Self::EditorCopy => "Copy",
+            Self::EditorCut => "Cut",
+            Self::EditorPaste => "Paste",
+            Self::EditorSelectNextMatch => "Add next occurrence to selection",
+            Self::EditorAddCursorAbove => "Add cursor above",
+            Self::EditorAddCursorBelow => "Add cursor below",
         }
     }
 
@@ -208,6 +256,7 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<usize> {
 pub enum ShellContext {
     Window,
     Terminal,
+    Editor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -675,6 +724,10 @@ pub struct WindowSession {
     /// User-given tab names (`terminal.renameTab`), parallel to `sessions`.
     #[serde(default)]
     pub titles: Vec<Option<String>>,
+    /// File open in each editor tab (`None` for terminals), parallel to
+    /// `sessions`.
+    #[serde(default)]
+    pub files: Vec<Option<std::path::PathBuf>>,
     /// Font zoom steps applied on top of `font.size`.
     #[serde(default)]
     pub zoom: i8,
@@ -753,7 +806,10 @@ impl WindowSession {
         if !(self.width.is_finite() && self.height.is_finite()) {
             return Err("window size is not finite".into());
         }
-        if self.sessions.len() > self.count || self.titles.len() > self.count {
+        if self.sessions.len() > self.count
+            || self.titles.len() > self.count
+            || self.files.len() > self.count
+        {
             return Err("more daemon sessions than tabs".into());
         }
         Ok(())
@@ -763,6 +819,12 @@ impl WindowSession {
     #[must_use]
     pub fn title(&self, index: usize) -> Option<&str> {
         self.titles.get(index).and_then(Option::as_deref)
+    }
+
+    /// File of editor tab `index`, if the file recorded one.
+    #[must_use]
+    pub fn file(&self, index: usize) -> Option<&Path> {
+        self.files.get(index).and_then(|file| file.as_deref())
     }
 
     /// Daemon session for tab `index`, if the file recorded one.
@@ -1016,6 +1078,7 @@ mod tests {
             daemon_instance: Some(42),
             titles: vec![None, Some("build".into())],
             zoom: 2,
+            files: vec![None, Some("/tmp/x.rs".into())],
         };
         session.save(&path).unwrap();
         assert_eq!(WindowSession::load(&path).unwrap(), Some(session.clone()));
@@ -1039,6 +1102,7 @@ mod tests {
         assert_eq!(session.daemon_session(5), None);
         assert_eq!(session.title(1), Some("build"));
         assert_eq!(session.title(0), None);
+        assert_eq!(session.file(1), Some(Path::new("/tmp/x.rs")));
         let too_many = WindowSession {
             sessions: vec![None; 3],
             ..session

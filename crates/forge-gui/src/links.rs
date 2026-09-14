@@ -127,6 +127,19 @@ fn file_reference(token: &str) -> Option<LinkTarget> {
     })
 }
 
+/// Splits `path:line[:col]` as typed on a command line; a path without a
+/// numeric suffix comes back whole.
+#[must_use]
+pub fn split_file_reference(argument: &str) -> (&str, Option<u32>, Option<u32>) {
+    match file_reference(argument) {
+        Some(LinkTarget::File { path, line, column }) if line.is_some() => {
+            let path_len = path.len();
+            (&argument[..path_len], line, column)
+        }
+        _ => (argument, None, None),
+    }
+}
+
 /// Why a paste deserves a confirmation, if it does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasteRisk {
@@ -204,6 +217,20 @@ mod tests {
         assert_eq!(link_at("Cargo.toml", 0).unwrap().range, 0..10);
         assert_eq!(link_at("12:30", 1), None, "a clock is not a file");
         assert_eq!(link_at("hello", 1), None);
+    }
+
+    #[test]
+    fn command_line_file_references_split_line_and_column() {
+        assert_eq!(
+            split_file_reference("src/main.rs:12:3"),
+            ("src/main.rs", Some(12), Some(3))
+        );
+        assert_eq!(
+            split_file_reference("notes.md:7"),
+            ("notes.md", Some(7), None)
+        );
+        assert_eq!(split_file_reference("plain"), ("plain", None, None));
+        assert_eq!(split_file_reference("dir/a:b"), ("dir/a:b", None, None));
     }
 
     #[test]

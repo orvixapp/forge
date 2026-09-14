@@ -16,6 +16,9 @@
     "ui": {
       "$ref": "#/$defs/UiConfig"
     },
+    "editor": {
+      "$ref": "#/$defs/EditorConfig"
+    },
     "keybindings": {
       "type": "array",
       "items": {
@@ -213,6 +216,28 @@
         "spanish",
         "english"
       ]
+    },
+    "EditorConfig": {
+      "type": "object",
+      "properties": {
+        "tab_size": {
+          "description": "Columns per tab stop; also the width of a soft tab.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 4
+        },
+        "indent_with_tabs": {
+          "description": "Insert `\\t` instead of spaces on Tab.",
+          "type": "boolean",
+          "default": false
+        },
+        "line_numbers": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
     },
     "UserKeyBinding": {
       "description": "User-owned binding declaration, accepted from `config.toml`.",

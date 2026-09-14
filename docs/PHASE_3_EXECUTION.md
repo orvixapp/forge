@@ -31,17 +31,26 @@ sin snippets, sin emulación Vim completa.
 
 ## 3.2 — Vista de editor en la GUI
 
-- [ ] Pestaña de editor (`TabKind::Editor`) junto a las de terminal, en el
-  mismo árbol de paneles; abrir archivo (`Ctrl+O`, `file:line:col` desde
-  la terminal, CLI `forge <ruta>`), guardar (`Ctrl+S`), cerrar con aviso.
-- [ ] Elemento de pintura directa (mismo enfoque que el grid): líneas
-  visibles ± 1 pantalla, gutter con números, cursores y selecciones,
-  scroll con rueda/teclado, wrap opcional.
-- [ ] Edición básica: tecleo, IME, Backspace/Delete, Enter con indentación
-  heredada, Tab, movimiento por chars/palabras/líneas/página, selección
-  con Shift y ratón, copiar/cortar/pegar, undo/redo, multi-cursor
-  (`Ctrl+Alt+↑/↓`, `Ctrl+D` siguiente coincidencia).
-- [ ] Journal activo para buffers sucios + «Recuperar N archivos» al abrir.
+- [x] `Tab { content: Terminal | Editor }` en el mismo árbol de paneles y
+  la misma sesión (`files` en `session.json`); abrir con `Ctrl+O`, nuevo
+  con `Ctrl+N`, guardar con `Ctrl+S` (guardar como para sin título), CLI
+  `forge-gui ruta[:línea[:col]]`, `Ctrl+clic` en `ruta:línea` desde la
+  terminal abre el editor; cerrar una pestaña sucia pregunta
+  (guardar/descartar/cancelar).
+- [x] `EditorElement`: líneas visibles con `shape_line`, gutter con
+  números, cursores y selecciones, barra de scroll, rueda y teclado.
+- [x] Edición: tecleo e IME, Backspace/Delete (y `Ctrl+Backspace` por
+  palabra), Enter con indentación heredada, Tab (espacios o `\t`),
+  movimiento por chars/palabras/líneas/página/documento con selección por
+  `Shift`, ratón (clic, arrastre, doble/triple clic, `Shift`/`Alt`+clic),
+  copiar/cortar/pegar (línea completa con selección vacía), undo/redo,
+  multi-cursor (`Ctrl+Alt+↑/↓`, `Ctrl+D`), `Esc` colapsa.
+- [x] Journal por archivo bajo `<config>/journal/` mientras el buffer
+  está sucio; al abrir un archivo con journal pendiente se reproduce y se
+  avisa («recuperado del journal»).
+- [ ] Wrap opcional, scroll horizontal y resaltado de la línea actual.
+- [ ] «Recuperar N archivos» al arrancar para archivos que no se vuelven a
+  abrir (hoy sólo al abrirlos).
 
 ## 3.3 — Sintaxis (`forge-syntax`)
 

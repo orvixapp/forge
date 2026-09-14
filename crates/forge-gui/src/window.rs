@@ -3,6 +3,7 @@
 
 use crate::{
     chrome,
+    editor::EditorTab,
     grid_element::{CellMetrics, Palette, SearchHighlights, TerminalSurface},
     ipc::{IpcCommand, SessionSpec, UiEvent, spawn_ipc_worker},
     search::{SearchAction, SearchDirection, SearchState, reveal_row},
@@ -20,7 +21,7 @@ use forge_gui::{
 };
 use gpui::{
     App, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle, KeyDownEvent, Modifiers,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point,
     PromptLevel, Render, ScrollDelta, ScrollWheelEvent, Timer, UTF16Selection, Window,
     WindowBounds, WindowDecorations, WindowHandle, WindowOptions, prelude::*, px, size,
 };
@@ -168,14 +169,80 @@ impl WindowFactory {
     }
 }
 
+/// One tab of the window: a terminal or an editor, both addressable by the
+/// pane tree through their index and by events through their id.
+pub struct Tab {
+    pub id: u64,
+    /// Name given by the user (`terminal.renameTab`); wins over everything.
+    pub custom_title: Option<String>,
+    pub content: TabContent,
+}
+
+pub enum TabContent {
+    Terminal(Box<TerminalTab>),
+    Editor(Box<EditorTab>),
+}
+
+impl Tab {
+    pub fn title(&self) -> Cow<'_, str> {
+        if let Some(custom) = &self.custom_title {
+            return Cow::Borrowed(custom);
+        }
+        match &self.content {
+            TabContent::Terminal(terminal) => terminal.title(),
+            TabContent::Editor(editor) => editor.title(),
+        }
+    }
+
+    pub fn status(&self) -> String {
+        match &self.content {
+            TabContent::Terminal(terminal) => terminal.status.clone(),
+            TabContent::Editor(editor) => editor.status(),
+        }
+    }
+
+    pub fn terminal(&self) -> Option<&TerminalTab> {
+        match &self.content {
+            TabContent::Terminal(terminal) => Some(terminal),
+            TabContent::Editor(_) => None,
+        }
+    }
+
+    pub fn terminal_mut(&mut self) -> Option<&mut TerminalTab> {
+        match &mut self.content {
+            TabContent::Terminal(terminal) => Some(terminal),
+            TabContent::Editor(_) => None,
+        }
+    }
+
+    pub fn editor(&self) -> Option<&EditorTab> {
+        match &self.content {
+            TabContent::Editor(editor) => Some(editor),
+            TabContent::Terminal(_) => None,
+        }
+    }
+
+    pub fn editor_mut(&mut self) -> Option<&mut EditorTab> {
+        match &mut self.content {
+            TabContent::Editor(editor) => Some(editor),
+            TabContent::Terminal(_) => None,
+        }
+    }
+
+    /// Whether a window position lies on the tab's content.
+    fn contains(&self, position: Point<Pixels>) -> bool {
+        match &self.content {
+            TabContent::Terminal(terminal) => terminal.terminal.contains(position),
+            TabContent::Editor(editor) => editor.contains(position),
+        }
+    }
+}
+
 /// A live terminal is owned by exactly one tab, so a background session can
 /// never overwrite the grid the user is looking at.
 pub struct TerminalTab {
-    pub id: u64,
     /// Name shown when the application has not set a title.
     pub default_title: String,
-    /// Name given by the user (`terminal.renameTab`); wins over everything.
-    pub custom_title: Option<String>,
     pub terminal: TerminalSurface,
     pub status: String,
     pub input: async_mpsc::UnboundedSender<IpcCommand>,
@@ -220,9 +287,6 @@ pub enum ConfirmationKind {
 
 impl TerminalTab {
     pub fn title(&self) -> Cow<'_, str> {
-        if let Some(custom) = &self.custom_title {
-            return Cow::Borrowed(custom);
-        }
         if let Some(pwd) = &self.info.pwd {
             return pwd
                 .file_name()
@@ -276,7 +340,7 @@ pub struct Picker {
 }
 
 pub struct ForgeWindow {
-    pub tabs: Vec<TerminalTab>,
+    pub tabs: Vec<Tab>,
     pub active_tab: usize,
     next_tab_id: u64,
     event_tx: Sender<UiEvent>,
@@ -449,7 +513,7 @@ impl ForgeWindow {
         self.theme = theme;
         self.theme_name = name;
         let palette = Palette::from(&theme);
-        for tab in &mut self.tabs {
+        for tab in self.tabs.iter_mut().filter_map(Tab::terminal_mut) {
             tab.terminal.palette = palette;
         }
     }
@@ -492,7 +556,11 @@ impl ForgeWindow {
             width: f32::from(self.factory.window_size.width),
             height: f32::from(self.factory.window_size.height),
             theme: Some(self.theme_name.clone()),
-            sessions: self.tabs.iter().map(|tab| tab.session_id).collect(),
+            sessions: self
+                .tabs
+                .iter()
+                .map(|tab| tab.terminal().and_then(|terminal| terminal.session_id))
+                .collect(),
             daemon_instance: self.daemon_instance,
             titles: self
                 .tabs
@@ -500,6 +568,14 @@ impl ForgeWindow {
                 .map(|tab| tab.custom_title.clone())
                 .collect(),
             zoom: self.zoom,
+            files: self
+                .tabs
+                .iter()
+                .map(|tab| {
+                    tab.editor()
+                        .and_then(|editor| editor.path().map(Path::to_path_buf))
+                })
+                .collect(),
         }
     }
 
@@ -542,13 +618,20 @@ impl ForgeWindow {
             self.factory.cwd = session.cwd.clone();
         }
         for index in 0..session.count {
-            self.open_tab(
-                None,
-                session.daemon_session(index),
-                session.daemon_instance,
-                cx,
-            );
-            self.tabs[index].custom_title = session.title(index).map(str::to_owned);
+            match session.file(index) {
+                Some(path) if path.is_file() => self.open_file(path, None, None, cx),
+                _ => {
+                    self.open_tab(
+                        None,
+                        session.daemon_session(index),
+                        session.daemon_instance,
+                        cx,
+                    );
+                }
+            }
+            if let Some(tab) = self.tabs.get_mut(index) {
+                tab.custom_title = session.title(index).map(str::to_owned);
+            }
         }
         self.active_tab = session.active.min(self.tabs.len().saturating_sub(1));
         self.split = session.split;
@@ -567,28 +650,62 @@ impl ForgeWindow {
 
     // ----- tabs and panes -----------------------------------------------
 
-    pub fn active_tab(&self) -> &TerminalTab {
+    pub fn active_tab(&self) -> &Tab {
         &self.tabs[self.active_tab]
     }
 
-    pub fn active_tab_mut(&mut self) -> &mut TerminalTab {
+    pub fn active_tab_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active_tab]
     }
 
-    fn tab_mut(&mut self, id: u64) -> Option<&mut TerminalTab> {
+    /// The active tab's terminal, if it is one.
+    pub fn active_terminal(&self) -> Option<&TerminalTab> {
+        self.active_tab().terminal()
+    }
+
+    pub fn active_terminal_mut(&mut self) -> Option<&mut TerminalTab> {
+        self.active_tab_mut().terminal_mut()
+    }
+
+    pub(crate) fn tab_mut(&mut self, id: u64) -> Option<&mut Tab> {
         self.tabs.iter_mut().find(|tab| tab.id == id)
+    }
+
+    fn terminal_mut(&mut self, id: u64) -> Option<&mut TerminalTab> {
+        self.tab_mut(id).and_then(Tab::terminal_mut)
     }
 
     /// Surface of pane `index`, called from the grid element's paint with the
     /// area it fills; the PTY is resized when that area changes.
+    ///
+    /// # Panics
+    ///
+    /// If pane `index` is not a terminal; the chrome only builds grid
+    /// elements for terminal tabs.
     pub fn pane_surface(&mut self, index: usize, bounds: Bounds<Pixels>) -> &mut TerminalSurface {
         let (cols, rows) = crate::grid_dimensions(bounds.size, self.factory.metrics, 0.0);
-        let tab = &mut self.tabs[index];
+        let tab = self.tabs[index]
+            .terminal_mut()
+            .expect("grid element painted for a terminal tab");
         if tab.viewport != Some((cols, rows)) {
             tab.viewport = Some((cols, rows));
             let _ = tab.input.send(IpcCommand::Resize { cols, rows });
         }
         &mut tab.terminal
+    }
+
+    /// Appends a tab and makes it active.
+    pub fn push_tab(&mut self, content: TabContent, cx: &mut Context<Self>) -> usize {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.push(Tab {
+            id,
+            custom_title: None,
+            content,
+        });
+        self.active_tab = self.tabs.len() - 1;
+        cx.notify();
+        self.active_tab
     }
 
     /// Creates a tab (and its daemon session) and makes it active. Without an
@@ -623,11 +740,11 @@ impl ForgeWindow {
         let cwd = cwd.or_else(|| {
             self.tabs
                 .get(self.active_tab)
+                .and_then(Tab::terminal)
                 .and_then(|tab| tab.info.pwd.clone())
                 .filter(|path| path.is_dir())
         });
         let id = self.next_tab_id;
-        self.next_tab_id += 1;
         let (input, input_rx) = async_mpsc::unbounded_channel();
         let title = profile.map_or_else(
             || {
@@ -644,10 +761,8 @@ impl ForgeWindow {
             self.factory.metrics,
             chrome_height,
         );
-        self.tabs.push(TerminalTab {
-            id,
+        let terminal = TerminalTab {
             default_title: title,
-            custom_title: None,
             terminal: TerminalSurface::new(
                 TerminalGrid::new(initial_cols, initial_rows),
                 self.factory.metrics,
@@ -664,8 +779,8 @@ impl ForgeWindow {
             clipboard_allowed: false,
             drag_anchor: None,
             viewport: None,
-        });
-        self.active_tab = self.tabs.len() - 1;
+        };
+        self.push_tab(TabContent::Terminal(Box::new(terminal)), cx);
         if self.factory.start_ipc {
             let cwd = cwd.unwrap_or_else(|| self.factory.cwd.clone());
             spawn_ipc_worker(
@@ -689,6 +804,53 @@ impl ForgeWindow {
         }
     }
 
+    /// Closes a tab, asking first when it is an editor with unsaved changes.
+    pub fn request_close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let dirty = self
+            .tabs
+            .get(index)
+            .and_then(Tab::editor)
+            .is_some_and(|editor| editor.buffer.is_dirty());
+        if !dirty {
+            self.close_tab(index, cx);
+            return;
+        }
+        let tab_id = self.tabs[index].id;
+        let title = self.tabs[index].title().into_owned();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("¿Cerrar «{title}» sin guardar?"),
+            Some(
+                "Los cambios se perderán; el journal conserva una copia hasta el próximo guardado.",
+            ),
+            &["Guardar y cerrar", "Descartar", "Cancelar"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            let choice = answer.await.unwrap_or(2);
+            if choice == 2 {
+                return;
+            }
+            let _ = this.update(cx, |view, cx| {
+                let Some(index) = view.tabs.iter().position(|tab| tab.id == tab_id) else {
+                    return;
+                };
+                if choice == 0 {
+                    view.activate_tab(index, cx);
+                    view.save_active(cx);
+                    let still_dirty = view.tabs[index]
+                        .editor()
+                        .is_some_and(|editor| editor.buffer.is_dirty());
+                    if still_dirty {
+                        return;
+                    }
+                }
+                view.close_tab(index, cx);
+            });
+        })
+        .detach();
+    }
+
     pub fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if self.tabs.len() <= 1 || index >= self.tabs.len() {
             return;
@@ -696,7 +858,9 @@ impl ForgeWindow {
         // Closing a tab ends its shell; sessions only survive when the
         // window itself goes away.
         let closed = self.tabs.remove(index);
-        let _ = closed.input.send(IpcCommand::Shutdown);
+        if let Some(terminal) = closed.terminal() {
+            let _ = terminal.input.send(IpcCommand::Shutdown);
+        }
         self.active_tab = if self.active_tab > index {
             self.active_tab - 1
         } else {
@@ -721,7 +885,7 @@ impl ForgeWindow {
     fn close_search(&mut self, cx: &mut Context<Self>) {
         self.search.open = false;
         self.search.clear_results();
-        for tab in &mut self.tabs {
+        for tab in self.tabs.iter_mut().filter_map(Tab::terminal_mut) {
             tab.terminal.search = SearchHighlights::default();
         }
         cx.notify();
@@ -731,7 +895,7 @@ impl ForgeWindow {
     fn retarget_search(&mut self) {
         let active = self.active_tab().id;
         if self.search.tab_id != Some(active) {
-            for tab in &mut self.tabs {
+            for tab in self.tabs.iter_mut().filter_map(Tab::terminal_mut) {
                 tab.terminal.search = SearchHighlights::default();
             }
             self.search.tab_id = Some(active);
@@ -745,7 +909,7 @@ impl ForgeWindow {
         let request = self.search.begin_request();
         let query = self.search.query.clone();
         let options = self.search.options;
-        let Some(tab) = self.search.tab_id.and_then(|id| self.tab_mut(id)) else {
+        let Some(tab) = self.search.tab_id.and_then(|id| self.terminal_mut(id)) else {
             return;
         };
         match request {
@@ -804,7 +968,7 @@ impl ForgeWindow {
 
     fn apply_search_highlights(&mut self) {
         let highlights = self.search.highlights();
-        if let Some(tab) = self.search.tab_id.and_then(|id| self.tab_mut(id)) {
+        if let Some(tab) = self.search.tab_id.and_then(|id| self.terminal_mut(id)) {
             tab.terminal.search = highlights;
         }
     }
@@ -813,7 +977,7 @@ impl ForgeWindow {
         let Some(row) = self.search.current_row() else {
             return;
         };
-        let Some(tab) = self.search.tab_id.and_then(|id| self.tab_mut(id)) else {
+        let Some(tab) = self.search.tab_id.and_then(|id| self.terminal_mut(id)) else {
             return;
         };
         if let Some(top) = reveal_row(row, tab.terminal.grid.viewport()) {
@@ -935,7 +1099,7 @@ impl ForgeWindow {
         config.font.size = (config.font.size * zoom_factor(self.zoom)).clamp(4.0, 200.0);
         let metrics = crate::cell_metrics_for(&config, cx);
         self.factory.metrics = metrics;
-        for tab in &mut self.tabs {
+        for tab in self.tabs.iter_mut().filter_map(Tab::terminal_mut) {
             tab.terminal.metrics = metrics;
             tab.viewport = None;
         }
@@ -1031,7 +1195,7 @@ impl ForgeWindow {
                 tab_id,
                 message: ServerMessage::Error { message },
             } => {
-                if let Some(tab) = self.tab_mut(tab_id) {
+                if let Some(tab) = self.terminal_mut(tab_id) {
                     tab.status = format!("Error del daemon: {message}");
                 }
             }
@@ -1047,7 +1211,7 @@ impl ForgeWindow {
                         ..
                     },
             } => {
-                if let Some(tab) = self.tab_mut(tab_id) {
+                if let Some(tab) = self.terminal_mut(tab_id) {
                     tab.info = SessionInfo {
                         title,
                         pwd: pwd.map(PathBuf::from),
@@ -1079,7 +1243,7 @@ impl ForgeWindow {
             } => self.on_search_results(tab_id, request_id, matches, error),
             UiEvent::Message { tab_id, message } => self.apply_screen_message(tab_id, message),
             UiEvent::Status { tab_id, status } => {
-                if let Some(tab) = self.tab_mut(tab_id) {
+                if let Some(tab) = self.terminal_mut(tab_id) {
                     tab.status = status;
                 }
             }
@@ -1089,7 +1253,7 @@ impl ForgeWindow {
                 daemon_instance,
             } => {
                 self.daemon_instance = Some(daemon_instance);
-                if let Some(tab) = self.tab_mut(tab_id) {
+                if let Some(tab) = self.terminal_mut(tab_id) {
                     tab.session_id = Some(session_id);
                 }
                 self.save_session();
@@ -1100,7 +1264,7 @@ impl ForgeWindow {
     /// Applies a screen patch (or ignores an unrelated message) and keeps
     /// selection and search highlights consistent with the new rows.
     fn apply_screen_message(&mut self, tab_id: u64, message: ServerMessage) {
-        let Some(tab) = self.tab_mut(tab_id) else {
+        let Some(tab) = self.terminal_mut(tab_id) else {
             return;
         };
         if let ServerMessage::ScreenPatch {
@@ -1175,8 +1339,22 @@ impl ForgeWindow {
             modifiers.alt,
             modifiers.shift,
         );
-        if let Some(command) = self.keymap.resolve(&shell_key, ShellContext::Terminal) {
+        let context = if self.active_tab().editor().is_some() {
+            ShellContext::Editor
+        } else {
+            ShellContext::Terminal
+        };
+        if let Some(command) = self.keymap.resolve(&shell_key, context) {
             self.run_shell_command(command, window, cx);
+            return;
+        }
+        if context == ShellContext::Editor {
+            self.editor_key(
+                keystroke.key.as_str(),
+                keystroke.key_char.as_deref(),
+                modifiers,
+                cx,
+            );
             return;
         }
         let copy_paste = modifiers.control && modifiers.shift && !modifiers.alt;
@@ -1225,8 +1403,9 @@ impl ForgeWindow {
             },
         );
         // Bare modifiers reach the daemon too: the Kitty protocol reports them.
-        if event.key != TerminalKey::Unidentified || event.text.is_some() {
-            let tab = self.active_tab_mut();
+        if (event.key != TerminalKey::Unidentified || event.text.is_some())
+            && let Some(tab) = self.active_terminal_mut()
+        {
             tab.terminal.selection = None;
             let _ = tab.input.send(IpcCommand::Key(event));
             cx.notify();
@@ -1261,34 +1440,45 @@ impl ForgeWindow {
 
     /// Rows scrolled by Shift+PageUp/PageDown: one screen minus a line.
     fn page_rows(&self) -> i64 {
-        let (_, rows) = self.active_tab().terminal.grid.dimensions();
+        let rows = self
+            .active_terminal()
+            .map_or(24, |tab| tab.terminal.grid.dimensions().1);
         i64::from(rows.saturating_sub(1).max(1))
     }
 
     fn scroll_active(&mut self, scroll: ScrollRequest) {
-        let _ = self.active_tab().input.send(IpcCommand::Scroll(scroll));
+        if let Some(tab) = self.active_terminal() {
+            let _ = tab.input.send(IpcCommand::Scroll(scroll));
+        }
     }
 
     /// Mouse wheel: the application gets it while it tracks the mouse;
     /// otherwise it moves the viewport over the scrollback.
-    pub fn on_scroll_wheel(&mut self, event: &ScrollWheelEvent, _cx: &mut Context<Self>) {
+    pub fn on_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
         let Some(index) = self
             .tabs
             .iter()
-            .position(|tab| tab.terminal.contains(event.position))
+            .position(|tab| tab.contains(event.position))
         else {
             return;
         };
-        let tab = &self.tabs[index];
         let lines = match event.delta {
             ScrollDelta::Lines(delta) => delta.y,
-            ScrollDelta::Pixels(delta) => f32::from(delta.y) / tab.terminal.metrics.height,
+            ScrollDelta::Pixels(delta) => f32::from(delta.y) / self.factory.metrics.height,
         };
         #[allow(clippy::cast_possible_truncation)]
         let rows = lines.round() as i64;
         if rows == 0 {
             return;
         }
+        if let Some(editor) = self.tabs[index].editor_mut() {
+            editor.scroll_by(-isize::try_from(rows).unwrap_or(0));
+            cx.notify();
+            return;
+        }
+        let Some(tab) = self.tabs[index].terminal() else {
+            return;
+        };
         if tab.app_wants_mouse(event.modifiers) {
             let Some(cell) = tab.terminal.cell_at(event.position) else {
                 return;
@@ -1372,7 +1562,7 @@ impl ForgeWindow {
             }
             ShellCommand::NewTerminalTabInDirectory => Self::prompt_for_directory(cx),
             ShellCommand::CloseWindow if self.tabs.len() > 1 => {
-                self.close_tab(self.active_tab, cx);
+                self.request_close_tab(self.active_tab, window, cx);
             }
             ShellCommand::CloseWindow => Self::confirm_close_window(window, cx),
             ShellCommand::ToggleMaximize => window.zoom_window(),
@@ -1410,20 +1600,26 @@ impl ForgeWindow {
             ShellCommand::SearchNext => self.search_step(SearchDirection::Older, cx),
             ShellCommand::SearchPrevious => self.search_step(SearchDirection::Newer, cx),
             ShellCommand::PreviousPrompt => {
-                let _ = self
-                    .active_tab()
-                    .input
-                    .send(IpcCommand::ScrollToPrompt(PromptDirection::Previous));
+                self.send_to_terminal(IpcCommand::ScrollToPrompt(PromptDirection::Previous));
             }
             ShellCommand::NextPrompt => {
-                let _ = self
-                    .active_tab()
-                    .input
-                    .send(IpcCommand::ScrollToPrompt(PromptDirection::Next));
+                self.send_to_terminal(IpcCommand::ScrollToPrompt(PromptDirection::Next));
             }
             ShellCommand::SignalInterrupt => self.signal(ProcessSignal::Interrupt),
             ShellCommand::SignalTerminate => self.signal(ProcessSignal::Terminate),
             ShellCommand::SignalKill => self.signal(ProcessSignal::Kill),
+            ShellCommand::OpenFile => Self::prompt_open_file(cx),
+            ShellCommand::NewFile => self.new_editor_tab(cx),
+            ShellCommand::SaveFile => self.save_active(cx),
+            ShellCommand::EditorUndo => self.editor_undo(false, cx),
+            ShellCommand::EditorRedo => self.editor_undo(true, cx),
+            ShellCommand::EditorSelectAll => self.editor_select_all(cx),
+            ShellCommand::EditorCopy => self.editor_copy(false, cx),
+            ShellCommand::EditorCut => self.editor_copy(true, cx),
+            ShellCommand::EditorPaste => self.editor_paste(cx),
+            ShellCommand::EditorSelectNextMatch => self.editor_select_next_match(cx),
+            ShellCommand::EditorAddCursorAbove => self.editor_add_cursor(false, cx),
+            ShellCommand::EditorAddCursorBelow => self.editor_add_cursor(true, cx),
             other => self.run_layout_command(other, cx),
         }
     }
@@ -1495,7 +1691,10 @@ impl ForgeWindow {
     /// Signals the process group behind the active tab, for programs that
     /// swallowed Ctrl+C or hung.
     fn signal(&mut self, signal: ProcessSignal) {
-        let _ = self.active_tab().input.send(IpcCommand::Signal(signal));
+        if self.active_terminal().is_none() {
+            return;
+        }
+        self.send_to_terminal(IpcCommand::Signal(signal));
         self.notify_user(
             NotificationLevel::Info,
             format!("Señal enviada: {signal:?}"),
@@ -1522,7 +1721,7 @@ impl ForgeWindow {
                     target,
                     text,
                 } => {
-                    if always && let Some(tab) = self.tab_mut(tab_id) {
+                    if always && let Some(tab) = self.terminal_mut(tab_id) {
                         tab.clipboard_allowed = true;
                     }
                     write_clipboard(cx, target, text);
@@ -1547,6 +1746,7 @@ impl ForgeWindow {
             .tabs
             .iter()
             .find(|tab| tab.id == tab_id)
+            .and_then(Tab::terminal)
             .is_some_and(|tab| tab.clipboard_allowed);
         match policy {
             ClipboardPolicy::Deny => {
@@ -1581,12 +1781,19 @@ impl ForgeWindow {
         cx.notify();
     }
 
+    /// Sends a command to the active terminal; editors ignore it.
+    fn send_to_terminal(&self, command: IpcCommand) {
+        if let Some(tab) = self.active_terminal() {
+            let _ = tab.input.send(command);
+        }
+    }
+
     // ----- links --------------------------------------------------------
 
     /// What lies under `cell` in the active tab: an OSC 8 hyperlink, else a
     /// URL or `path:line` recognised in the row text.
     fn link_at(&self, cell: CellPos) -> Option<(Range<u16>, LinkTarget)> {
-        let grid = &self.active_tab().terminal.grid;
+        let grid = &self.active_terminal()?.terminal.grid;
         if let Some(uri) = grid.cell(cell.x, cell.y).and_then(|c| c.hyperlink.clone()) {
             let row = grid.row(cell.y)?;
             let same = |x: u16| row[usize::from(x)].hyperlink.as_deref() == Some(uri.as_str());
@@ -1611,10 +1818,8 @@ impl ForgeWindow {
             LinkTarget::Url(url) => cx.open_url(&url),
             LinkTarget::File { path, line, column } => {
                 let base = self
-                    .active_tab()
-                    .info
-                    .pwd
-                    .clone()
+                    .active_terminal()
+                    .and_then(|tab| tab.info.pwd.clone())
                     .unwrap_or_else(|| self.factory.cwd.clone());
                 let expanded = if let Some(rest) = path.strip_prefix("~/") {
                     std::env::var_os("HOME").map_or_else(
@@ -1634,6 +1839,12 @@ impl ForgeWindow {
                         NotificationLevel::Warning,
                         format!("No existe {}", resolved.display()),
                     );
+                    return;
+                }
+                // Files open in Forge's editor unless the user configured an
+                // external opener; directories go to the desktop opener.
+                if resolved.is_file() && self.config.terminal.open_file_command.is_empty() {
+                    self.open_file(&resolved, line, column, cx);
                     return;
                 }
                 let (program, args) = open_file_command(
@@ -1693,7 +1904,7 @@ impl ForgeWindow {
     // ----- clipboard and mouse selection --------------------------------
 
     fn selected_text(&self) -> Option<String> {
-        let terminal = &self.active_tab().terminal;
+        let terminal = &self.active_terminal()?.terminal;
         let text = terminal.grid.selected_text(terminal.selection?);
         (!text.is_empty()).then_some(text)
     }
@@ -1711,7 +1922,9 @@ impl ForgeWindow {
         let Some(text) = item.and_then(|item| item.text()) else {
             return;
         };
-        let bracketed = self.active_tab().info.bracketed_paste;
+        let Some(bracketed) = self.active_terminal().map(|tab| tab.info.bracketed_paste) else {
+            return;
+        };
         match links::paste_risk(&text, bracketed) {
             None => self.send_paste(text),
             Some(risk) => {
@@ -1732,22 +1945,38 @@ impl ForgeWindow {
     }
 
     fn send_paste(&self, text: String) {
-        let _ = self.active_tab().input.send(IpcCommand::Paste(text));
+        self.send_to_terminal(IpcCommand::Paste(text));
     }
 
-    pub fn on_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+    pub fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(index) = self
             .tabs
             .iter()
-            .position(|tab| tab.terminal.contains(event.position))
+            .position(|tab| tab.contains(event.position))
         else {
             return;
         };
         self.activate_tab(index, cx);
-        let Some(cell) = self.active_tab().terminal.cell_at(event.position) else {
+        if self.active_tab().editor().is_some() {
+            if event.button == MouseButton::Left {
+                self.editor_mouse_down(event, window, cx);
+            }
+            return;
+        }
+        let Some(cell) = self
+            .active_terminal()
+            .and_then(|tab| tab.terminal.cell_at(event.position))
+        else {
             return;
         };
-        let tab = self.active_tab_mut();
+        let Some(tab) = self.active_terminal_mut() else {
+            return;
+        };
         if tab.app_wants_mouse(event.modifiers) {
             tab.drag_anchor = None;
             let _ = tab.input.send(IpcCommand::Mouse(MouseEvent {
@@ -1778,8 +2007,21 @@ impl ForgeWindow {
         cx.notify();
     }
 
-    pub fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        let tab = self.active_tab();
+    pub fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_tab().editor().is_some() {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.editor_mouse_drag(event.position, window, cx);
+            }
+            return;
+        }
+        let Some(tab) = self.active_terminal() else {
+            return;
+        };
         if tab.app_wants_mouse(event.modifiers) && tab.terminal.contains(event.position) {
             if let Some(cell) = tab.terminal.cell_at(event.position) {
                 let _ = tab.input.send(IpcCommand::Mouse(MouseEvent {
@@ -1794,37 +2036,47 @@ impl ForgeWindow {
         }
         // Ctrl+hover underlines what a Ctrl+click would open.
         let hover = if event.modifiers.control && event.pressed_button.is_none() {
-            self.active_tab()
-                .terminal
+            tab.terminal
                 .cell_at(event.position)
-                .filter(|_| self.active_tab().terminal.contains(event.position))
+                .filter(|_| tab.terminal.contains(event.position))
                 .and_then(|cell| self.link_at(cell).map(|(range, _)| (cell.y, range)))
         } else {
             None
         };
-        if self.active_tab().terminal.hover_link != hover {
-            self.active_tab_mut().terminal.hover_link = hover;
+        let anchor = tab.drag_anchor;
+        let head = tab.terminal.cell_at(event.position);
+        let Some(tab) = self.active_terminal_mut() else {
+            return;
+        };
+        if tab.terminal.hover_link != hover {
+            tab.terminal.hover_link = hover;
             cx.notify();
         }
-        let Some(anchor) = self.active_tab().drag_anchor else {
+        let Some(anchor) = anchor else {
             return;
         };
         if event.pressed_button != Some(MouseButton::Left) {
-            self.active_tab_mut().drag_anchor = None;
+            tab.drag_anchor = None;
             return;
         }
-        let Some(head) = self.active_tab().terminal.cell_at(event.position) else {
+        let Some(head) = head else {
             return;
         };
         let selection = Some(Selection { anchor, head });
-        if self.active_tab().terminal.selection != selection {
-            self.active_tab_mut().terminal.selection = selection;
+        if tab.terminal.selection != selection {
+            tab.terminal.selection = selection;
             cx.notify();
         }
     }
 
     pub fn on_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
-        let tab = self.active_tab();
+        if self.active_tab().editor().is_some() {
+            self.editor_mouse_up();
+            return;
+        }
+        let Some(tab) = self.active_terminal() else {
+            return;
+        };
         if tab.app_wants_mouse(event.modifiers) && tab.drag_anchor.is_none() {
             if let Some(cell) = tab.terminal.cell_at(event.position) {
                 let _ = tab.input.send(IpcCommand::Mouse(MouseEvent {
@@ -1837,7 +2089,11 @@ impl ForgeWindow {
             }
             return;
         }
-        if self.active_tab_mut().drag_anchor.take().is_none() {
+        if self
+            .active_terminal_mut()
+            .and_then(|tab| tab.drag_anchor.take())
+            .is_none()
+        {
             return;
         }
         // Linux convention: a finished selection is available on middle click.
@@ -1941,8 +2197,17 @@ impl EntityInputHandler for ForgeWindow {
         cx: &mut Context<Self>,
     ) {
         let had_preedit = self.marked_text.take().is_some();
-        if !text.is_empty() {
-            let tab = self.active_tab_mut();
+        if text.is_empty() {
+            if had_preedit {
+                cx.notify();
+            }
+            return;
+        }
+        if self.active_tab().editor().is_some() {
+            self.editor_insert_text(text, cx);
+            return;
+        }
+        if let Some(tab) = self.active_terminal_mut() {
             tab.terminal.selection = None;
             let _ = tab.input.send(IpcCommand::Key(key_event(
                 "",
@@ -1950,8 +2215,6 @@ impl EntityInputHandler for ForgeWindow {
                 KeyMods::default(),
                 KeyAction::Press,
             )));
-            cx.notify();
-        } else if had_preedit {
             cx.notify();
         }
     }
@@ -1975,10 +2238,13 @@ impl EntityInputHandler for ForgeWindow {
         &mut self,
         _range_utf16: Range<usize>,
         _element_bounds: Bounds<Pixels>,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        self.active_tab().terminal.cursor_bounds()
+        match &self.active_tab().content {
+            TabContent::Terminal(terminal) => terminal.terminal.cursor_bounds(),
+            TabContent::Editor(_) => self.editor_cursor_bounds(window),
+        }
     }
 
     fn character_index_for_point(
