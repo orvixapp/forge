@@ -71,12 +71,42 @@ y [`2026-09-13-flood-input.md`](../bench/results/2026-09-13-flood-input.md).
 - [x] Prueba de integración `search_finds_scrollback_rows_and_reports_bad_patterns`:
   la fila de la coincidencia coincide con el espacio de filas del viewport.
 
+## 2.5 — OSC e integración de shell
+
+- [x] OSC 7: `SessionInfo.pwd` (ya existía); las pestañas nuevas heredan el
+  directorio y el título muestra su nombre.
+- [x] OSC 8: cada `ScreenCell` transporta el URI (`hyperlink`), leído del
+  render state sólo en filas que Ghostty marca con hipervínculos;
+  `Ctrl+hover` subraya y `Ctrl+clic` abre en el navegador.
+- [x] Detección de URLs y `ruta:línea:columna` en el texto (`links.rs`):
+  se resuelven contra el cwd de la pestaña y se abren con
+  `terminal.open_file_command` (plantilla `{file}`/`{line}`/`{column}`) o el
+  abridor del escritorio; la Fase 3 los redirigirá al editor.
+- [x] OSC 52 (y OSC 1337/5522 normalizados por Ghostty): el daemon acepta
+  la escritura y la reenvía como `ClipboardWrite`; la GUI aplica
+  `terminal.clipboard_write` (`ask` con diálogo y «permitir en esta
+  pestaña», `allow`, `deny`). Las lecturas de portapapeles no se atienden.
+- [x] OSC 133: `ScreenRow.prompt` desde el `semantic_prompt` de Ghostty,
+  marca en el margen izquierdo de cada fila de prompt y navegación
+  `terminal.previousPrompt`/`nextPrompt` (`ScrollToPrompt` en el daemon,
+  escaneo acotado a 20.000 filas).
+- [x] Scripts de integración para bash (`--rcfile` que carga los rc del
+  usuario), zsh (`ZDOTDIR` puente que restaura el original) y fish
+  (`vendor_conf.d` vía `XDG_DATA_DIRS`), inyectados sólo sin `terminal.args`
+  y con `terminal.shell_integration = true`; `TERM_PROGRAM=forge`.
+- [x] Protección de pegado: varias líneas sin bracketed paste o la
+  secuencia `ESC [201~` piden confirmación (regla de `ghostty_paste_is_safe`
+  consciente del modo 2004, que viaja en `SessionInfo.bracketed_paste`).
+- [x] Prueba de integración `osc_marks_hyperlinks_and_clipboard_cross_the_daemon_boundary`.
+- [ ] Copiar la salida del último comando: Ghostty no expone los límites C/D
+  por fila en la C API; queda para cuando lo haga (o se reconstruya desde
+  las marcas A).
+
 ## Resto de Fase 2
 
 - [ ] Comparación Ghostty/Alacritty (`VtEngine` ya desacoplado).
 - [ ] ConPTY y transporte equivalente en Windows.
 - [ ] Renderer completo: atlas, wide chars, emoji, estilos y redraw incremental.
 - [ ] Entrada xterm/Kitty, mouse, selección, copiar/pegar y protección.
-- [ ] OSC 7/8/52/133, integración de shell e hipervínculos `file:line`.
 - [ ] Acciones finales de tabs/splits, renombrado, settings y señales.
 - [ ] Conformance (`vttest`/`esctest`), benchmarks finales y CI verde.

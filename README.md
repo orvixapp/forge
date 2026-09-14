@@ -89,8 +89,11 @@ before closing the last one), `window.toggleMaximize`, `layout.splitVertical`
 (`Ctrl+Tab`), `theme.cycle` (`Ctrl+Shift+T`), `config.reload`,
 `processExplorer.show`, `terminal.search` (`Ctrl+Shift+F`),
 `terminal.searchNext` (`Ctrl+Shift+G`, towards older rows),
-`terminal.searchPrevious` (`Ctrl+Shift+H`). The last window layout, size and
-theme are restored from `session.json` next to the config.
+`terminal.searchPrevious` (`Ctrl+Shift+H`), `terminal.previousPrompt` /
+`terminal.nextPrompt` (`Ctrl+Shift+Up`/`Down`, need shell integration),
+`terminal.signal.interrupt` / `terminate` / `kill` (palette only). The last
+window layout, size and theme are restored from `session.json` next to the
+config.
 
 Search: the bar searches the whole scrollback in `forge-termd` (literal and
 case-insensitive by default; `Alt+R` regex, `Alt+C` case), highlights every
@@ -102,6 +105,21 @@ finished selection lands on the Linux primary buffer (middle click).
 Keys: `Ctrl+Shift+C` copies, `Ctrl+Shift+V` pastes the clipboard,
 `Shift+Insert` pastes the primary buffer. Typing clears the selection. A shell
 that exits closes its tab; the last one closes the window.
+
+Shell integration: bash, zsh and fish started by Forge (without custom
+`terminal.args`) load `assets/shell-integration/` automatically
+(`terminal.shell_integration = false` disables it; `$FORGE_SHELL_INTEGRATION`
+points elsewhere). It emits OSC 133 prompt marks (a bar in the left margin of
+every prompt row, prompt navigation) and OSC 7 (new tabs open in the current
+directory). Other shells can `source "$FORGE_SHELL_INTEGRATION/<shell>/…"`.
+
+Links: `Ctrl+hover` underlines OSC 8 hyperlinks, URLs and `path:line:col`
+references; `Ctrl+click` opens them — URLs in the browser, files with
+`terminal.open_file_command` (e.g. `["code", "-g", "{file}:{line}"]`) or the
+desktop opener. Programs writing the clipboard (OSC 52) are confirmed once
+per tab by default (`terminal.clipboard_write = "ask" | "allow" | "deny"`).
+Pasting several lines into a program without bracketed paste, or text that
+could escape a bracketed paste, asks first.
 
 Diagnostics: `FORGE_LOG=debug` prints tracing/GPUI logs; `FORGE_TRACE_FILE=trace.json`
 writes a Chrome trace of the startup spans that Perfetto can open.
