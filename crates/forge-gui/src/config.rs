@@ -36,6 +36,9 @@ pub const WORKSPACE_FORBIDDEN_KEYS: &[&[&str]] = &[
     &["terminal", "args"],
     &["profiles"],
     &["agents"],
+    &["providers"],
+    &["router"],
+    &["mcp_servers"],
 ];
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, JsonSchema)]
@@ -54,6 +57,227 @@ pub struct Config {
     /// ACP adapters available to `agent.newSession`. Ignored in workspace
     /// configuration because repositories must not choose executables.
     pub agents: Vec<AgentConfig>,
+    /// Model providers Forge injects into agents (§17.7). User layer only.
+    pub providers: Vec<ProviderConfig>,
+    /// Which provider serves each task class (§17.7).
+    pub router: RouterConfig,
+    /// MCP servers handed to agents in `session/new` (§18). User layer only:
+    /// a repository must not make Forge start executables.
+    pub mcp_servers: Vec<McpServerConfig>,
+}
+
+/// A model provider: how an agent should reach a model, expressed as the
+/// environment the agent's CLI already understands. Keys are never written
+/// in the config: `api_key_env` names the variable that holds one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderConfig {
+    pub name: String,
+    pub kind: ProviderKind,
+    /// Model id passed to the agent (`gpt-5`, `claude-opus-5`, …); empty
+    /// keeps the agent's default.
+    pub model: String,
+    /// OpenAI-compatible or custom endpoint; empty keeps the default.
+    pub base_url: String,
+    /// Environment variable holding the API key; empty relies on the
+    /// agent's own login (Codex with the ChatGPT subscription, Claude Code
+    /// with `claude login`).
+    pub api_key_env: String,
+    /// Whether requests are free of charge (local models, free tiers);
+    /// the router prefers these for `trivial` tasks.
+    pub free: bool,
+    /// Extra environment for this provider, verbatim.
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderKind {
+    #[default]
+    Openai,
+    Anthropic,
+    Google,
+    /// Any server speaking the OpenAI API (Ollama, LM Studio, vLLM…).
+    OpenaiCompatible,
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            kind: ProviderKind::Openai,
+            model: String::new(),
+            base_url: String::new(),
+            api_key_env: String::new(),
+            free: false,
+            env: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// Provider name per task class; an empty entry means "the agent's own
+/// default". `/trivial`, `/normal` or `/deep` at the start of a prompt
+/// picks the class; `default_class` applies otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct RouterConfig {
+    pub trivial: String,
+    pub normal: String,
+    pub deep: String,
+    pub default_class: TaskClass,
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self {
+            trivial: String::new(),
+            normal: String::new(),
+            deep: String::new(),
+            default_class: TaskClass::Normal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskClass {
+    /// Renames, one-liners, questions: cheap/free models are enough.
+    Trivial,
+    #[default]
+    Normal,
+    /// Architecture, debugging across files: the strongest model.
+    Deep,
+}
+
+impl TaskClass {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Trivial => "trivial",
+            Self::Normal => "normal",
+            Self::Deep => "deep",
+        }
+    }
+
+    /// Splits a `/trivial|/normal|/deep` prefix off a prompt.
+    #[must_use]
+    pub fn split_prefix(prompt: &str) -> (Option<Self>, &str) {
+        let trimmed = prompt.trim_start();
+        for (prefix, class) in [
+            ("/trivial", Self::Trivial),
+            ("/normal", Self::Normal),
+            ("/deep", Self::Deep),
+        ] {
+            if let Some(rest) = trimmed.strip_prefix(prefix)
+                && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+            {
+                return (Some(class), rest.trim_start());
+            }
+        }
+        (None, prompt)
+    }
+}
+
+impl RouterConfig {
+    /// Provider name for a class, if configured.
+    #[must_use]
+    pub fn provider_for(&self, class: TaskClass) -> Option<&str> {
+        let name = match class {
+            TaskClass::Trivial => &self.trivial,
+            TaskClass::Normal => &self.normal,
+            TaskClass::Deep => &self.deep,
+        };
+        (!name.is_empty()).then_some(name.as_str())
+    }
+}
+
+/// An MCP server the agent connects to directly (ACP `session/new`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+impl ProviderConfig {
+    /// Environment that points the agent's CLI at this provider: the
+    /// well-known variables of each ecosystem plus `FORGE_PROVIDER_*` for
+    /// adapters that want to read the route explicitly.
+    #[must_use]
+    pub fn environment(&self) -> Vec<(String, String)> {
+        let mut env = vec![
+            ("FORGE_PROVIDER".to_owned(), self.name.clone()),
+            (
+                "FORGE_PROVIDER_KIND".to_owned(),
+                match self.kind {
+                    ProviderKind::Openai => "openai",
+                    ProviderKind::Anthropic => "anthropic",
+                    ProviderKind::Google => "google",
+                    ProviderKind::OpenaiCompatible => "openai-compatible",
+                }
+                .to_owned(),
+            ),
+        ];
+        let key = (!self.api_key_env.is_empty())
+            .then(|| std::env::var(&self.api_key_env).ok())
+            .flatten();
+        let set = |env: &mut Vec<(String, String)>, name: &str, value: &str| {
+            if !value.is_empty() {
+                env.push((name.to_owned(), value.to_owned()));
+            }
+        };
+        if !self.model.is_empty() {
+            env.push(("FORGE_PROVIDER_MODEL".to_owned(), self.model.clone()));
+        }
+        match self.kind {
+            ProviderKind::Openai | ProviderKind::OpenaiCompatible => {
+                set(&mut env, "OPENAI_BASE_URL", &self.base_url);
+                set(&mut env, "OPENAI_MODEL", &self.model);
+                if let Some(key) = &key {
+                    set(&mut env, "OPENAI_API_KEY", key);
+                }
+            }
+            ProviderKind::Anthropic => {
+                set(&mut env, "ANTHROPIC_BASE_URL", &self.base_url);
+                set(&mut env, "ANTHROPIC_MODEL", &self.model);
+                if let Some(key) = &key {
+                    set(&mut env, "ANTHROPIC_API_KEY", key);
+                }
+            }
+            ProviderKind::Google => {
+                set(&mut env, "GOOGLE_GEMINI_BASE_URL", &self.base_url);
+                set(&mut env, "GEMINI_MODEL", &self.model);
+                if let Some(key) = &key {
+                    set(&mut env, "GEMINI_API_KEY", key);
+                }
+            }
+        }
+        env.extend(self.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        env
+    }
+
+    /// Short description for the route line: `openai:gpt-5 (free)`.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let kind = match self.kind {
+            ProviderKind::Openai => "openai",
+            ProviderKind::Anthropic => "anthropic",
+            ProviderKind::Google => "google",
+            ProviderKind::OpenaiCompatible => "openai-compatible",
+        };
+        let model = if self.model.is_empty() {
+            "modelo por defecto"
+        } else {
+            &self.model
+        };
+        format!(
+            "{}: {kind}:{model}{}",
+            self.name,
+            if self.free { " (free)" } else { "" }
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -65,6 +289,12 @@ pub struct AgentConfig {
     pub env: std::collections::BTreeMap<String, String>,
     pub auth_method: Option<String>,
     pub enabled: bool,
+    /// Provider used when the router has nothing for the task class;
+    /// empty keeps the agent's own login/model.
+    pub provider: String,
+    /// Run each session in its own git worktree (`<config>/worktrees/…`)
+    /// so agents never edit the checkout you are working in.
+    pub worktree: bool,
 }
 
 impl Default for AgentConfig {
@@ -76,6 +306,8 @@ impl Default for AgentConfig {
             env: std::collections::BTreeMap::new(),
             auth_method: None,
             enabled: true,
+            provider: String::new(),
+            worktree: false,
         }
     }
 }
@@ -565,6 +797,35 @@ mod tests {
         assert_eq!(config.ui.language, Language::English);
         assert_eq!(config.ui.theme, "forge-light");
         assert_eq!(config.keybindings.len(), 1);
+    }
+
+    #[test]
+    fn task_classes_split_prompt_prefixes_and_route_to_providers() {
+        assert_eq!(
+            TaskClass::split_prefix("/deep why does this leak?"),
+            (Some(TaskClass::Deep), "why does this leak?")
+        );
+        assert_eq!(TaskClass::split_prefix("/deepdive"), (None, "/deepdive"));
+        assert_eq!(TaskClass::split_prefix("hola"), (None, "hola"));
+        let router = RouterConfig {
+            trivial: "local".into(),
+            ..RouterConfig::default()
+        };
+        assert_eq!(router.provider_for(TaskClass::Trivial), Some("local"));
+        assert_eq!(router.provider_for(TaskClass::Deep), None);
+        let provider = ProviderConfig {
+            name: "local".into(),
+            kind: ProviderKind::OpenaiCompatible,
+            model: "qwen".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            free: true,
+            ..ProviderConfig::default()
+        };
+        let env = provider.environment();
+        assert!(env.contains(&("OPENAI_BASE_URL".into(), "http://localhost:11434/v1".into())));
+        assert!(env.contains(&("OPENAI_MODEL".into(), "qwen".into())));
+        assert!(!env.iter().any(|(k, _)| k == "OPENAI_API_KEY"), "no key env, no key");
+        assert_eq!(provider.describe(), "local: openai-compatible:qwen (free)");
     }
 
     #[test]

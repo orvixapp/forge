@@ -12,7 +12,10 @@ use crate::{
 };
 use forge_gui::{
     CellPos, Selection, TerminalGrid,
-    config::{ClipboardPolicy, Config, ConfigSources, TerminalProfile, resolve_font_family},
+    config::{
+        ClipboardPolicy, Config, ConfigSources, ProviderConfig, TerminalProfile,
+        resolve_font_family,
+    },
     key_event,
     links::{self, LinkTarget, PasteRisk},
     shell::{
@@ -365,17 +368,42 @@ pub struct ContextMenu {
     pub index: usize,
 }
 
-/// Single-line text prompt inside the window (tab rename).
+/// Single-line text prompt inside the window (tab rename, agent question).
 pub struct TextPrompt {
     pub title: String,
     pub value: String,
+    pub kind: PromptKind,
 }
 
-/// List picker inside the window (profiles); `index` selects an item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    RenameTab,
+    AskAgent,
+}
+
+/// List picker inside the window; `index` selects an item.
 pub struct Picker {
     pub title: String,
     pub items: Vec<String>,
     pub index: usize,
+    pub kind: PickerKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerKind {
+    /// Terminal profiles (`terminal.newTabWithProfile`).
+    Profile,
+    /// Providers for `agent.forward`.
+    Provider,
+}
+
+/// How an agent session is opened: task class, explicit provider, the
+/// context blocks and an optional prompt to send right away.
+pub struct AgentLaunch {
+    pub class: forge_gui::config::TaskClass,
+    pub provider: Option<String>,
+    pub context: Vec<PromptContext>,
+    pub prompt: Option<String>,
 }
 
 pub struct ForgeWindow {
@@ -402,6 +430,8 @@ pub struct ForgeWindow {
     pub minimap_override: Option<bool>,
     pub rename: Option<TextPrompt>,
     pub picker: Option<Picker>,
+    /// Prompt and context waiting for a provider choice (`agent.forward`).
+    forward_prompt: Option<(String, Vec<PromptContext>)>,
     /// Font zoom steps (each ±10 %) on top of `font.size`.
     pub zoom: i8,
     /// Show only the active pane of the split tree.
@@ -453,6 +483,7 @@ impl ForgeWindow {
             minimap_override: None,
             rename: None,
             picker: None,
+            forward_prompt: None,
             zoom: 0,
             pane_zoom: false,
             process_explorer: false,
@@ -797,6 +828,20 @@ impl ForgeWindow {
 
     fn create_agent_tab(&mut self, cx: &mut Context<Self>) -> usize {
         let context = self.agent_prompt_context();
+        self.create_agent_tab_with(AgentLaunch {
+            class: self.config.router.default_class,
+            provider: None,
+            context,
+            prompt: None,
+        }, cx)
+    }
+
+    /// Opens an agent tab routed to a provider: the explicit one, else the
+    /// router's choice for the task class, else the agent's own. The
+    /// provider's environment is injected into the adapter process, MCP
+    /// servers from the config travel in `session/new`, and the session
+    /// runs in a git worktree when the agent asks for one.
+    fn create_agent_tab_with(&mut self, launch: AgentLaunch, cx: &mut Context<Self>) -> usize {
         let configured = self
             .config
             .agents
@@ -806,17 +851,77 @@ impl ForgeWindow {
         let name = configured
             .as_ref()
             .map_or_else(|| "ACP".to_owned(), |agent| agent.name.clone());
-        let mut agent_tab = AgentTab::new(name, self.factory.cwd.clone());
-        agent_tab.set_context(context);
+        let provider_name = launch
+            .provider
+            .clone()
+            .or_else(|| {
+                self.config
+                    .router
+                    .provider_for(launch.class)
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                configured
+                    .as_ref()
+                    .map(|agent| agent.provider.clone())
+                    .filter(|name| !name.is_empty())
+            });
+        let provider = provider_name.as_ref().and_then(|wanted| {
+            self.config
+                .providers
+                .iter()
+                .find(|provider| &provider.name == wanted)
+                .cloned()
+        });
+        if let Some(wanted) = &provider_name
+            && provider.is_none()
+        {
+            self.notify_user(
+                NotificationLevel::Warning,
+                format!("Proveedor {wanted:?} no definido en [[providers]]; se usa el del agente"),
+            );
+        }
+        let workspace = configured
+            .as_ref()
+            .filter(|agent| agent.worktree)
+            .and_then(|agent| self.session_worktree(&agent.name))
+            .unwrap_or_else(|| self.factory.cwd.clone());
+        let route = format!(
+            "{} → {}{}",
+            launch.class.label(),
+            provider
+                .as_ref()
+                .map_or_else(|| "proveedor del agente".to_owned(), ProviderConfig::describe),
+            if workspace == self.factory.cwd {
+                String::new()
+            } else {
+                format!(" · worktree {}", workspace.display())
+            }
+        );
+        let mut agent_tab = AgentTab::new(name, workspace.clone());
+        agent_tab.set_context(launch.context);
+        agent_tab.provider = provider.as_ref().map(|p| p.name.clone());
+        agent_tab.route = route;
+        if let Some(prompt) = launch.prompt {
+            agent_tab.prompt = prompt;
+        }
         let index = self.push_tab(TabContent::Agent(Box::new(agent_tab)), cx);
-        let definition = configured.map(|configured| proto_acp::AgentDefinition {
-            name: configured.name,
-            command: configured.command,
-            args: configured.args,
-            env: configured.env,
-            cwd: Some(self.factory.cwd.clone()),
-            auth_method: configured.auth_method,
-            enabled: configured.enabled,
+        let definition = configured.map(|configured| {
+            let mut env = configured.env;
+            if let Some(provider) = &provider {
+                env.extend(provider.environment());
+            }
+            env.insert("FORGE_TASK_CLASS".into(), launch.class.label().to_owned());
+            env.insert("TERM_PROGRAM".into(), "forge".into());
+            proto_acp::AgentDefinition {
+                name: configured.name,
+                command: configured.command,
+                args: configured.args,
+                env,
+                cwd: Some(workspace.clone()),
+                auth_method: configured.auth_method,
+                enabled: configured.enabled,
+            }
         });
         let registry_cache = self
             .factory
@@ -827,20 +932,206 @@ impl ForgeWindow {
                 || std::env::temp_dir().join("forge-acp-registry.json"),
                 |directory| directory.join("acp-registry.json"),
             );
+        let mcp_servers = self
+            .config
+            .mcp_servers
+            .iter()
+            .map(|server| {
+                serde_json::json!({
+                    "name": server.name,
+                    "command": server.command,
+                    "args": server.args,
+                    "env": server
+                        .env
+                        .iter()
+                        .map(|(name, value)| serde_json::json!({"name": name, "value": value}))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
         let (commands, command_rx) = async_mpsc::unbounded_channel();
-        self.tabs[index]
-            .agent_mut()
-            .expect("new agent tab")
-            .connect(commands);
+        let tab_id = self.tabs[index].id;
+        let send_now = self.tabs[index]
+            .agent()
+            .is_some_and(|agent| !agent.prompt.trim().is_empty());
+        if let Some(agent) = self.tabs[index].agent_mut() {
+            agent.connect(commands);
+            if send_now {
+                // The prompt is queued in the command channel and delivered
+                // once the session exists.
+                agent.submit_prompt();
+            }
+        }
         spawn_agent_worker(
             definition,
             registry_cache,
-            self.factory.cwd.clone(),
-            self.tabs[index].id,
+            workspace,
+            mcp_servers,
+            tab_id,
             self.event_tx.clone(),
             command_rx,
         );
         index
+    }
+
+    /// `git worktree add` under the config directory, on a branch named
+    /// after the agent and the moment; `None` (with a notice) when the
+    /// workspace is not a git checkout or git is unavailable.
+    fn session_worktree(&mut self, agent_name: &str) -> Option<PathBuf> {
+        let base = self.factory.config_path.as_deref()?.parent()?.join("worktrees");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let slug: String = agent_name
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+            .collect();
+        let directory = base.join(format!("{slug}-{stamp}"));
+        let branch = format!("forge/{slug}-{stamp}");
+        let output = std::process::Command::new("git")
+            .args(["worktree", "add", "-b", &branch])
+            .arg(&directory)
+            .arg("HEAD")
+            .current_dir(&self.factory.cwd)
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                self.notify_user(
+                    NotificationLevel::Info,
+                    format!("Sesión en worktree {} (rama {branch})", directory.display()),
+                );
+                Some(directory)
+            }
+            Ok(output) => {
+                self.notify_user(
+                    NotificationLevel::Warning,
+                    format!(
+                        "No se pudo crear el worktree; la sesión usa el directorio actual: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                );
+                None
+            }
+            Err(error) => {
+                self.notify_user(
+                    NotificationLevel::Warning,
+                    format!("git no disponible para worktrees ({error}); se usa el directorio actual"),
+                );
+                None
+            }
+        }
+    }
+
+    /// `Ctrl+K`: ask about the selection without leaving the editor.
+    fn agent_ask(&mut self, cx: &mut Context<Self>) {
+        let context = self.agent_prompt_context();
+        if context.is_empty() {
+            self.notify_user(
+                NotificationLevel::Info,
+                "Selecciona código (o abre un archivo) para preguntar al agente",
+            );
+            return;
+        }
+        self.rename = Some(TextPrompt {
+            title: format!("Pregunta al agente sobre {}", context[0].label),
+            value: String::new(),
+            kind: PromptKind::AskAgent,
+        });
+        cx.notify();
+    }
+
+    /// Sends `question` (with the current selection as context) to a new
+    /// agent session, routed by an optional `/class` prefix.
+    fn agent_ask_submit(&mut self, question: &str, cx: &mut Context<Self>) {
+        let (class, rest) = forge_gui::config::TaskClass::split_prefix(question);
+        let context = self.agent_prompt_context();
+        self.create_agent_tab_with(AgentLaunch {
+            class: class.unwrap_or(self.config.router.default_class),
+            provider: None,
+            context,
+            prompt: Some(rest.to_owned()),
+        }, cx);
+    }
+
+    /// From a terminal: hands the last command, its output and the cwd to
+    /// an agent. Command boundaries come from the OSC 133 prompt marks.
+    fn agent_investigate(&mut self, cx: &mut Context<Self>) {
+        let Some(terminal) = self.active_terminal() else {
+            self.notify_user(NotificationLevel::Info, "agent.investigate se usa desde una terminal");
+            return;
+        };
+        let session_label = terminal
+            .session_id
+            .map_or_else(|| "active".to_owned(), |id| id.to_string());
+        let fallback_cwd = self.factory.cwd.clone();
+        let grid = &terminal.terminal.grid;
+        let (_, rows) = grid.dimensions();
+        let cursor_row = grid.cursor().map_or(rows.saturating_sub(1), |cursor| cursor.y);
+        let prompts: Vec<u16> = (0..=cursor_row).filter(|row| grid.prompt_mark(*row) == 1).collect();
+        let (from, to) = match prompts.as_slice() {
+            [.., previous, last] => (*previous, *last),
+            [only] => (*only, cursor_row + 1),
+            [] => (0, cursor_row + 1),
+        };
+        let lines: Vec<String> = (from..to)
+            .filter_map(|row| grid.row_text(row))
+            .map(|text| text.trim_end().to_owned())
+            .collect();
+        let command = lines.first().cloned().unwrap_or_default();
+        let output = lines.iter().skip(1).cloned().collect::<Vec<_>>().join("\n");
+        let cwd = terminal.info.pwd.clone().unwrap_or(fallback_cwd);
+        let without_marks = prompts.is_empty();
+        if without_marks {
+            self.notify_user(
+                NotificationLevel::Warning,
+                "Sin marcas de prompt (integración de shell); se envía la pantalla visible",
+            );
+        }
+        let prompt = format!(
+            "El último comando en la terminal falló o no hizo lo esperado. Investiga la causa y propón la solución.\n\nDirectorio: {}\nComando: {}\n",
+            cwd.display(),
+            command.trim()
+        );
+        let context = vec![PromptContext {
+            label: format!("terminal://{session_label}"),
+            content: output,
+        }];
+        self.create_agent_tab_with(AgentLaunch {
+            class: forge_gui::config::TaskClass::Normal,
+            provider: None,
+            context,
+            prompt: Some(prompt),
+        }, cx);
+    }
+
+    /// `agent.forward`: re-send the active session's last prompt through
+    /// another provider, in a new session.
+    fn agent_forward(&mut self, cx: &mut Context<Self>) {
+        let Some(agent) = self.active_tab().agent() else {
+            self.notify_user(NotificationLevel::Info, "agent.forward se usa desde una sesión de agente");
+            return;
+        };
+        let Some(prompt) = agent.last_prompt.clone() else {
+            self.notify_user(NotificationLevel::Info, "Todavía no hay un prompt que reenviar");
+            return;
+        };
+        if self.config.providers.is_empty() {
+            self.notify_user(NotificationLevel::Info, "Sin [[providers]] configurados para reenviar");
+            return;
+        }
+        self.forward_prompt = Some((prompt, agent.context.clone()));
+        self.picker = Some(Picker {
+            title: "Reenviar a proveedor".into(),
+            items: self
+                .config
+                .providers
+                .iter()
+                .map(ProviderConfig::describe)
+                .collect(),
+            index: 0,
+            kind: PickerKind::Provider,
+        });
+        cx.notify();
     }
 
     fn agent_prompt_context(&self) -> Vec<PromptContext> {
@@ -1318,9 +1609,19 @@ impl ForgeWindow {
             "escape" => self.rename = None,
             "enter" => {
                 let value = prompt.value.trim().to_owned();
+                let kind = prompt.kind;
                 self.rename = None;
-                self.active_tab_mut().custom_title = (!value.is_empty()).then_some(value);
-                self.save_session();
+                match kind {
+                    PromptKind::RenameTab => {
+                        self.active_tab_mut().custom_title = (!value.is_empty()).then_some(value);
+                        self.save_session();
+                    }
+                    PromptKind::AskAgent => {
+                        if !value.is_empty() {
+                            self.agent_ask_submit(&value, cx);
+                        }
+                    }
+                }
             }
             "backspace" => {
                 prompt.value.pop();
@@ -1345,9 +1646,30 @@ impl ForgeWindow {
             "down" => picker.index = (picker.index + 1).min(picker.items.len().saturating_sub(1)),
             "enter" => {
                 let index = picker.index;
+                let kind = picker.kind;
                 self.picker = None;
-                if let Some(profile) = self.config.profiles.get(index).cloned() {
-                    self.open_tab_with(None, None, None, Some(&profile), cx);
+                match kind {
+                    PickerKind::Profile => {
+                        if let Some(profile) = self.config.profiles.get(index).cloned() {
+                            self.open_tab_with(None, None, None, Some(&profile), cx);
+                        }
+                    }
+                    PickerKind::Provider => {
+                        if let (Some(provider), Some((prompt, context))) = (
+                            self.config.providers.get(index).cloned(),
+                            self.forward_prompt.take(),
+                        ) {
+                            self.create_agent_tab_with(
+                                AgentLaunch {
+                                    class: self.config.router.default_class,
+                                    provider: Some(provider.name),
+                                    context,
+                                    prompt: Some(prompt),
+                                },
+                                cx,
+                            );
+                        }
+                    }
                 }
             }
             _ => {}
@@ -2413,6 +2735,7 @@ impl ForgeWindow {
         modifiers: KeyMods,
         cx: &mut Context<Self>,
     ) {
+        let router = self.config.router.clone();
         let Some(agent) = self.active_agent_mut() else {
             return;
         };
@@ -2422,6 +2745,36 @@ impl ForgeWindow {
                 agent.status = "Cancelación solicitada".into();
             }
             "enter" if !modifiers.shift => {
+                let typed = agent.prompt.clone();
+                let (class, rest) = forge_gui::config::TaskClass::split_prefix(&typed);
+                let wanted = class.and_then(|class| router.provider_for(class));
+                let current = agent.provider.clone();
+                if let (Some(class), Some(wanted)) = (class, wanted)
+                    && current.as_deref() != Some(wanted)
+                {
+                    // Another provider serves this class: reroute to a new
+                    // session and say so in both places.
+                    let prompt = rest.to_owned();
+                    let context = agent.context.clone();
+                    agent.prompt.clear();
+                    agent.timeline.push(crate::agent::TimelineItem::Message {
+                        role: crate::agent::MessageRole::Agent,
+                        text: format!("Reenviado a {wanted} ({} → nueva sesión)", class.label()),
+                    });
+                    self.create_agent_tab_with(
+                        AgentLaunch {
+                            class,
+                            provider: Some(wanted.to_owned()),
+                            context,
+                            prompt: Some(prompt),
+                        },
+                        cx,
+                    );
+                    return;
+                }
+                if class.is_some() {
+                    agent.prompt = rest.to_owned();
+                }
                 let _ = agent.submit_prompt();
             }
             "enter" => agent.prompt.push('\n'),
@@ -2631,6 +2984,9 @@ impl ForgeWindow {
             ShellCommand::NewAgentSession => {
                 self.create_agent_tab(cx);
             }
+            ShellCommand::AgentAsk => self.agent_ask(cx),
+            ShellCommand::AgentInvestigate => self.agent_investigate(cx),
+            ShellCommand::AgentForward => self.agent_forward(cx),
             ShellCommand::AgentAcceptAllHunks => {
                 let tab_id = self.active_tab().id;
                 let edits_count = self
@@ -2770,6 +3126,7 @@ impl ForgeWindow {
                 self.rename = Some(TextPrompt {
                     title: "Nombre de la pestaña".into(),
                     value: self.active_tab().custom_title.clone().unwrap_or_default(),
+                    kind: PromptKind::RenameTab,
                 });
                 cx.notify();
             }
@@ -2804,6 +3161,7 @@ impl ForgeWindow {
                     );
                 } else {
                     self.picker = Some(Picker {
+                        kind: PickerKind::Profile,
                         title: "Perfil de terminal".into(),
                         items: self
                             .config

@@ -124,6 +124,13 @@ pub struct AgentTab {
     pub session_id: Option<String>,
     pub status: String,
     pub prompt: String,
+    /// Provider name this session was started with, if the router or the
+    /// agent config chose one; shown as the route.
+    pub provider: Option<String>,
+    /// Human description of the route (`normal → openai: gpt-5`).
+    pub route: String,
+    /// Last prompt sent, for `agent.forward`.
+    pub last_prompt: Option<String>,
     pub timeline: Vec<TimelineItem>,
     pub context: Vec<PromptContext>,
     pub proposed_edits: Vec<ProposedEdit>,
@@ -144,6 +151,9 @@ impl AgentTab {
             agent_name,
             session_id: None,
             prompt: String::new(),
+            provider: None,
+            route: String::new(),
+            last_prompt: None,
             timeline: Vec::new(),
             context: Vec::new(),
             proposed_edits: Vec::new(),
@@ -220,6 +230,7 @@ impl AgentTab {
         }
         self.prompt.clear();
         self.resolve_file_mentions(&prompt);
+        self.last_prompt = Some(prompt.clone());
         self.timeline.push(TimelineItem::Message {
             role: MessageRole::User,
             text: prompt.clone(),
@@ -422,6 +433,7 @@ pub fn spawn_agent_worker(
     definition: Option<AgentDefinition>,
     registry_cache: PathBuf,
     workspace: PathBuf,
+    mcp_servers: Vec<serde_json::Value>,
     tab_id: u64,
     events: Sender<UiEvent>,
     mut commands: async_mpsc::UnboundedReceiver<AgentCommand>,
@@ -464,11 +476,11 @@ pub fn spawn_agent_worker(
                     } else {
                         if let Some(method) = &definition.auth_method { let _ = client.authenticate(method).await; }
                         let session = match previous_session.as_deref() {
-                            Some(id) => match client.load_session(id, &workspace, Vec::new()).await {
+                            Some(id) => match client.load_session(id, &workspace, mcp_servers.clone()).await {
                                 Ok(session) => Ok(session),
-                                Err(_) => client.new_session(&workspace, Vec::new()).await,
+                                Err(_) => client.new_session(&workspace, mcp_servers.clone()).await,
                             },
-                            None => client.new_session(&workspace, Vec::new()).await,
+                            None => client.new_session(&workspace, mcp_servers.clone()).await,
                         };
                         match session {
                             Ok(session) => {

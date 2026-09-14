@@ -64,12 +64,15 @@ pub enum ShellCommand {
     TerminalCopy,
     TerminalPaste,
     NewAgentSession,
+    AgentAsk,
+    AgentInvestigate,
+    AgentForward,
     AgentAcceptAllHunks,
     AgentRejectAllHunks,
 }
 
 impl ShellCommand {
-    pub const ALL: [Self; 54] = [
+    pub const ALL: [Self; 57] = [
         Self::NewTerminalTab,
         Self::NewTerminalTabInDirectory,
         Self::CloseWindow,
@@ -122,6 +125,9 @@ impl ShellCommand {
         Self::TerminalCopy,
         Self::TerminalPaste,
         Self::NewAgentSession,
+        Self::AgentAsk,
+        Self::AgentInvestigate,
+        Self::AgentForward,
         Self::AgentAcceptAllHunks,
         Self::AgentRejectAllHunks,
     ];
@@ -181,6 +187,9 @@ impl ShellCommand {
             Self::TerminalCopy => "terminal.copy",
             Self::TerminalPaste => "terminal.paste",
             Self::NewAgentSession => "agent.newSession",
+            Self::AgentAsk => "agent.ask",
+            Self::AgentInvestigate => "agent.investigate",
+            Self::AgentForward => "agent.forward",
             Self::AgentAcceptAllHunks => "agent.acceptAllHunks",
             Self::AgentRejectAllHunks => "agent.rejectAllHunks",
         }
@@ -240,6 +249,9 @@ impl ShellCommand {
             Self::ShowContextMenu => "Show context menu",
             Self::TerminalPaste => "Paste clipboard",
             Self::NewAgentSession => "New agent session",
+            Self::AgentAsk => "Ask the agent about the selection…",
+            Self::AgentInvestigate => "Investigate the last failed command with the agent",
+            Self::AgentForward => "Forward the last prompt to another provider…",
             Self::AgentAcceptAllHunks => "Accept all proposed hunks",
             Self::AgentRejectAllHunks => "Reject all proposed hunks",
         }
@@ -351,7 +363,7 @@ impl Default for ShellKeymap {
             CloseWindow, CycleTheme, EditorAddCursorAbove, EditorAddCursorBelow, EditorCopy,
             EditorCut, EditorFind, EditorPaste, EditorRedo, EditorReplace, EditorSelectAll,
             EditorSelectNextMatch, EditorUndo, FocusNextPane, FocusPreviousPane, MoveTabLeft,
-            MoveTabRight, NewAgentSession, NewFile, NewTerminalTab, NextPrompt, OpenFile,
+            MoveTabRight, NewAgentSession, NewFile, NewTerminalTab, NextPrompt, OpenFile, AgentAsk, AgentInvestigate,
             OpenProjectFile, PreviousPrompt, RenameTab, SaveFile, SearchNext, SearchPrevious,
             SearchProject, SearchScrollback, ShowCommandPalette, ShowContextMenu, SplitHorizontal,
             SplitVertical, ToggleWordWrap, ZoomIn, ZoomOut, ZoomPane, ZoomReset,
@@ -361,6 +373,8 @@ impl Default for ShellKeymap {
             bindings: vec![
                 binding("t", true, false, false, Window, NewTerminalTab),
                 binding("a", true, false, true, Window, NewAgentSession),
+                binding("k", true, false, false, Editor, AgentAsk),
+                binding("i", true, false, true, Terminal, AgentInvestigate),
                 // Editor chords follow VS Code; they only apply in editors so
                 // Ctrl+C/Ctrl+F keep their meaning inside terminals.
                 binding("o", true, false, false, Window, OpenFile),
