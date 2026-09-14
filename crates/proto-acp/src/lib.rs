@@ -10,11 +10,16 @@ use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 mod client;
+pub mod permission;
 mod registry;
 
 pub use client::{
     AcpClient, AcpEvent, AcpSession, AgentProcess, AgentProcessEvent, ClientError,
     InitializeResult, PromptBlock, SessionMode,
+};
+pub use permission::{
+    PermissionAuditEntry, PermissionBroker, PermissionCapability, PermissionDecision,
+    PermissionRule, PermissionScope, PermissionSubject, PermissionTtl, select_option_id,
 };
 pub use registry::{AgentDefinition, AgentRegistry, AgentRegistryError, OFFICIAL_REGISTRY_URL};
 
