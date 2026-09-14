@@ -1,8 +1,10 @@
 //! `PermissionBroker` and capability-based security policy (ARCHITECTURE.md §23.2).
 //!
 //! Evaluates permission requests for agents, MCP servers and extensions.
-//! Decisions can have a TTL of `Once`, `Session` (in-memory) or `Always`
-//! (persisted to `.forge/permissions.json`). An audit log records every decision.
+//! Decisions can have a TTL of `Once`, `Session` (in-memory) or `Always`,
+//! persisted in the **user's** config directory keyed by workspace — never
+//! inside the workspace, where a cloned repository could ship grants. An
+//! audit log records every decision.
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -65,19 +67,59 @@ impl PermissionCapability {
         }
     }
 
+    /// Capability of an ACP tool call from its `kind` (`read`, `edit`,
+    /// `delete`, `move`, `search`, `execute`, `fetch`, `think`, `other`),
+    /// falling back to the tool name only when the agent sent no kind.
+    #[must_use]
+    pub fn from_tool_call(kind: Option<&str>, tool_name: &str) -> Self {
+        match kind.map(str::to_ascii_lowercase).as_deref() {
+            Some("read" | "search") => Self::FsRead,
+            Some("edit" | "delete" | "move") => Self::FsWrite,
+            Some("execute") => Self::ProcessSpawn,
+            Some("fetch") => Self::Net,
+            Some(_) => Self::Tool(tool_name.to_owned()),
+            None => Self::from_tool_name(tool_name),
+        }
+    }
+
+    /// Best guess from a tool name, for agents that omit `kind`.
     #[must_use]
     pub fn from_tool_name(tool_name: &str) -> Self {
-        if tool_name.starts_with("fs/read") {
+        let name = tool_name.to_ascii_lowercase();
+        if name.starts_with("fs/read") || name.contains("read_file") {
             Self::FsRead
-        } else if tool_name.starts_with("fs/write") {
+        } else if name.starts_with("fs/write")
+            || name.contains("write_file")
+            || name.contains("edit")
+        {
             Self::FsWrite
-        } else if tool_name.starts_with("terminal/") {
+        } else if name.starts_with("terminal/") {
             Self::Terminal
-        } else if tool_name == "bash" || tool_name == "exec" || tool_name == "execute_command" {
+        } else if matches!(
+            name.as_str(),
+            "bash"
+                | "sh"
+                | "shell"
+                | "exec"
+                | "execute"
+                | "execute_command"
+                | "run_command"
+                | "run_shell"
+        ) {
             Self::ProcessSpawn
         } else {
             Self::Tool(tool_name.to_owned())
         }
+    }
+
+    /// Capabilities whose remembered grants need a scope: a blanket
+    /// "always allow" on running commands is never recorded.
+    #[must_use]
+    pub const fn needs_scope(&self) -> bool {
+        matches!(
+            self,
+            Self::ProcessSpawn | Self::Terminal | Self::Net | Self::Secrets | Self::Any
+        )
     }
 }
 
@@ -93,33 +135,69 @@ pub enum PermissionScope {
 }
 
 impl PermissionScope {
+    /// Whether `target` (a command line, path or host) falls under the
+    /// scope. Empty patterns never match: a rule must say what it covers
+    /// (`Any` is the explicit wildcard).
     #[must_use]
     pub fn matches(&self, target: &str) -> bool {
         match self {
             Self::Any => true,
-            Self::Glob(pat) => {
-                let trimmed = pat.trim_end_matches('*');
-                if trimmed.is_empty() {
-                    true
-                } else {
-                    target.starts_with(trimmed)
-                }
-            }
-            Self::CommandPattern(pat) => {
-                let pat_clean = pat.trim().trim_end_matches('*').trim();
-                if pat_clean.is_empty() {
-                    true
-                } else {
-                    target.trim().starts_with(pat_clean)
-                }
-            }
-            Self::Host(host) => target.eq_ignore_ascii_case(host),
+            Self::Glob(pattern) => !pattern.is_empty() && glob_matches(pattern, target),
+            Self::CommandPattern(pattern) => command_matches(pattern, target),
+            Self::Host(host) => !host.is_empty() && target.eq_ignore_ascii_case(host),
             Self::Path(path) => {
                 let target_path = Path::new(target);
-                target_path.starts_with(path) || target_path == path
+                !path.as_os_str().is_empty()
+                    && (target_path.starts_with(path) || target_path == path)
             }
         }
     }
+}
+
+/// `*` matches any run of characters, `?` one character; everything else
+/// is literal. Good enough for `src/**`, `*.rs` and `docs/*.md`.
+fn glob_matches(pattern: &str, target: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let target: Vec<char> = target.chars().collect();
+    let (mut p, mut t) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while t < target.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == target[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            // Collapse `**` and remember where to backtrack to.
+            while p < pattern.len() && pattern[p] == '*' {
+                p += 1;
+            }
+            star = Some((p, t));
+        } else if let Some((star_p, star_t)) = star {
+            p = star_p;
+            t = star_t + 1;
+            star = Some((star_p, t));
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+/// Token-wise prefix: `cargo test` covers `cargo test --workspace` but not
+/// `cargo test-x`, and `git` covers `git status` but not `gitfoo`. A
+/// trailing `*` token is accepted and ignored. Empty patterns never match.
+fn command_matches(pattern: &str, target: &str) -> bool {
+    let wanted: Vec<&str> = pattern
+        .split_whitespace()
+        .filter(|token| *token != "*")
+        .collect();
+    if wanted.is_empty() {
+        return false;
+    }
+    let actual: Vec<&str> = target.split_whitespace().collect();
+    wanted.len() <= actual.len() && wanted.iter().zip(&actual).all(|(w, a)| w == a)
 }
 
 /// Decision reached for a permission query.
@@ -164,31 +242,58 @@ pub struct PermissionAuditEntry {
 /// Evaluates and persists security policies for Forge.
 #[derive(Debug, Clone)]
 pub struct PermissionBroker {
-    workspace: PathBuf,
+    /// Where `Always` rules for this workspace live; `None` keeps them in
+    /// memory only (no config directory).
+    store: Option<PathBuf>,
     persistent_rules: Vec<PermissionRule>,
     session_rules: Vec<PermissionRule>,
     audit_log: Vec<PermissionAuditEntry>,
 }
 
 impl PermissionBroker {
+    /// A broker for `workspace` whose remembered grants are stored under
+    /// `store_dir` (the user's config directory), one file per workspace.
+    /// Nothing is ever read from the workspace itself.
     #[must_use]
-    pub fn new(workspace: PathBuf) -> Self {
-        let permissions_file = workspace.join(".forge").join("permissions.json");
-        let persistent_rules = if permissions_file.is_file() {
-            std::fs::read_to_string(&permissions_file)
-                .ok()
-                .and_then(|data| serde_json::from_str(&data).ok())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
+    pub fn new(workspace: &Path, store_dir: Option<&Path>) -> Self {
+        let store = store_dir.map(|dir| Self::store_path(dir, workspace));
+        let persistent_rules = store
+            .as_ref()
+            .filter(|path| path.is_file())
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|data| serde_json::from_str(&data).ok())
+            .unwrap_or_default();
         Self {
-            workspace,
+            store,
             persistent_rules,
             session_rules: Vec::new(),
             audit_log: Vec::new(),
         }
+    }
+
+    /// `<store_dir>/permissions/<sanitised workspace path>-<hash>.json`.
+    #[must_use]
+    pub fn store_path(store_dir: &Path, workspace: &Path) -> PathBuf {
+        let text = workspace.to_string_lossy();
+        let mut name: String = text
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if name.len() > 80 {
+            name = name[name.len() - 80..].to_owned();
+        }
+        let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+        store_dir
+            .join("permissions")
+            .join(format!("{name}-{hash:016x}.json"))
     }
 
     /// Evaluates existing policies for `agent_name`, `capability` and `scope`.
@@ -250,6 +355,22 @@ impl PermissionBroker {
             ttl,
         });
 
+        // A remembered *grant* on running commands, terminals or the
+        // network needs a concrete scope; otherwise it is honoured once.
+        let blanket = matches!(scope, PermissionScope::Any)
+            || match &scope {
+                PermissionScope::CommandPattern(pattern) | PermissionScope::Glob(pattern) => {
+                    pattern.split_whitespace().all(|token| token == "*")
+                }
+                PermissionScope::Host(host) => host.is_empty(),
+                PermissionScope::Path(path) => path.as_os_str().is_empty(),
+                PermissionScope::Any => true,
+            };
+        let ttl = if decision == PermissionDecision::Allow && blanket && capability.needs_scope() {
+            PermissionTtl::Once
+        } else {
+            ttl
+        };
         let rule = PermissionRule {
             subject: PermissionSubject::Agent(agent_name.to_owned()),
             capability,
@@ -271,20 +392,21 @@ impl PermissionBroker {
         }
     }
 
-    /// Saves persistent rules to `<workspace>/.forge/permissions.json`.
+    /// Saves persistent rules to the user store; a no-op without one.
     ///
     /// # Errors
     ///
     /// Returns an error if the directory cannot be created or the file cannot be written.
     pub fn save_persistent(&self) -> Result<(), std::io::Error> {
-        let forge_dir = self.workspace.join(".forge");
-        if !forge_dir.exists() {
-            std::fs::create_dir_all(&forge_dir)?;
+        let Some(path) = &self.store else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-        let permissions_file = forge_dir.join("permissions.json");
         let data = serde_json::to_string_pretty(&self.persistent_rules)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&permissions_file, data)
+        std::fs::write(path, data)
     }
 
     #[must_use]
@@ -310,40 +432,44 @@ pub fn select_option_id(
     decision: PermissionDecision,
     ttl: PermissionTtl,
 ) -> Option<String> {
-    match decision {
-        PermissionDecision::Allow => {
-            if ttl == PermissionTtl::Always {
-                options
-                    .iter()
-                    .find(|opt| {
-                        opt.get("kind")
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|k| k.contains("always"))
-                    })
-                    .or_else(|| options.first())
-                    .and_then(extract_option_id)
-            } else {
-                options
-                    .iter()
-                    .find(|opt| {
-                        opt.get("kind")
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|k| k.contains("once") || k.contains("allow"))
-                    })
-                    .or_else(|| options.first())
-                    .and_then(extract_option_id)
-            }
+    let kind_of = |option: &serde_json::Value| -> String {
+        option
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    };
+    let pick = |kinds: &[&str]| -> Option<String> {
+        kinds.iter().find_map(|wanted| {
+            options
+                .iter()
+                .find(|option| kind_of(option) == *wanted)
+                .and_then(extract_option_id)
+        })
+    };
+    // ACP option kinds are exactly `allow_once`, `allow_always`,
+    // `reject_once` and `reject_always`; nothing else is ever picked, so a
+    // denial can never land on an allow option (the caller cancels instead).
+    match (decision, ttl) {
+        (PermissionDecision::Allow, PermissionTtl::Always) => pick(&["allow_always", "allow_once"]),
+        (PermissionDecision::Allow, _) => pick(&["allow_once", "allow_always"]),
+        (PermissionDecision::Deny, PermissionTtl::Always) => {
+            pick(&["reject_always", "reject_once"])
         }
-        PermissionDecision::Deny => options
-            .iter()
-            .find(|opt| {
-                opt.get("kind")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|k| k.contains("deny") || k.contains("reject"))
-            })
-            .or_else(|| options.last())
-            .and_then(extract_option_id),
-        PermissionDecision::Ask => None,
+        (PermissionDecision::Deny, _) => pick(&["reject_once", "reject_always"]),
+        (PermissionDecision::Ask, _) => None,
+    }
+}
+
+/// The JSON-RPC result for a permission request: the selected option, or
+/// `cancelled` when no option of the wanted kind exists.
+#[must_use]
+pub fn permission_outcome(option_id: Option<String>) -> serde_json::Value {
+    match option_id {
+        Some(option_id) => serde_json::json!({
+            "outcome": { "outcome": "selected", "optionId": option_id }
+        }),
+        None => serde_json::json!({ "outcome": { "outcome": "cancelled" } }),
     }
 }
 
@@ -359,18 +485,18 @@ fn extract_option_id(option: &serde_json::Value) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn temp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("forge-perm-{name}-{}", std::process::id()))
+    }
+
     #[test]
     fn evaluates_session_rules_before_persistent() {
-        let temp_dir = std::env::temp_dir().join(format!("forge-perm-test-{}", std::process::id()));
-        let mut broker = PermissionBroker::new(temp_dir.clone());
-
-        // Default is Ask
+        let workspace = temp("ws");
+        let mut broker = PermissionBroker::new(&workspace, None);
         assert_eq!(
             broker.evaluate("OpenCode", &PermissionCapability::Terminal, "printf test"),
             PermissionDecision::Ask
         );
-
-        // Record a session rule: allow printf *
         broker.record_decision(
             "OpenCode",
             PermissionCapability::Terminal,
@@ -378,28 +504,27 @@ mod tests {
             PermissionDecision::Allow,
             PermissionTtl::Session,
         );
-
-        // Now printf is allowed
         assert_eq!(
             broker.evaluate("OpenCode", &PermissionCapability::Terminal, "printf test"),
             PermissionDecision::Allow
         );
-
-        // Different command still Ask
+        assert_eq!(
+            broker.evaluate("OpenCode", &PermissionCapability::Terminal, "printfx test"),
+            PermissionDecision::Ask,
+            "token-wise, not a text prefix"
+        );
         assert_eq!(
             broker.evaluate("OpenCode", &PermissionCapability::Terminal, "rm -rf /"),
             PermissionDecision::Ask
         );
-
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
-    fn persists_always_rules_to_disk() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("forge-perm-persist-{}", std::process::id()));
-        let mut broker = PermissionBroker::new(temp_dir.clone());
-
+    fn always_rules_live_in_the_user_store_not_the_workspace() {
+        let workspace = temp("ws2");
+        let store = temp("store");
+        let _ = std::fs::remove_dir_all(&store);
+        let mut broker = PermissionBroker::new(&workspace, Some(&store));
         broker.record_decision(
             "Codex",
             PermissionCapability::FsWrite,
@@ -407,42 +532,145 @@ mod tests {
             PermissionDecision::Allow,
             PermissionTtl::Always,
         );
-
-        // Reload broker from same workspace
-        let reloaded = PermissionBroker::new(temp_dir.clone());
+        let path = PermissionBroker::store_path(&store, &workspace);
+        assert!(path.is_file(), "{}", path.display());
+        assert!(path.starts_with(&store));
+        assert!(
+            !workspace.join(".forge").exists(),
+            "nothing written into the workspace"
+        );
+        // A different workspace does not inherit the grant.
+        let other = PermissionBroker::new(&temp("ws3"), Some(&store));
+        assert!(other.persistent_rules().is_empty());
+        let reloaded = PermissionBroker::new(&workspace, Some(&store));
         assert_eq!(reloaded.persistent_rules().len(), 1);
         assert_eq!(
             reloaded.evaluate("Codex", &PermissionCapability::FsWrite, "src/main.rs"),
             PermissionDecision::Allow
         );
-
-        let _ = std::fs::remove_dir_all(temp_dir);
+        assert_eq!(
+            reloaded.evaluate("Codex", &PermissionCapability::FsWrite, "Cargo.toml"),
+            PermissionDecision::Ask
+        );
+        let _ = std::fs::remove_dir_all(store);
     }
 
     #[test]
-    fn selects_correct_option_id() {
-        let options = serde_json::json!([
-            {"optionId": "allow_once", "name": "Permitir una vez", "kind": "allow_once"},
-            {"optionId": "allow_always", "name": "Permitir siempre", "kind": "allow_always"},
-            {"optionId": "deny", "name": "Rechazar", "kind": "deny"}
-        ]);
-        let options_arr = options.as_array().unwrap();
+    fn blanket_grants_on_commands_are_not_remembered() {
+        let mut broker = PermissionBroker::new(&temp("ws4"), None);
+        broker.record_decision(
+            "Codex",
+            PermissionCapability::ProcessSpawn,
+            PermissionScope::CommandPattern(String::new()),
+            PermissionDecision::Allow,
+            PermissionTtl::Always,
+        );
+        assert!(broker.session_rules().is_empty());
+        assert!(broker.persistent_rules().is_empty());
+        assert_eq!(
+            broker.evaluate("Codex", &PermissionCapability::ProcessSpawn, "rm -rf /"),
+            PermissionDecision::Ask
+        );
+        // A denial, or a scoped grant, is remembered normally.
+        broker.record_decision(
+            "Codex",
+            PermissionCapability::ProcessSpawn,
+            PermissionScope::Any,
+            PermissionDecision::Deny,
+            PermissionTtl::Session,
+        );
+        assert_eq!(
+            broker.evaluate("Codex", &PermissionCapability::ProcessSpawn, "ls"),
+            PermissionDecision::Deny
+        );
+        // A tool without a natural scope may still be remembered.
+        broker.record_decision(
+            "Codex",
+            PermissionCapability::Tool("think".into()),
+            PermissionScope::Any,
+            PermissionDecision::Allow,
+            PermissionTtl::Session,
+        );
+        assert_eq!(
+            broker.evaluate("Codex", &PermissionCapability::Tool("think".into()), ""),
+            PermissionDecision::Allow
+        );
+    }
 
+    #[test]
+    fn scopes_match_globs_commands_and_paths() {
+        assert!(PermissionScope::Glob("*.rs".into()).matches("main.rs"));
+        assert!(PermissionScope::Glob("src/**".into()).matches("src/a/b.rs"));
+        assert!(!PermissionScope::Glob("src/*.rs".into()).matches("docs/x.md"));
+        assert!(!PermissionScope::Glob(String::new()).matches("anything"));
+        assert!(
+            PermissionScope::CommandPattern("cargo test".into()).matches("cargo test --workspace")
+        );
+        assert!(!PermissionScope::CommandPattern("cargo test".into()).matches("cargo test-x"));
+        assert!(PermissionScope::CommandPattern("git *".into()).matches("git status"));
+        assert!(!PermissionScope::CommandPattern("git".into()).matches("gitfoo"));
+        assert!(!PermissionScope::CommandPattern("*".into()).matches("rm -rf /"));
+        assert!(PermissionScope::Path("/tmp/x".into()).matches("/tmp/x/y"));
+        assert!(!PermissionScope::Path(PathBuf::new()).matches("/etc/passwd"));
+    }
+
+    #[test]
+    fn capabilities_come_from_the_tool_call_kind() {
         assert_eq!(
-            select_option_id(options_arr, PermissionDecision::Allow, PermissionTtl::Once),
-            Some("allow_once".into())
+            PermissionCapability::from_tool_call(Some("execute"), "run_shell"),
+            PermissionCapability::ProcessSpawn
         );
         assert_eq!(
-            select_option_id(
-                options_arr,
-                PermissionDecision::Allow,
-                PermissionTtl::Always
-            ),
-            Some("allow_always".into())
+            PermissionCapability::from_tool_call(Some("edit"), "apply_patch"),
+            PermissionCapability::FsWrite
         );
         assert_eq!(
-            select_option_id(options_arr, PermissionDecision::Deny, PermissionTtl::Once),
-            Some("deny".into())
+            PermissionCapability::from_tool_call(None, "bash"),
+            PermissionCapability::ProcessSpawn
+        );
+        assert_eq!(
+            PermissionCapability::from_tool_call(Some("think"), "plan"),
+            PermissionCapability::Tool("plan".into())
+        );
+    }
+
+    #[test]
+    fn option_selection_never_picks_the_wrong_kind() {
+        // Reject listed first, like some agents do.
+        let options = serde_json::json!([
+            {"optionId": "r1", "name": "Rechazar", "kind": "reject_once"},
+            {"optionId": "a1", "name": "Permitir una vez", "kind": "allow_once"},
+            {"optionId": "a2", "name": "Permitir siempre", "kind": "allow_always"}
+        ]);
+        let options = options.as_array().unwrap();
+        assert_eq!(
+            select_option_id(options, PermissionDecision::Allow, PermissionTtl::Once),
+            Some("a1".into())
+        );
+        assert_eq!(
+            select_option_id(options, PermissionDecision::Allow, PermissionTtl::Always),
+            Some("a2".into())
+        );
+        assert_eq!(
+            select_option_id(options, PermissionDecision::Deny, PermissionTtl::Once),
+            Some("r1".into())
+        );
+        // Only allow options offered: a denial cancels instead of allowing.
+        let allow_only = serde_json::json!([
+            {"optionId": "a1", "kind": "allow_once"}
+        ]);
+        let allow_only = allow_only.as_array().unwrap();
+        assert_eq!(
+            select_option_id(allow_only, PermissionDecision::Deny, PermissionTtl::Once),
+            None
+        );
+        assert_eq!(
+            permission_outcome(None)["outcome"]["outcome"],
+            serde_json::json!("cancelled")
+        );
+        assert_eq!(
+            permission_outcome(Some("a1".into()))["outcome"]["optionId"],
+            serde_json::json!("a1")
         );
     }
 }

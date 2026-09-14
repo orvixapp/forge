@@ -46,6 +46,8 @@ pub enum BufferError {
 
 /// Consecutive edits closer than this are undone together.
 pub const UNDO_GROUP_WINDOW: Duration = Duration::from_millis(300);
+/// Applied transactions kept for [`Buffer::transactions_since`].
+const APPLIED_LOG: usize = 512;
 
 /// One undo step: the applied transaction and the one that reverts it.
 #[derive(Debug, Clone)]
@@ -76,6 +78,9 @@ pub struct Buffer {
     version: u64,
     /// Edits of the transaction that produced `version`, in text order.
     last_change: Vec<AppliedEdit>,
+    /// Recent transactions as applied (edits, undos, redos, replays), so
+    /// proposals can be rebased across any of them.
+    applied: std::collections::VecDeque<Transaction>,
     undo: Vec<HistoryEntry>,
     redo: Vec<HistoryEntry>,
     selections: Selections,
@@ -97,6 +102,7 @@ impl Buffer {
             text: Rope::from_str(text),
             version: 0,
             last_change: Vec::new(),
+            applied: std::collections::VecDeque::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             selections: Selections::default(),
@@ -112,8 +118,9 @@ impl Buffer {
         self.version
     }
 
-    /// Returns transactions applied between `version` and current version,
-    /// or `None` if `version` is not in history.
+    /// Every transaction applied since `version`, in order — including
+    /// undos and redos, which change the text like any edit. `None` when
+    /// `version` is ahead of the buffer or older than the retained log.
     #[must_use]
     pub fn transactions_since(&self, version: u64) -> Option<Vec<&Transaction>> {
         if version > self.version {
@@ -122,13 +129,16 @@ impl Buffer {
         if version == self.version {
             return Some(Vec::new());
         }
-        let mut result = Vec::new();
-        for entry in &self.undo {
-            if entry.forward.version_before >= version {
-                result.push(&entry.forward);
-            }
+        let oldest = self.applied.front()?.version_before;
+        if oldest > version {
+            return None;
         }
-        Some(result)
+        Some(
+            self.applied
+                .iter()
+                .filter(|transaction| transaction.version_before >= version)
+                .collect(),
+        )
     }
 
     /// The edits that took the buffer from `version() - 1` to `version()`,
@@ -439,6 +449,12 @@ impl Buffer {
         self.version += 1;
         self.last_change = applied;
         self.selections = transaction.selections_after.clone();
+        let mut record = transaction.clone();
+        record.version_before = self.version - 1;
+        self.applied.push_back(record);
+        if self.applied.len() > APPLIED_LOG {
+            self.applied.pop_front();
+        }
         Transaction {
             edits: inverse_edits,
             selections_before: transaction.selections_after.clone(),
@@ -622,6 +638,32 @@ mod tests {
         );
         buffer.undo();
         assert_eq!(buffer.last_change()[1].inserted, "world");
+    }
+
+    #[test]
+    fn transactions_since_includes_undos_and_forgets_pruned_history() {
+        let mut buffer = buffer_with_cursor("", 0);
+        buffer.insert("a", false).unwrap();
+        let base = buffer.version();
+        buffer.insert("b", false).unwrap();
+        assert!(buffer.undo());
+        let since = buffer.transactions_since(base).unwrap();
+        assert_eq!(since.len(), 2, "the insert and its undo");
+        assert_eq!(since[1].edits[0].range, 1..2, "undo removes the b");
+        assert!(buffer.transactions_since(base + 5).is_none());
+        assert!(
+            buffer
+                .transactions_since(buffer.version())
+                .unwrap()
+                .is_empty()
+        );
+        for _ in 0..APPLIED_LOG + 2 {
+            buffer.insert("x", false).unwrap();
+        }
+        assert!(
+            buffer.transactions_since(base).is_none(),
+            "older than the log"
+        );
     }
 
     #[test]

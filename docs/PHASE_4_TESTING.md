@@ -49,7 +49,11 @@ Después:
    - La solicitud espera la decisión del usuario antes de responder al agente.
    - "Permitir en esta sesión" recuerda la decisión para la herramienta/comando en la
      sesión activa sin volver a preguntar.
-   - "Permitir siempre" persiste la regla en `.forge/permissions.json` del workspace.
+   - "Permitir siempre" persiste la regla en
+     `~/.config/forge/permissions/<workspace>-<hash>.json` (nunca dentro del
+     repositorio: un clon no puede traer permisos). Un "Permitir siempre"
+     sobre `execute`/terminal/red sin comando concreto se aplica sólo una
+     vez.
    - "Rechazar" responde negativamente al agente con la opción de denegación.
 10. Cuando el agente ejecute el comando autorizado, se abre la pestaña
     `Agente · <comando>`; `terminal/output` devuelve su salida y la pestaña permanece

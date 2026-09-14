@@ -55,7 +55,11 @@ Pruebas manuales de las entregas ya utilizables: [`PHASE_4_TESTING.md`](PHASE_4_
 
 ## 4.4 — Permisos y diff review
 - [x] `PermissionBroker`: política por agente/herramienta, tarjetas de
-  permiso, decisiones recordadas por sesión y persistencia en `.forge/permissions.json`.
+  permiso, decisiones recordadas por sesión y persistencia por workspace en
+  el directorio de config del usuario (`permissions/<workspace>-<hash>.json`);
+  la capability sale de `toolCall.kind`, los patrones de comando casan por
+  tokens y los globs son reales; sin opción `reject_*` se responde
+  `cancelled`, nunca un `allow_*`.
 - [x] Overlay de ediciones propuestas + diff review por hunk + rebase
   sobre ediciones concurrentes (§17.5) aplicadas como `forge-buffer::Transaction`.
 

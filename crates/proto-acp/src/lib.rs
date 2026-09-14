@@ -19,7 +19,8 @@ pub use client::{
 };
 pub use permission::{
     PermissionAuditEntry, PermissionBroker, PermissionCapability, PermissionDecision,
-    PermissionRule, PermissionScope, PermissionSubject, PermissionTtl, select_option_id,
+    PermissionRule, PermissionScope, PermissionSubject, PermissionTtl, permission_outcome,
+    select_option_id,
 };
 pub use registry::{AgentDefinition, AgentRegistry, AgentRegistryError, OFFICIAL_REGISTRY_URL};
 

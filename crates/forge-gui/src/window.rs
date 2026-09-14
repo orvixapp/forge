@@ -421,7 +421,15 @@ impl ForgeWindow {
         Self::spawn_housekeeping(events, cx);
         let (theme, theme_name) = load_theme(&factory);
         let keymap = ShellKeymap::default().with_overrides(&factory.config.keybindings);
-        let permission_broker = proto_acp::PermissionBroker::new(factory.cwd.clone());
+        // Remembered grants live next to the user's config, keyed by
+        // workspace: a cloned repository can never bring its own.
+        let permission_store = factory
+            .config_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+        let permission_broker =
+            proto_acp::PermissionBroker::new(&factory.cwd, permission_store.as_deref());
         let mut window = Self {
             tabs: Vec::new(),
             active_tab: 0,
@@ -1677,15 +1685,8 @@ impl ForgeWindow {
     ) {
         let option_id =
             proto_acp::select_option_id(raw_options, decision, proto_acp::PermissionTtl::Session);
-        let reply = proto_acp::JsonRpcMessage::response(
-            id,
-            serde_json::json!({
-                "outcome": {
-                    "outcome": "selected",
-                    "optionId": option_id,
-                }
-            }),
-        );
+        let reply =
+            proto_acp::JsonRpcMessage::response(id, proto_acp::permission_outcome(option_id));
         let _ = response.send(reply);
     }
 
@@ -1733,7 +1734,8 @@ impl ForgeWindow {
             .unwrap_or(&detail)
             .to_owned();
 
-        let capability = proto_acp::PermissionCapability::from_tool_name(&tool_name);
+        let kind = tool_call.get("kind").and_then(serde_json::Value::as_str);
+        let capability = proto_acp::PermissionCapability::from_tool_call(kind, &tool_name);
         let decision = self
             .permission_broker
             .evaluate(&agent_name, &capability, &scope);
@@ -1884,7 +1886,12 @@ impl ForgeWindow {
         let Some(proposed) = agent.proposed_edits.get(edit_index) else {
             return;
         };
-        let path = proposed.path.clone();
+        // Editors store canonical paths; compare in the same space so a
+        // proposal on a symlinked or relative path still finds its tab.
+        let path = proposed
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| proposed.path.clone());
 
         let editor_idx = self.tabs.iter().position(|t| {
             if let TabContent::Editor(e) = &t.content {
@@ -1908,20 +1915,47 @@ impl ForgeWindow {
                 let (left, right) = self.tabs.split_at_mut(agent_idx);
                 (&mut right[0], &mut left[editor_idx])
             };
+            let mut failure = None;
             if let (Some(agent), Some(editor)) = (agent_tab.agent_mut(), editor_tab.editor_mut())
                 && let Some(proposed) = agent.proposed_edits.get_mut(edit_index)
             {
-                let _ = proposed.apply_hunk(hunk_id, &mut editor.buffer);
+                match proposed.apply_hunk(hunk_id, &mut editor.buffer) {
+                    Ok(_) => {
+                        editor.follow_cursor();
+                        editor.sync_syntax();
+                    }
+                    Err(error) => failure = Some(error.to_string()),
+                }
+            }
+            if let Some(error) = failure {
+                self.notify_user(
+                    NotificationLevel::Warning,
+                    format!("No se aplicó el cambio propuesto: {error}"),
+                );
             }
         } else {
-            let content = std::fs::read_to_string(&path).unwrap_or_default();
-            let mut buffer = forge_buffer::Buffer::new(&content);
-            if let Some(agent) = self.tabs[agent_idx].agent_mut()
-                && let Some(proposed) = agent.proposed_edits.get_mut(edit_index)
-                && proposed.apply_hunk(hunk_id, &mut buffer).is_ok()
-            {
-                let _ = std::fs::write(&path, buffer.text());
+            // Not open yet: open it so the edit goes through the buffer
+            // (undo, journal, watcher, gutter) instead of a raw disk write,
+            // then retry on the editor tab. Opening changes the active tab;
+            // the agent tab is restored afterwards.
+            let active = self.active_tab;
+            self.open_file(&path, None, None, cx);
+            let opened = self.tabs.iter().any(|tab| {
+                tab.editor()
+                    .and_then(|e| e.path())
+                    .is_some_and(|p| p == path)
+            });
+            self.active_tab = active.min(self.tabs.len().saturating_sub(1));
+            if opened {
+                return self.agent_accept_hunk(agent_id, edit_index, hunk_id, cx);
             }
+            self.notify_user(
+                NotificationLevel::Error,
+                format!(
+                    "No se pudo abrir {} para aplicar la propuesta",
+                    path.display()
+                ),
+            );
         }
         cx.notify();
     }
@@ -1956,7 +1990,12 @@ impl ForgeWindow {
         let Some(proposed) = agent.proposed_edits.get(edit_index) else {
             return;
         };
-        let path = proposed.path.clone();
+        // Editors store canonical paths; compare in the same space so a
+        // proposal on a symlinked or relative path still finds its tab.
+        let path = proposed
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| proposed.path.clone());
 
         let editor_idx = self.tabs.iter().position(|t| {
             if let TabContent::Editor(e) = &t.content {
@@ -1980,20 +2019,53 @@ impl ForgeWindow {
                 let (left, right) = self.tabs.split_at_mut(agent_idx);
                 (&mut right[0], &mut left[editor_idx])
             };
+            let mut failure = None;
+            let mut conflicts = 0;
             if let (Some(agent), Some(editor)) = (agent_tab.agent_mut(), editor_tab.editor_mut())
                 && let Some(proposed) = agent.proposed_edits.get_mut(edit_index)
             {
-                let _ = proposed.apply_all_pending(&mut editor.buffer);
+                match proposed.apply_all_pending(&mut editor.buffer) {
+                    Ok(_) => {
+                        editor.follow_cursor();
+                        editor.sync_syntax();
+                        conflicts = proposed.conflict_count();
+                    }
+                    Err(error) => failure = Some(error.to_string()),
+                }
+            }
+            if let Some(error) = failure {
+                self.notify_user(
+                    NotificationLevel::Warning,
+                    format!("No se aplicaron los cambios propuestos: {error}"),
+                );
+            } else if conflicts > 0 {
+                self.notify_user(
+                    NotificationLevel::Warning,
+                    format!(
+                        "{conflicts} hunks en conflicto quedan sin aplicar; revísalos uno a uno"
+                    ),
+                );
             }
         } else {
-            let content = std::fs::read_to_string(&path).unwrap_or_default();
-            let mut buffer = forge_buffer::Buffer::new(&content);
-            if let Some(agent) = self.tabs[agent_idx].agent_mut()
-                && let Some(proposed) = agent.proposed_edits.get_mut(edit_index)
-                && let Ok(Some(_tx)) = proposed.apply_all_pending(&mut buffer)
-            {
-                let _ = std::fs::write(&path, buffer.text());
+            // Not open yet: open it and apply through the editor buffer.
+            let active = self.active_tab;
+            self.open_file(&path, None, None, cx);
+            let opened = self.tabs.iter().any(|tab| {
+                tab.editor()
+                    .and_then(|e| e.path())
+                    .is_some_and(|p| p == path)
+            });
+            self.active_tab = active.min(self.tabs.len().saturating_sub(1));
+            if opened {
+                return self.agent_accept_all_hunks(agent_id, edit_index, cx);
             }
+            self.notify_user(
+                NotificationLevel::Error,
+                format!(
+                    "No se pudo abrir {} para aplicar la propuesta",
+                    path.display()
+                ),
+            );
         }
         cx.notify();
     }

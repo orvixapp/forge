@@ -142,31 +142,40 @@ impl ProposedEdit {
         let transactions = buffer.transactions_since(self.base_version);
         if let Some(txs) = transactions {
             for tx in txs {
-                for edit in &tx.edits {
-                    let delta = edit.delta();
-                    for hunk in &mut self.hunks {
-                        if !matches!(hunk.status, HunkStatus::Pending) {
-                            continue;
-                        }
-                        // Check overlap
+                // All edits of a transaction are in the coordinates of the
+                // text *before* it, so overlap checks use the hunk's range
+                // as it was before the transaction and the shift is applied
+                // once, after every edit has been considered.
+                for hunk in &mut self.hunks {
+                    if !matches!(hunk.status, HunkStatus::Pending) {
+                        continue;
+                    }
+                    let hunk_start = hunk.buffer_chars.start;
+                    let hunk_end = hunk.buffer_chars.end;
+                    let mut shift: isize = 0;
+                    for edit in &tx.edits {
                         let edit_start = edit.range.start;
                         let edit_end = edit.range.end;
-                        let hunk_start = hunk.buffer_chars.start;
-                        let hunk_end = hunk.buffer_chars.end;
-
-                        if edit_end <= hunk_start {
-                            // Edit happened strictly before the hunk
-                            let new_start = hunk_start.saturating_add_signed(delta);
-                            let new_end = hunk_end.saturating_add_signed(delta);
-                            hunk.buffer_chars = new_start..new_end;
-                        } else if edit_start >= hunk_end {
-                            // Edit happened strictly after the hunk: no shift
+                        let touches = if edit.range.is_empty() {
+                            // An insertion strictly inside the hunk; at its
+                            // edges it only shifts.
+                            edit_start > hunk_start && edit_start < hunk_end
                         } else {
-                            // Overlap!
+                            edit_start < hunk_end && edit_end > hunk_start
+                        };
+                        if touches {
                             hunk.status = HunkStatus::Conflict(
                                 "Modificación concurrente en la misma región del archivo".into(),
                             );
+                            break;
                         }
+                        if edit_end <= hunk_start {
+                            shift += edit.delta();
+                        }
+                    }
+                    if matches!(hunk.status, HunkStatus::Pending) && shift != 0 {
+                        hunk.buffer_chars = hunk_start.saturating_add_signed(shift)
+                            ..hunk_end.saturating_add_signed(shift);
                     }
                 }
             }
@@ -465,6 +474,41 @@ mod tests {
         // Applying hunk now applies cleanly at the shifted location
         proposed_edit.apply_hunk(0, &mut buffer).unwrap();
         assert_eq!(buffer.text(), "header\nline 1\nline 2\nline 3 modified\n");
+    }
+
+    #[test]
+    fn rebase_survives_multi_cursor_edits_and_undo() {
+        let mut buffer = Buffer::new("aaa\nbbb\nccc\nddd\n");
+        let mut proposal = ProposedEdit::from_proposal(
+            PathBuf::from("x"),
+            "agent",
+            buffer.text(),
+            &buffer,
+            "aaa\nbbb\nccc\nDDD\n".into(),
+        );
+        assert_eq!(proposal.hunks.len(), 1);
+        // Two insertions before the hunk in one transaction (multi-cursor).
+        buffer
+            .edit(vec![Edit::insert(0, "1"), Edit::insert(4, "22")], false)
+            .unwrap();
+        assert!(proposal.rebase(&buffer));
+        assert!(matches!(proposal.hunks[0].status, HunkStatus::Pending));
+        assert_eq!(
+            buffer.slice(proposal.hunks[0].buffer_chars.clone()),
+            "ddd\n"
+        );
+        // Undo is a text change too: the hunk follows it back.
+        assert!(buffer.undo());
+        assert!(proposal.rebase(&buffer));
+        assert!(matches!(proposal.hunks[0].status, HunkStatus::Pending));
+        assert_eq!(
+            buffer.slice(proposal.hunks[0].buffer_chars.clone()),
+            "ddd\n"
+        );
+        proposal
+            .apply_hunk(proposal.hunks[0].id, &mut buffer)
+            .unwrap();
+        assert_eq!(buffer.text(), "aaa\nbbb\nccc\nDDD\n");
     }
 
     #[test]
