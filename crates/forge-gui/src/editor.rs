@@ -9,7 +9,8 @@ use crate::{
     window::{ForgeWindow, NotificationLevel, Tab, TabContent},
 };
 use forge_buffer::{
-    Buffer, Cursor, Edit, Journal, LoadedFile, Motion, Position, Selection, Selections,
+    Buffer, Cursor, Edit, Journal, LargeFile, LoadedFile, Motion, Position, Selection, Selections,
+    large,
 };
 use forge_syntax::{PARSE_BUDGET_MS, Span, SyntaxState, Token};
 use gpui::{
@@ -54,7 +55,15 @@ pub struct EditorTab {
     pub syntax: Option<SyntaxState>,
     /// A background parse is in flight for this tab.
     parsing: bool,
+    /// Large-file mode: the text lives in this map, read-only, until the
+    /// user materialises it (§13.4).
+    pub large: Option<LargeFile>,
 }
+
+/// Longest line prefix painted in large mode.
+const LARGE_LINE_PAINT_BYTES: usize = 4096;
+/// Files above this size skip tree-sitter even after materialising.
+const SYNTAX_MAX_BYTES: usize = 20 * 1024 * 1024;
 
 impl EditorTab {
     pub fn new(buffer: Buffer, file: Option<LoadedFile>) -> Self {
@@ -70,13 +79,81 @@ impl EditorTab {
             pending_center: None,
             syntax: None,
             parsing: false,
+            large: None,
         }
+    }
+
+    /// Opens `path` in large mode (memory-mapped, read-only).
+    pub fn large(path: PathBuf, file: LargeFile) -> Self {
+        let mut tab = Self::new(Buffer::new(""), None);
+        tab.file = Some(LoadedFile {
+            path,
+            text: String::new(),
+            line_ending: forge_buffer::LineEnding::Lf,
+            encoding: "UTF-8",
+            had_bom: false,
+            lossy: false,
+        });
+        tab.large = Some(file);
+        tab
+    }
+
+    #[must_use]
+    pub fn is_large(&self) -> bool {
+        self.large.is_some()
+    }
+
+    /// Lines the tab can show: the rope's, or the indexed lines of the map.
+    fn total_lines(&self) -> usize {
+        self.large
+            .as_ref()
+            .map_or_else(|| self.buffer.len_lines(), LargeFile::len_lines)
+    }
+
+    /// Loads the mapped file into a rope so it can be edited. Refused when
+    /// it would take more than half of the available memory.
+    pub fn materialize(&mut self) -> Result<(), String> {
+        let Some(file) = &self.large else {
+            return Ok(());
+        };
+        let needed = u64::try_from(file.len_bytes()).unwrap_or(u64::MAX);
+        if let Some(available) = available_memory_bytes()
+            && needed.saturating_mul(2) > available
+        {
+            return Err(format!(
+                "el archivo ocupa {} MiB y sólo hay {} MiB disponibles; no se carga en memoria",
+                needed / (1024 * 1024),
+                available / (1024 * 1024)
+            ));
+        }
+        let text = file.text();
+        self.buffer = Buffer::new(&text);
+        if let Some(loaded) = &mut self.file {
+            loaded.line_ending = if text.contains("\r\n") {
+                forge_buffer::LineEnding::CrLf
+            } else {
+                forge_buffer::LineEnding::Lf
+            };
+        }
+        self.large = None;
+        self.scroll_line = self
+            .scroll_line
+            .min(self.buffer.len_lines().saturating_sub(1));
+        self.set_cursor(self.buffer.char_at(Position {
+            line: self.scroll_line,
+            column: 0,
+        }));
+        Ok(())
     }
 
     /// Picks the grammar for the file and parses it (synchronously for
     /// small files; otherwise on a thread that hands the state back via
     /// `UiEvent::SyntaxReady`).
     pub fn detect_language(&mut self, tab_id: u64, events: &Sender<UiEvent>) {
+        if self.large.is_some() || self.buffer.len_bytes() > SYNTAX_MAX_BYTES {
+            self.syntax = None;
+            return;
+        }
         let first_line = self.buffer.line(0).unwrap_or_default();
         let Some(config) = forge_syntax::detect(self.path(), &first_line) else {
             self.syntax = None;
@@ -200,7 +277,7 @@ impl EditorTab {
     }
 
     pub fn scroll_by(&mut self, delta: isize) {
-        let max = self.buffer.len_lines().saturating_sub(1);
+        let max = self.total_lines().saturating_sub(1);
         self.scroll_line = self.scroll_line.saturating_add_signed(delta).min(max);
     }
 
@@ -242,6 +319,10 @@ impl EditorTab {
 
     /// Cursor at a 1-based line and column, as links and the CLI give them.
     pub fn go_to(&mut self, line: u32, column: Option<u32>) {
+        if self.large.is_some() {
+            self.pending_center = Some(usize::try_from(line.saturating_sub(1)).unwrap_or(0));
+            return;
+        }
         let at = self.buffer.char_at(Position {
             line: usize::try_from(line.saturating_sub(1)).unwrap_or(0),
             column: usize::try_from(column.unwrap_or(1).saturating_sub(1)).unwrap_or(0),
@@ -488,7 +569,7 @@ fn paint_editor(
     let font_size = px(paint.metrics.font_size);
     let rows = ((f32::from(bounds.size.height) / paint.metrics.height).floor() as usize).max(1);
     editor.visible_rows = rows;
-    let total_lines = editor.buffer.len_lines();
+    let total_lines = editor.total_lines();
     if let Some(line) = editor.pending_center.take() {
         editor.scroll_line = line.saturating_sub(rows / 2);
     }
@@ -507,11 +588,41 @@ fn paint_editor(
         ),
     );
     editor.last_text_bounds = Some(text_bounds);
-    let selections = editor.buffer.selections().clone();
-    let primary_line = editor.buffer.position_of(selections.primary().head).line;
     let first = editor.scroll_line;
     let last = (first + rows).min(total_lines);
     let text_system = window.text_system().clone();
+    if let Some(file) = &editor.large {
+        // Read-only view: lines straight from the map, no cursor.
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            window.paint_layer(bounds, |window| {
+                for line in first..last {
+                    let y = bounds.origin.y + line_height * ((line - first) as f32);
+                    let text = file.line(line, LARGE_LINE_PAINT_BYTES).unwrap_or_default();
+                    let (display, _) = display_line(&text, paint.tab_size);
+                    let runs = paint.runs(&text, &[], display.len(), &[]);
+                    let shaped =
+                        text_system.shape_line(SharedString::from(display), font_size, &runs, None);
+                    let _ = shaped.paint(point(text_bounds.origin.x, y), line_height, window, cx);
+                    if paint.line_numbers {
+                        paint_line_number(
+                            line,
+                            digits,
+                            paint,
+                            false,
+                            bounds,
+                            y,
+                            &text_system,
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            });
+        });
+        return;
+    }
+    let selections = editor.buffer.selections().clone();
+    let primary_line = editor.buffer.position_of(selections.primary().head).line;
     // Highlights come from the tree as of the last successful parse; a
     // parse that ran out of budget keeps the previous tree, so a stale
     // frame is at worst one keystroke behind.
@@ -598,28 +709,14 @@ fn paint_editor(
                     ));
                 }
                 if paint.line_numbers {
-                    let number = format!("{:>width$}", line + 1, width = digits);
-                    let run = TextRun {
-                        len: number.len(),
-                        font: paint.font.clone(),
-                        color: if line == primary_line {
-                            paint.foreground
-                        } else {
-                            paint.muted
-                        },
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    };
-                    let shaped = text_system.shape_line(
-                        SharedString::from(number),
-                        font_size,
-                        std::slice::from_ref(&run),
-                        None,
-                    );
-                    let _ = shaped.paint(
-                        point(bounds.origin.x + px(GUTTER_PADDING), y),
-                        line_height,
+                    paint_line_number(
+                        line,
+                        digits,
+                        paint,
+                        line == primary_line,
+                        bounds,
+                        y,
+                        &text_system,
                         window,
                         cx,
                     );
@@ -627,6 +724,55 @@ fn paint_editor(
             }
         });
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_line_number(
+    line: usize,
+    digits: usize,
+    paint: &EditorPaint,
+    current: bool,
+    bounds: Bounds<Pixels>,
+    y: Pixels,
+    text_system: &gpui::WindowTextSystem,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let number = format!("{:>width$}", line + 1, width = digits);
+    let run = TextRun {
+        len: number.len(),
+        font: paint.font.clone(),
+        color: if current {
+            paint.foreground
+        } else {
+            paint.muted
+        },
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = text_system.shape_line(
+        SharedString::from(number),
+        px(paint.metrics.font_size),
+        std::slice::from_ref(&run),
+        None,
+    );
+    let _ = shaped.paint(
+        point(bounds.origin.x + px(GUTTER_PADDING), y),
+        px(paint.metrics.height),
+        window,
+        cx,
+    );
+}
+
+/// `MemAvailable` from `/proc/meminfo`; `None` elsewhere.
+fn available_memory_bytes() -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = info
+        .lines()
+        .find(|line| line.starts_with("MemAvailable:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
 }
 
 impl ForgeWindow {
@@ -647,6 +793,24 @@ impl ForgeWindow {
                 .is_some_and(|editor| editor.path() == Some(path.as_path()))
         }) {
             self.activate_tab(index, cx);
+        } else if large::is_large(&path).unwrap_or(false) {
+            match LargeFile::open(&path) {
+                Ok(file) => {
+                    let editor = EditorTab::large(path.clone(), file);
+                    self.push_tab(TabContent::Editor(Box::new(editor)), cx);
+                    self.notify_user(
+                        NotificationLevel::Info,
+                        format!(
+                            "{} abierto en modo archivo grande (solo lectura, sin resaltado)",
+                            path.display()
+                        ),
+                    );
+                }
+                Err(error) => self.notify_user(
+                    NotificationLevel::Error,
+                    format!("No se pudo mapear {}: {error}", path.display()),
+                ),
+            }
         } else {
             let file = match LoadedFile::read(&path) {
                 Ok(file) => file,
@@ -691,6 +855,36 @@ impl ForgeWindow {
             && let Some(editor) = self.active_tab_mut().editor_mut()
         {
             editor.go_to(line, column);
+        }
+        cx.notify();
+    }
+
+    /// Loads a large-mode file into memory so it becomes editable.
+    pub fn materialize_active(&mut self, cx: &mut Context<Self>) {
+        let tab_id = self.active_tab().id;
+        let events = self.event_tx.clone();
+        let Some(editor) = self.active_tab_mut().editor_mut() else {
+            return;
+        };
+        if !editor.is_large() {
+            return;
+        }
+        match editor.materialize() {
+            Ok(()) => {
+                editor.detect_language(tab_id, &events);
+                if let Some(path) = editor.path().map(Path::to_path_buf) {
+                    let mut buffer = std::mem::take(&mut editor.buffer);
+                    let _ = self.attach_journal(&mut buffer, &path);
+                    if let Some(editor) = self.active_tab_mut().editor_mut() {
+                        editor.buffer = buffer;
+                    }
+                }
+                self.notify_user(
+                    NotificationLevel::Info,
+                    "Archivo cargado en memoria; ya se puede editar",
+                );
+            }
+            Err(error) => self.notify_user(NotificationLevel::Warning, error),
         }
         cx.notify();
     }
@@ -750,6 +944,9 @@ impl ForgeWindow {
         let Some(editor) = self.active_tab_mut().editor_mut() else {
             return;
         };
+        if editor.is_large() {
+            return;
+        }
         match &editor.file {
             Some(file) => {
                 let text = editor.buffer.text();
@@ -847,6 +1044,26 @@ impl ForgeWindow {
         let Some(editor) = self.active_tab_mut().editor_mut() else {
             return;
         };
+        if editor.is_large() {
+            let rows = editor.visible_rows.saturating_sub(1).max(1);
+            match key {
+                "up" => editor.scroll_by(-1),
+                "down" => editor.scroll_by(1),
+                "pageup" => editor.scroll_by(-isize::try_from(rows).unwrap_or(1)),
+                "pagedown" => editor.scroll_by(isize::try_from(rows).unwrap_or(1)),
+                "home" if modifiers.control => editor.scroll_line = 0,
+                "end" if modifiers.control => editor.scroll_by(isize::MAX / 2),
+                _ if key_char.is_some() && !modifiers.control && !modifiers.alt => {
+                    self.notify_user(
+                        NotificationLevel::Info,
+                        "Archivo grande en solo lectura: usa editor.materialize para editarlo",
+                    );
+                }
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
         let extend = modifiers.shift;
         let word = modifiers.control;
         let rows = editor.visible_rows.saturating_sub(1).max(1);
@@ -1130,7 +1347,10 @@ impl ForgeWindow {
     /// Char index under a window position in the active editor.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn editor_char_at(&self, position: Point<Pixels>, window: &Window) -> Option<usize> {
-        let editor = self.active_tab().editor()?;
+        let editor = self
+            .active_tab()
+            .editor()
+            .filter(|editor| !editor.is_large())?;
         let bounds = editor.last_text_bounds?;
         let metrics = self.factory.metrics;
         let row = ((f32::from(position.y - bounds.origin.y)) / metrics.height)
@@ -1241,7 +1461,10 @@ impl ForgeWindow {
     /// Cursor rectangle for IME candidate windows.
     #[allow(clippy::cast_precision_loss)]
     pub fn editor_cursor_bounds(&self, window: &Window) -> Option<Bounds<Pixels>> {
-        let editor = self.active_tab().editor()?;
+        let editor = self
+            .active_tab()
+            .editor()
+            .filter(|editor| !editor.is_large())?;
         let bounds = editor.last_text_bounds?;
         let head = editor.buffer.selections().primary().head;
         let position = editor.buffer.position_of(head);

@@ -1838,6 +1838,7 @@ name = "forge-buffer"
 version = "0.0.1"
 dependencies = [
  "encoding_rs",
+ "memmap2",
  "proptest",
  "ropey",
  "serde",

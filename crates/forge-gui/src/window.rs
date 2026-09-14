@@ -1646,6 +1646,7 @@ impl ForgeWindow {
             ShellCommand::SearchProject => self.open_finder(FinderMode::ProjectSearch, cx),
             ShellCommand::EditorFind => self.open_find(false, cx),
             ShellCommand::EditorReplace => self.open_find(true, cx),
+            ShellCommand::EditorMaterialize => self.materialize_active(cx),
             other => self.run_layout_command(other, cx),
         }
     }

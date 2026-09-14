@@ -3,6 +3,7 @@
 //! buffers changed on disk.
 
 use crate::{
+    editor::EditorTab,
     ipc::UiEvent,
     window::{ForgeWindow, NotificationLevel},
 };
@@ -363,7 +364,7 @@ impl ForgeWindow {
     // ----- in-buffer find/replace -----------------------------------------
 
     pub fn open_find(&mut self, replace: bool, cx: &mut Context<Self>) {
-        if self.active_tab().editor().is_none() {
+        if self.active_tab().editor().is_none_or(EditorTab::is_large) {
             return;
         }
         // Seed the query with the selection, like most editors.
@@ -629,6 +630,11 @@ impl ForgeWindow {
                 self.notify_user(
                     NotificationLevel::Warning,
                     format!("{name} se borró en disco; guarda para recrearlo"),
+                );
+            } else if editor.is_large() {
+                self.notify_user(
+                    NotificationLevel::Warning,
+                    format!("{name} cambió en disco; reábrelo para ver el contenido nuevo"),
                 );
             } else if editor.buffer.is_dirty() {
                 self.notify_user(

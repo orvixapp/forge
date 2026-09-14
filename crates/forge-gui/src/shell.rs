@@ -57,10 +57,11 @@ pub enum ShellCommand {
     SearchProject,
     EditorFind,
     EditorReplace,
+    EditorMaterialize,
 }
 
 impl ShellCommand {
-    pub const ALL: [Self; 45] = [
+    pub const ALL: [Self; 46] = [
         Self::NewTerminalTab,
         Self::NewTerminalTabInDirectory,
         Self::CloseWindow,
@@ -106,6 +107,7 @@ impl ShellCommand {
         Self::SearchProject,
         Self::EditorFind,
         Self::EditorReplace,
+        Self::EditorMaterialize,
     ];
 
     #[must_use]
@@ -156,6 +158,7 @@ impl ShellCommand {
             Self::SearchProject => "project.search",
             Self::EditorFind => "editor.find",
             Self::EditorReplace => "editor.replace",
+            Self::EditorMaterialize => "editor.materialize",
         }
     }
 
@@ -207,6 +210,7 @@ impl ShellCommand {
             Self::SearchProject => "Search in project…",
             Self::EditorFind => "Find in file",
             Self::EditorReplace => "Find and replace in file",
+            Self::EditorMaterialize => "Load large file into memory for editing",
         }
     }
 
