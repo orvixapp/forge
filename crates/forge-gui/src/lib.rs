@@ -656,6 +656,7 @@ mod tests {
         let changed = grid
             .apply_server_message(ServerMessage::Initialized {
                 protocol_version: 2,
+                daemon_instance: 1,
             })
             .unwrap();
         assert!(!changed);

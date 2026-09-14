@@ -44,7 +44,7 @@ type RowCellsNew = unsafe extern "C" fn(*const c_void, *mut RawRowCells) -> i32;
 type RowCellsFree = unsafe extern "C" fn(RawRowCells);
 type RowCellsNext = unsafe extern "C" fn(RawRowCells) -> bool;
 type RowCellsGet = unsafe extern "C" fn(RawRowCells, i32, *mut c_void) -> i32;
-type RowIteratorNext = unsafe extern "C" fn(RawRowIterator, *mut u16) -> bool;
+type RowIteratorNext = unsafe extern "C" fn(RawRowIterator) -> bool;
 type TerminalSet = unsafe extern "C" fn(RawTerminal, i32, *const c_void) -> i32;
 type TerminalGet = unsafe extern "C" fn(RawTerminal, i32, *mut c_void) -> i32;
 type TerminalScrollViewport = unsafe extern "C" fn(RawTerminal, GhosttyScrollViewport);
@@ -1105,12 +1105,18 @@ impl GhosttyTerminal {
             raw: cells,
         };
         let mut rows = Vec::new();
+        let mut viewport_y = 0_u16;
         loop {
             let mut y = 0;
             let more = if only_dirty {
                 unsafe { (self.api.row_iterator_next_dirty)(iterator.raw, &raw mut y) }
             } else {
-                unsafe { (self.api.row_iterator_next)(iterator.raw, &raw mut y) }
+                y = viewport_y;
+                let advanced = unsafe { (self.api.row_iterator_next)(iterator.raw) };
+                if advanced {
+                    viewport_y = viewport_y.saturating_add(1);
+                }
+                advanced
             };
             if !more {
                 break;

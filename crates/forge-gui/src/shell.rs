@@ -483,6 +483,10 @@ pub struct WindowSession {
     /// this field existed.
     #[serde(default)]
     pub sessions: Vec<Option<u64>>,
+    /// Namespace for `sessions`; absent in legacy files, whose numeric IDs
+    /// must never be reattached.
+    #[serde(default)]
+    pub daemon_instance: Option<u64>,
 }
 
 impl WindowSession {
@@ -776,6 +780,7 @@ mod tests {
             height: 600.0,
             theme: Some("forge-light".into()),
             sessions: vec![Some(7), None],
+            daemon_instance: Some(42),
         };
         session.save(&path).unwrap();
         assert_eq!(WindowSession::load(&path).unwrap(), Some(session.clone()));

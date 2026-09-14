@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const HEADER_BYTES: usize = 8;
 
@@ -533,6 +533,9 @@ impl Viewport {
 pub enum ServerMessage {
     Initialized {
         protocol_version: u16,
+        /// Changes every time the daemon process starts. Session IDs are only
+        /// meaningful inside this namespace.
+        daemon_instance: u64,
     },
     SessionCreated {
         request_id: u64,

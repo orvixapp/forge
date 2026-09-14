@@ -25,6 +25,7 @@ pub enum UiEvent {
     Attached {
         tab_id: u64,
         session_id: u64,
+        daemon_instance: u64,
     },
 }
 
@@ -58,6 +59,8 @@ pub struct SessionSpec {
     /// Daemon session from the saved layout; a new one is created when the
     /// daemon no longer has it.
     pub attach: Option<u64>,
+    /// Instance that issued `attach`; IDs from another daemon are stale.
+    pub daemon_instance: Option<u64>,
 }
 
 #[cfg(unix)]
@@ -130,6 +133,7 @@ mod unix {
         FrameReader<tokio::net::unix::OwnedReadHalf>,
         tokio::net::unix::OwnedWriteHalf,
         u64,
+        u64,
         Option<DaemonGuard>,
     )> {
         let (stream, daemon) = connect_or_start_daemon(&spec.socket).await?;
@@ -144,12 +148,17 @@ mod unix {
             },
         )
         .await?;
-        match reader.read_message::<ServerMessage>().await?.1 {
-            ServerMessage::Initialized { protocol_version }
-                if protocol_version == PROTOCOL_VERSION => {}
+        let daemon_instance = match reader.read_message::<ServerMessage>().await?.1 {
+            ServerMessage::Initialized {
+                protocol_version,
+                daemon_instance,
+            } if protocol_version == PROTOCOL_VERSION => daemon_instance,
             message => bail!("respuesta initialize inesperada: {message:?}"),
-        }
-        let existing = match spec.attach {
+        };
+        let existing = match spec
+            .attach
+            .filter(|_| spec.daemon_instance == Some(daemon_instance))
+        {
             Some(wanted) => {
                 write_message(
                     &mut writer,
@@ -194,7 +203,7 @@ mod unix {
             &ClientMessage::Attach { session_id },
         )
         .await?;
-        Ok((reader, writer, session_id, daemon))
+        Ok((reader, writer, session_id, daemon_instance, daemon))
     }
 
     pub async fn run_ipc(
@@ -204,11 +213,17 @@ mod unix {
         mut input: async_mpsc::UnboundedReceiver<IpcCommand>,
     ) -> Result<()> {
         let wanted = spec.attach;
-        let (mut reader, mut writer, session_id, _daemon) = handshake(spec).await?;
-        let _ = events.send(UiEvent::Attached { tab_id, session_id });
+        let expected_daemon = spec.daemon_instance;
+        let (mut reader, mut writer, session_id, daemon_instance, _daemon) =
+            handshake(spec).await?;
+        let _ = events.send(UiEvent::Attached {
+            tab_id,
+            session_id,
+            daemon_instance,
+        });
         let _ = events.send(UiEvent::Status {
             tab_id,
-            status: if wanted == Some(session_id) {
+            status: if wanted == Some(session_id) && expected_daemon == Some(daemon_instance) {
                 format!("Sesión {session_id} recuperada")
             } else {
                 format!("Sesión {session_id} conectada")

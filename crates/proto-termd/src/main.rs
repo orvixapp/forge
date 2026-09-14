@@ -24,6 +24,7 @@ mod unix {
         path::PathBuf,
         sync::{Arc, Mutex, mpsc},
         thread,
+        time::{SystemTime, UNIX_EPOCH},
     };
     use tokio::{
         net::{UnixListener, UnixStream},
@@ -519,6 +520,7 @@ mod unix {
     }
 
     struct Daemon {
+        instance_id: u64,
         ghostty: GhosttyLibrary,
         sessions: RwLock<HashMap<u64, Arc<Session>>>,
         next_session_id: std::sync::atomic::AtomicU64,
@@ -526,7 +528,12 @@ mod unix {
 
     impl Daemon {
         fn new(ghostty: GhosttyLibrary) -> Self {
+            let started = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            let started = started.as_secs() ^ (u64::from(started.subsec_nanos()) << 32);
             Self {
+                instance_id: started ^ u64::from(std::process::id()),
                 ghostty,
                 sessions: RwLock::new(HashMap::new()),
                 next_session_id: std::sync::atomic::AtomicU64::new(0),
@@ -817,6 +824,7 @@ mod unix {
                         FrameKind::Response,
                         ServerMessage::Initialized {
                             protocol_version: PROTOCOL_VERSION,
+                            daemon_instance: daemon.instance_id,
                         },
                     ))
                     .await?;

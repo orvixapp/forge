@@ -76,7 +76,7 @@ impl WindowFactory {
             .map(|path| path.with_file_name("session.json"))
     }
 
-    fn spec(&self, cwd: PathBuf, attach: Option<u64>) -> SessionSpec {
+    fn spec(&self, cwd: PathBuf, attach: Option<u64>, daemon_instance: Option<u64>) -> SessionSpec {
         let chrome_height = chrome::TOPBAR_HEIGHT + chrome::STATUS_HEIGHT;
         let (cols, rows) = crate::grid_dimensions(self.window_size, self.metrics, chrome_height);
         SessionSpec {
@@ -87,6 +87,7 @@ impl WindowFactory {
             cols,
             rows,
             attach,
+            daemon_instance,
         }
     }
 
@@ -203,6 +204,7 @@ pub struct ForgeWindow {
     pub notifications: Vec<Notification>,
     /// IME composition in progress, shown in the status line.
     pub marked_text: Option<String>,
+    daemon_instance: Option<u64>,
 }
 
 impl ForgeWindow {
@@ -229,6 +231,7 @@ impl ForgeWindow {
             split: None,
             notifications: Vec::new(),
             marked_text: None,
+            daemon_instance: None,
         };
         // Tabs must exist before the first draw, which happens inside
         // `open_window`, so the saved layout is applied here.
@@ -390,6 +393,7 @@ impl ForgeWindow {
             height: f32::from(self.factory.window_size.height),
             theme: Some(self.theme_name.clone()),
             sessions: self.tabs.iter().map(|tab| tab.session_id).collect(),
+            daemon_instance: self.daemon_instance,
         }
     }
 
@@ -432,7 +436,12 @@ impl ForgeWindow {
             self.factory.cwd = session.cwd.clone();
         }
         for index in 0..session.count {
-            self.open_tab(None, session.daemon_session(index), cx);
+            self.open_tab(
+                None,
+                session.daemon_session(index),
+                session.daemon_instance,
+                cx,
+            );
         }
         self.active_tab = session.active.min(self.tabs.len().saturating_sub(1));
         self.split = session.split;
@@ -474,7 +483,7 @@ impl ForgeWindow {
     /// Creates a tab (and its daemon session) and makes it active. Without an
     /// explicit directory the new shell starts where the active one is (OSC 7).
     pub fn create_terminal_tab(&mut self, cwd: Option<PathBuf>, cx: &mut Context<Self>) -> usize {
-        self.open_tab(cwd, None, cx)
+        self.open_tab(cwd, None, None, cx)
     }
 
     /// Like [`Self::create_terminal_tab`], reattaching to a daemon session
@@ -483,6 +492,7 @@ impl ForgeWindow {
         &mut self,
         cwd: Option<PathBuf>,
         attach: Option<u64>,
+        daemon_instance: Option<u64>,
         cx: &mut Context<Self>,
     ) -> usize {
         let cwd = cwd.or_else(|| {
@@ -527,7 +537,7 @@ impl ForgeWindow {
         if self.factory.start_ipc {
             let cwd = cwd.unwrap_or_else(|| self.factory.cwd.clone());
             spawn_ipc_worker(
-                self.factory.spec(cwd, attach),
+                self.factory.spec(cwd, attach, daemon_instance),
                 id,
                 self.event_tx.clone(),
                 input_rx,
@@ -670,7 +680,12 @@ impl ForgeWindow {
                     tab.status = status;
                 }
             }
-            UiEvent::Attached { tab_id, session_id } => {
+            UiEvent::Attached {
+                tab_id,
+                session_id,
+                daemon_instance,
+            } => {
+                self.daemon_instance = Some(daemon_instance);
                 if let Some(tab) = self.tab_mut(tab_id) {
                     tab.session_id = Some(session_id);
                 }
