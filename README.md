@@ -182,6 +182,16 @@ memory-mapped and read-only (`editor.materialize` loads them for editing).
 `editor.autosave_ms` saves dirty files after a quiet period; `editor.modal`
 enables a small Helix-like Normal/Insert keymap.
 
+Settings: `Ctrl+,`, the gear in the top bar, or "Settings…" in any
+right-click menu (terminal, editor, agent panel, tab strip) opens a menu
+that edits the TOML for you: open the user or workspace file in an editor
+tab (created from a commented template when missing), add a provider or an
+agent through a short wizard, pick the theme, or switch the UI language.
+Wizards edit `config.toml` in place with comments preserved; the change
+applies within a second like any manual edit. `ui.language = "spanish" |
+"english"` selects one language for every message, menu and command title
+(default Spanish).
+
 Agents (ACP): `Ctrl+Shift+A` opens a session with the first enabled
 `[[agents]]` entry (see `docs/PHASE_4_TESTING.md` for OpenCode, Codex and
 Claude Code). Providers and routing:

@@ -6,6 +6,7 @@ mod grid_element;
 mod ipc;
 mod project;
 mod search;
+mod settings;
 mod window;
 
 use crate::{

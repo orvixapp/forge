@@ -7,10 +7,8 @@ use crate::{
     grid_element::{TerminalGridElement, color},
     window::{ConfirmationKind, ForgeWindow, NotificationLevel, TabContent},
 };
-use forge_gui::{
-    config::Language,
-    shell::{PaneTree, Rect, ShellCommand, search_commands},
-};
+use forge_gui::i18n::{tr, trf};
+use forge_gui::shell::{PaneTree, Rect, ShellCommand, search_commands};
 use gpui::{
     AnyElement, Context, CursorStyle, ImageSource, MouseButton, ResizeEdge, Resource, SharedString,
     Window, div, img, prelude::*, px, rgb,
@@ -139,6 +137,13 @@ fn topbar(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> impl IntoElement
         )
         .child(topbar_notice(view))
         .child(
+            chrome_button("forge-settings", "⚙", theme.chrome_active, view).on_click(cx.listener(
+                |view, _, window, cx| {
+                    view.run_shell_command(ShellCommand::OpenSettings, window, cx);
+                },
+            )),
+        )
+        .child(
             chrome_button("forge-minimize", "—", theme.chrome_active, view)
                 .on_click(|_, window, _| window.minimize_window()),
         )
@@ -205,6 +210,14 @@ fn tab_button(
         .cursor_pointer()
         .hover(move |style| style.bg(color(theme.chrome_active)))
         .on_click(cx.listener(move |view, _, _, cx| view.activate_tab(index, cx)))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |view, event: &gpui::MouseDownEvent, _, cx| {
+                view.activate_tab(index, cx);
+                view.open_context_menu_for(crate::window::MenuTarget::Tab, event.position, cx);
+                cx.stop_propagation();
+            }),
+        )
         .child(
             div()
                 .flex_1()
@@ -234,7 +247,6 @@ fn tab_button(
 /// Latest notification, or the new-tab hint when there is none.
 fn topbar_notice(view: &ForgeWindow) -> impl IntoElement {
     let theme = view.theme;
-    let english = view.config.ui.language == Language::English;
     if let Some(note) = view.notifications.last() {
         let tint = match note.level {
             NotificationLevel::Info => theme.accent,
@@ -252,13 +264,7 @@ fn topbar_notice(view: &ForgeWindow) -> impl IntoElement {
     let hint = view
         .keymap
         .chord_for(ShellCommand::NewTerminalTab)
-        .map(|chord| {
-            if english {
-                format!("{chord} · new tab")
-            } else {
-                format!("{chord} · nueva pestaña")
-            }
-        })
+        .map(|chord| trf("{} · new tab", &[&chord]))
         .unwrap_or_default();
     div()
         .text_size(px(12.0))
@@ -571,20 +577,20 @@ fn process_explorer(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> impl I
                 ),
         )
         .child(
-            div()
-                .mt(px(4.0))
-                .text_color(color(theme.muted))
-                .child(format!(
-                    "tema {} · fuente {} {}px · config {}",
-                    view.theme_name,
-                    view.config.font.family,
-                    view.config.font.size,
-                    view.factory
+            div().mt(px(4.0)).text_color(color(theme.muted)).child(trf(
+                "theme {} · font {} {}px · config {}",
+                &[
+                    &view.theme_name,
+                    &view.config.font.family,
+                    &view.config.font.size,
+                    &view
+                        .factory
                         .sources
                         .user
                         .as_deref()
-                        .map_or_else(|| "—".into(), |path| path.display().to_string())
-                )),
+                        .map_or_else(|| "—".into(), |path| path.display().to_string()),
+                ],
+            )),
         )
         .children(view.tabs.iter().map(|tab| {
             let size = match &tab.content {
@@ -592,8 +598,8 @@ fn process_explorer(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> impl I
                     let (cols, rows) = terminal.terminal.grid.dimensions();
                     format!("{cols}×{rows}")
                 }
-                TabContent::Editor(editor) => format!("{} líneas", editor.buffer.len_lines()),
-                TabContent::Agent(agent) => format!("{} eventos", agent.timeline.len()),
+                TabContent::Editor(editor) => trf("{} lines", &[&editor.buffer.len_lines()]),
+                TabContent::Agent(agent) => trf("{} events", &[&agent.timeline.len()]),
             };
             div()
                 .mt(px(4.0))
@@ -601,6 +607,7 @@ fn process_explorer(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> impl I
         }))
 }
 
+#[allow(clippy::too_many_lines)]
 fn agent_panel(
     agent: &crate::agent::AgentTab,
     tab_id: u64,
@@ -619,10 +626,12 @@ fn agent_panel(
             div()
                 .text_size(px(15.0))
                 .text_color(color(theme.accent))
-                .child(format!(
-                    "Sesión ACP · {} · {}",
-                    agent.agent_name,
-                    agent.session_id.as_deref().unwrap_or("sin id")
+                .child(trf(
+                    "ACP session · {} · {}",
+                    &[
+                        &agent.agent_name,
+                        &agent.session_id.as_deref().unwrap_or(tr("no id")),
+                    ],
                 )),
         )
         .when(!agent.route.is_empty(), |panel| {
@@ -632,7 +641,7 @@ fn agent_panel(
                 div()
                     .text_size(px(11.0))
                     .text_color(color(theme.muted))
-                    .child(format!("Ruta: {}", agent.route)),
+                    .child(trf("Route: {}", &[&agent.route])),
             )
         })
         .when(!agent.context.is_empty(), |panel| {
@@ -687,7 +696,7 @@ fn agent_panel(
                 .border_1()
                 .border_color(color(theme.chrome_active_border))
                 .child(if agent.prompt.is_empty() {
-                    "Escribe un prompt…  (Enter para enviar)".to_owned()
+                    tr("Type a prompt…  (Enter sends)").to_owned()
                 } else {
                     agent.prompt.clone()
                 }),
@@ -696,15 +705,17 @@ fn agent_panel(
             div()
                 .text_size(px(10.0))
                 .text_color(color(theme.muted))
-                .child(format!(
-                    "eventos {}–{} de {} · rueda/PageUp/PageDown para navegar",
-                    agent
-                        .visible_range()
-                        .start
-                        .saturating_add(1)
-                        .min(agent.timeline.len()),
-                    agent.visible_range().end,
-                    agent.timeline.len()
+                .child(trf(
+                    "events {}–{} of {} · wheel/PageUp/PageDown to navigate",
+                    &[
+                        &agent
+                            .visible_range()
+                            .start
+                            .saturating_add(1)
+                            .min(agent.timeline.len()),
+                        &agent.visible_range().end,
+                        &agent.timeline.len(),
+                    ],
                 )),
         )
 }
@@ -750,7 +761,7 @@ fn agent_permission_buttons(
         .mt(px(4.0))
         .child(agent_perm_button(
             SharedString::from(format!("perm-once-{tab_id}-{}", pending.id)),
-            "Permitir una vez",
+            tr("Allow once"),
             theme.accent,
             theme.chrome,
             tab_id,
@@ -761,7 +772,7 @@ fn agent_permission_buttons(
         ))
         .child(agent_perm_button(
             SharedString::from(format!("perm-sess-{tab_id}-{}", pending.id)),
-            "Permitir en esta sesión",
+            tr("Allow for this session"),
             theme.chrome_active,
             theme.foreground,
             tab_id,
@@ -772,7 +783,7 @@ fn agent_permission_buttons(
         ))
         .child(agent_perm_button(
             SharedString::from(format!("perm-always-{tab_id}-{}", pending.id)),
-            "Permitir siempre",
+            tr("Allow always"),
             theme.chrome_active,
             theme.foreground,
             tab_id,
@@ -783,7 +794,7 @@ fn agent_permission_buttons(
         ))
         .child(agent_perm_button(
             SharedString::from(format!("perm-deny-{tab_id}-{}", pending.id)),
-            "Rechazar",
+            tr("Reject"),
             theme.danger,
             theme.foreground,
             tab_id,
@@ -819,7 +830,7 @@ fn agent_permission_card(
                     div()
                         .text_size(px(13.0))
                         .text_color(color(theme.accent))
-                        .child(format!("Solicitud de permiso · {}", pending.title)),
+                        .child(trf("Permission request · {}", &[&pending.title])),
                 )
                 .child(
                     div()
@@ -838,9 +849,9 @@ fn agent_permission_card(
                 .child(if !pending.detail.is_empty() {
                     pending.detail.clone()
                 } else if pending.scope.is_empty() {
-                    format!("El agente solicita ejecutar {}", pending.tool_name)
+                    trf("The agent asks to run {}", &[&pending.tool_name])
                 } else {
-                    format!("Objetivo: {}", pending.scope)
+                    trf("Target: {}", &[&pending.scope])
                 }),
         )
         .child(agent_permission_buttons(pending, tab_id, theme, cx))
@@ -870,7 +881,7 @@ fn agent_hunk_action_buttons(
                 .text_color(color(theme.chrome))
                 .text_size(px(10.0))
                 .cursor_pointer()
-                .child("Aceptar")
+                .child(tr("Accept"))
                 .on_click(cx.listener(move |window, _, _, cx| {
                     window.agent_accept_hunk(tab_id, edit_idx, hunk_id, cx);
                 })),
@@ -887,7 +898,7 @@ fn agent_hunk_action_buttons(
                 .text_color(color(theme.foreground))
                 .text_size(px(10.0))
                 .cursor_pointer()
-                .child("Rechazar")
+                .child(tr("Reject"))
                 .on_click(cx.listener(move |window, _, _, cx| {
                     window.agent_reject_hunk(tab_id, edit_idx, hunk_id, cx);
                 })),
@@ -914,7 +925,7 @@ fn agent_proposed_hunk_card(
         }
         forge_buffer::HunkStatus::Conflict(msg) => div()
             .text_color(color(theme.danger))
-            .child(format!("Conflicto: {msg}")),
+            .child(trf("Conflict: {}", &[&msg])),
     };
 
     div()
@@ -932,11 +943,13 @@ fn agent_proposed_hunk_card(
                 .justify_between()
                 .items_center()
                 .text_size(px(11.0))
-                .child(format!(
-                    "Hunk #{} · Líneas {}-{}",
-                    hunk.id + 1,
-                    hunk.buffer_lines.start + 1,
-                    hunk.buffer_lines.end
+                .child(trf(
+                    "Hunk #{} · Lines {}-{}",
+                    &[
+                        &(hunk.id + 1),
+                        &(hunk.buffer_lines.start + 1),
+                        &hunk.buffer_lines.end,
+                    ],
                 ))
                 .child(status_badge),
         )
@@ -1009,7 +1022,7 @@ fn agent_proposed_edit_view(
                             div()
                                 .text_size(px(13.0))
                                 .text_color(color(theme.foreground))
-                                .child(format!("Edición propuesta · {}", proposed.path.display())),
+                                .child(trf("Proposed edit · {}", &[&proposed.path.display()])),
                         )
                         .child(
                             div()
@@ -1034,7 +1047,7 @@ fn agent_proposed_edit_view(
                                 .text_color(color(theme.chrome))
                                 .text_size(px(11.0))
                                 .cursor_pointer()
-                                .child("Aceptar todo")
+                                .child(tr("Accept all"))
                                 .on_click(cx.listener(move |window, _, _, cx| {
                                     window.agent_accept_all_hunks(tab_id, edit_idx, cx);
                                 })),
@@ -1049,7 +1062,7 @@ fn agent_proposed_edit_view(
                                 .text_color(color(theme.foreground))
                                 .text_size(px(11.0))
                                 .cursor_pointer()
-                                .child("Rechazar todo")
+                                .child(tr("Reject all"))
                                 .on_click(cx.listener(move |window, _, _, cx| {
                                     window.agent_reject_all_hunks(tab_id, edit_idx, cx);
                                 })),
@@ -1065,7 +1078,7 @@ fn agent_proposed_edit_view(
                     .bg(color(theme.danger))
                     .text_color(color(theme.foreground))
                     .text_size(px(11.0))
-                    .child("⚠ Conflicto detectado: modificaciones concurrentes en el buffer. Revisa los cambios antes de aceptar."),
+                    .child(tr("⚠ Conflict detected: concurrent changes in the buffer. Review them before accepting.")),
             )
         })
         .children(
@@ -1081,9 +1094,9 @@ fn agent_timeline_item(item: &TimelineItem, theme: forge_gui::theme::ThemeColors
     let (label, body, tint) = match item {
         TimelineItem::Message { role, text } => {
             let label = match role {
-                MessageRole::User => "Tú",
-                MessageRole::Agent => "Agente",
-                MessageRole::System => "Sistema",
+                MessageRole::User => tr("You"),
+                MessageRole::Agent => tr("Agent"),
+                MessageRole::System => tr("System"),
             };
             (label, text.clone(), theme.foreground)
         }
@@ -1094,14 +1107,14 @@ fn agent_timeline_item(item: &TimelineItem, theme: forge_gui::theme::ThemeColors
             ..
         } => {
             let state = match state {
-                ToolState::Pending => "pendiente",
-                ToolState::Running => "en curso",
-                ToolState::Succeeded => "completada",
-                ToolState::Failed => "falló",
-                ToolState::WaitingPermission => "espera permiso",
+                ToolState::Pending => tr("pending"),
+                ToolState::Running => tr("running"),
+                ToolState::Succeeded => tr("completed"),
+                ToolState::Failed => tr("failed"),
+                ToolState::WaitingPermission => tr("waiting for permission"),
             };
             (
-                "Herramienta",
+                tr("Tool"),
                 format!("{title} · {state}\n{detail}"),
                 theme.accent,
             )
@@ -1164,7 +1177,7 @@ fn context_menu(
                 .on_click(cx.listener(move |view, _, window, cx| {
                     view.context_menu_pick(index, window, cx);
                 }))
-                .child(command.title())
+                .child(tr(command.title()))
                 .child(
                     div()
                         .text_color(color(theme.muted))
@@ -1194,7 +1207,6 @@ fn overlay_box(view: &ForgeWindow, id: &'static str) -> gpui::Stateful<gpui::Div
 
 fn text_prompt(view: &ForgeWindow, prompt: &crate::window::TextPrompt) -> impl IntoElement {
     let theme = view.theme;
-    let english = view.config.ui.language == Language::English;
     overlay_box(view, "text-prompt")
         .child(
             div()
@@ -1212,17 +1224,17 @@ fn text_prompt(view: &ForgeWindow, prompt: &crate::window::TextPrompt) -> impl I
             div()
                 .text_size(px(11.0))
                 .text_color(color(theme.muted))
-                .child(if english {
-                    "Enter applies · empty restores the automatic name · Esc cancels"
-                } else {
-                    "Enter aplica · vacío recupera el nombre automático · Esc cancela"
+                .child(match prompt.kind {
+                    crate::window::PromptKind::RenameTab => {
+                        tr("Enter applies · empty restores the automatic name · Esc cancels")
+                    }
+                    _ => tr("Enter continues · Esc cancels"),
                 }),
         )
 }
 
 fn picker_overlay(view: &ForgeWindow, picker: &crate::window::Picker) -> impl IntoElement {
     let theme = view.theme;
-    let english = view.config.ui.language == Language::English;
     overlay_box(view, "picker")
         .child(
             div()
@@ -1248,11 +1260,7 @@ fn picker_overlay(view: &ForgeWindow, picker: &crate::window::Picker) -> impl In
             div()
                 .text_size(px(11.0))
                 .text_color(color(theme.muted))
-                .child(if english {
-                    "↑↓ select · Enter opens · Esc closes"
-                } else {
-                    "↑↓ selecciona · Enter abre · Esc cierra"
-                }),
+                .child(tr("↑↓ select · Enter opens · Esc closes")),
         )
 }
 
@@ -1261,7 +1269,6 @@ fn picker_overlay(view: &ForgeWindow, picker: &crate::window::Picker) -> impl In
 #[allow(clippy::too_many_lines)]
 fn finder_overlay(view: &ForgeWindow) -> AnyElement {
     let theme = view.theme;
-    let english = view.config.ui.language == Language::English;
     let Some(finder) = &view.finder else {
         return div().into_any_element();
     };
@@ -1269,29 +1276,12 @@ fn finder_overlay(view: &ForgeWindow) -> AnyElement {
     let first = view.finder_first_row();
     let status = view.finder_status();
     let (title, hint) = match finder.mode {
-        crate::project::FinderMode::Files => (
-            if english {
-                "Go to file"
-            } else {
-                "Ir a archivo"
-            },
-            if english {
-                "↑↓ select · Enter opens · Esc closes"
-            } else {
-                "↑↓ selecciona · Enter abre · Esc cierra"
-            },
-        ),
+        crate::project::FinderMode::Files => {
+            (tr("Go to file"), tr("↑↓ select · Enter opens · Esc closes"))
+        }
         crate::project::FinderMode::ProjectSearch => (
-            if english {
-                "Search in project"
-            } else {
-                "Buscar en el proyecto"
-            },
-            if english {
-                "↑↓ select · Enter opens · Alt+R regex · Alt+C case · Alt+W word · Esc closes"
-            } else {
-                "↑↓ selecciona · Enter abre · Alt+R regex · Alt+C mayúsculas · Alt+W palabra · Esc cierra"
-            },
+            tr("Search in project"),
+            tr("↑↓ select · Enter opens · Alt+R regex · Alt+C case · Alt+W word · Esc closes"),
         ),
     };
     let flags = match finder.mode {
@@ -1411,7 +1401,6 @@ fn finder_label(
 /// Find/replace bar of the active editor, top-right like the terminal's.
 fn find_bar(view: &ForgeWindow) -> impl IntoElement {
     let theme = view.theme;
-    let english = view.config.ui.language == Language::English;
     let find = &view.find;
     let status = find.error.clone().unwrap_or_else(|| find.label());
     let field = |label: &str, value: &str, focused: bool| {
@@ -1469,11 +1458,9 @@ fn find_bar(view: &ForgeWindow) -> impl IntoElement {
             div()
                 .text_size(px(11.0))
                 .text_color(color(theme.muted))
-                .child(if english {
-                    "Enter next · Shift+Enter previous · Tab field · Ctrl+Enter replace · Ctrl+Alt+Enter all · Alt+R/C/W"
-                } else {
-                    "Enter siguiente · Shift+Enter anterior · Tab campo · Ctrl+Enter reemplaza · Ctrl+Alt+Enter todos · Alt+R/C/W"
-                }),
+                .child(tr(
+                    "Enter next · Shift+Enter previous · Tab field · Ctrl+Enter replace · Ctrl+Alt+Enter all · Alt+R/C/W",
+                )),
         )
 }
 
@@ -1484,13 +1471,11 @@ fn confirmation_dialog(
     confirmation: &crate::window::Confirmation,
 ) -> impl IntoElement {
     let theme = view.theme;
-    let english = view.config.ui.language == Language::English;
     let remember = matches!(confirmation.kind, ConfirmationKind::Clipboard { .. });
-    let hint = match (english, remember) {
-        (true, true) => "Enter/Y allow · A allow for this tab · Esc/N deny",
-        (true, false) => "Enter/Y paste · Esc/N cancel",
-        (false, true) => "Enter/Y permitir · A permitir en esta pestaña · Esc/N denegar",
-        (false, false) => "Enter/Y pegar · Esc/N cancelar",
+    let hint = if remember {
+        tr("Enter/Y allow · A allow for this tab · Esc/N deny")
+    } else {
+        tr("Enter/Y paste · Esc/N cancel")
     };
     div()
         .id("confirmation")
@@ -1537,25 +1522,12 @@ fn confirmation_dialog(
 /// back; Alt+R / Alt+C toggle regex and case sensitivity.
 fn search_bar(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> impl IntoElement {
     let theme = view.theme;
-    let english = view.config.ui.language == Language::English;
     let search = &view.search;
     let position = search.position_label();
     let status = match &search.error {
         Some(error) => error.clone(),
-        None if search.query.is_empty() => {
-            if english {
-                "type to search".into()
-            } else {
-                "escribe para buscar".into()
-            }
-        }
-        None if search.matches.is_empty() => {
-            if english {
-                "no matches".into()
-            } else {
-                "sin coincidencias".into()
-            }
-        }
+        None if search.query.is_empty() => tr("type to search").into(),
+        None if search.matches.is_empty() => tr("no matches").into(),
         None => position.clone(),
     };
     div()
@@ -1605,11 +1577,9 @@ fn search_bar(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> impl IntoEle
             div()
                 .text_size(px(11.0))
                 .text_color(color(theme.muted))
-                .child(if english {
-                    "Enter/↑ older · Shift+Enter/↓ newer · Alt+R regex · Alt+C case · Esc closes"
-                } else {
-                    "Enter/↑ anterior · Shift+Enter/↓ siguiente · Alt+R regex · Alt+C mayúsculas · Esc cierra"
-                }),
+                .child(tr(
+                    "Enter/↑ older · Shift+Enter/↓ newer · Alt+R regex · Alt+C case · Esc closes",
+                )),
         )
 }
 
@@ -1658,7 +1628,6 @@ fn search_toggles(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> Vec<AnyE
 
 fn palette(view: &ForgeWindow) -> impl IntoElement {
     let theme = view.theme;
-    let english = view.config.ui.language == Language::English;
     let matches = search_commands(&view.palette.query);
     let first_visible = view.palette.index.saturating_sub(5);
     div()
@@ -1683,11 +1652,7 @@ fn palette(view: &ForgeWindow) -> impl IntoElement {
                 .mt(px(6.0))
                 .text_size(px(11.0))
                 .text_color(color(theme.muted))
-                .child(if english {
-                    "↑↓ select · Enter runs · Esc closes"
-                } else {
-                    "↑↓ selecciona · Enter ejecuta · Esc cierra"
-                }),
+                .child(tr("↑↓ select · Enter runs · Esc closes")),
         )
         .children(
             matches
@@ -1710,7 +1675,7 @@ fn palette(view: &ForgeWindow) -> impl IntoElement {
                             theme.chrome_active
                         }))
                         .text_size(px(13.0))
-                        .child(item.command.title())
+                        .child(tr(item.command.title()))
                         .child(
                             div()
                                 .text_color(color(theme.muted))
@@ -1718,13 +1683,13 @@ fn palette(view: &ForgeWindow) -> impl IntoElement {
                         )
                 }),
         )
-        .when(view.palette.query.is_empty() && !english, |root| {
+        .when(view.palette.query.is_empty(), |root| {
             root.child(
                 div()
                     .mt(px(8.0))
                     .text_size(px(11.0))
                     .text_color(rgb(0x7f_8a_a3))
-                    .child("Escribe para filtrar comandos"),
+                    .child(tr("Type to filter commands")),
             )
         })
 }

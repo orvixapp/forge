@@ -5,6 +5,7 @@
 //! in-flight reads on every keystroke and desynchronize the framed stream
 //! under heavy output.
 
+use forge_gui::i18n::trf;
 use proto_ipc::{
     KeyEvent, MouseEvent, ProcessSignal, PromptDirection, ScrollRequest, ServerMessage,
 };
@@ -132,7 +133,7 @@ pub fn spawn_ipc_worker(
             if let Err(error) = result {
                 let _ = events.send(UiEvent::Status {
                     tab_id,
-                    status: format!("Sin conexión: {error:#}"),
+                    status: trf("No connection: {}", &[&format!("{error:#}")]),
                 });
             }
         })
@@ -149,7 +150,7 @@ pub fn spawn_ipc_worker(
 ) {
     let _ = events.send(UiEvent::Status {
         tab_id,
-        status: "forge-termd no está disponible en esta plataforma todavía".into(),
+        status: forge_gui::i18n::tr("forge-termd is not available on this platform yet").into(),
     });
 }
 
@@ -157,7 +158,7 @@ pub fn spawn_ipc_worker(
 /// on Windows. Both are plain `AsyncRead + AsyncWrite` streams from here.
 #[cfg(any(unix, windows))]
 mod client {
-    use super::{IpcCommand, SessionSpec, UiEvent};
+    use super::{IpcCommand, SessionSpec, UiEvent, trf};
     use anyhow::{Context as _, Result, bail};
     use proto_ipc::{
         ClientMessage, FrameKind, FrameReader, PROTOCOL_VERSION, ServerMessage, write_message,
@@ -263,11 +264,11 @@ mod client {
         match std::fs::remove_file(&spec.socket) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("retirar socket de daemon incompatible"),
+            Err(error) => return Err(error).context("remove the incompatible daemon socket"),
         }
         handshake_once(spec)
             .await
-            .context("reiniciar forge-termd después de actualizar el protocolo")
+            .context("restart forge-termd after the protocol update")
     }
 
     async fn handshake_once(spec: SessionSpec) -> Result<Connection> {
@@ -363,9 +364,9 @@ mod client {
         let _ = events.send(UiEvent::Status {
             tab_id,
             status: if wanted == Some(session_id) && expected_daemon == Some(daemon_instance) {
-                format!("Sesión {session_id} recuperada")
+                trf("Session {} recovered", &[&session_id])
             } else {
-                format!("Sesión {session_id} conectada")
+                trf("Session {} connected", &[&session_id])
             },
         });
 
@@ -515,7 +516,7 @@ mod client {
         let ghostty = ghostty_library();
         if !ghostty.is_file() {
             bail!(
-                "no existe {}; ejecuta ./scripts/bootstrap-ghostty.sh una vez",
+                "{} does not exist; run ./scripts/bootstrap-ghostty.sh once",
                 ghostty.display()
             );
         }
@@ -529,9 +530,7 @@ mod client {
         // does not take the daemon (and every shell) down with it.
         #[cfg(unix)]
         command.process_group(0);
-        let child = command
-            .spawn()
-            .context("arrancar forge-termd automáticamente")?;
+        let child = command.spawn().context("start forge-termd automatically")?;
         let mut daemon = DaemonGuard(child);
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
@@ -545,11 +544,11 @@ mod client {
                         if let Ok(stream) = connect(socket).await {
                             return Ok((stream, None));
                         }
-                        bail!("forge-termd terminó durante el arranque: {status}");
+                        bail!("forge-termd exited during startup: {status}");
                     }
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-                Err(error) => bail!("forge-termd no abrió {}: {error}", socket.display()),
+                Err(error) => bail!("forge-termd did not open {}: {error}", socket.display()),
             }
         }
     }

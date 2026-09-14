@@ -8,6 +8,7 @@ use crate::{
     window::{ForgeWindow, NotificationLevel},
 };
 use forge_buffer::{Edit, Selection, Selections};
+use forge_gui::i18n::{tr, trf};
 use forge_project::{FileChange, FileWatcher, PathIndex};
 use forge_search::{ProjectMatch, ProjectSearch, SearchEvent, SearchOptions};
 use gpui::Context;
@@ -84,7 +85,7 @@ impl EditorFind {
     pub fn label(&self) -> String {
         match (self.current, self.matches.len()) {
             (_, 0) if self.query.is_empty() => String::new(),
-            (_, 0) => "sin coincidencias".into(),
+            (_, 0) => tr("no matches").into(),
             (Some(index), count) => format!("{}/{count}", index + 1),
             (None, count) => format!("{count}"),
         }
@@ -202,17 +203,20 @@ impl ForgeWindow {
         }
         match finder.mode {
             FinderMode::Files => match &self.project.index {
-                Some(index) => format!("{} archivos", index.len()),
-                None => "indexando…".into(),
+                Some(index) => trf("{} files", &[&index.len()]),
+                None => tr("indexing…").into(),
             },
             FinderMode::ProjectSearch => match self.project.done {
-                Some((truncated, files)) => format!(
-                    "{}{} resultados · {files} archivos",
-                    self.project.results.len(),
-                    if truncated { "+" } else { "" }
+                Some((truncated, files)) => trf(
+                    "{}{} results · {} files",
+                    &[
+                        &self.project.results.len(),
+                        &if truncated { "+" } else { "" },
+                        &files,
+                    ],
                 ),
-                None if finder.query.is_empty() => "escribe para buscar en el proyecto".into(),
-                None => format!("{} resultados…", self.project.results.len()),
+                None if finder.query.is_empty() => tr("type to search the project").into(),
+                None => trf("{} results…", &[&self.project.results.len()]),
             },
         }
     }
@@ -629,17 +633,20 @@ impl ForgeWindow {
             if removed {
                 self.notify_user(
                     NotificationLevel::Warning,
-                    format!("{name} se borró en disco; guarda para recrearlo"),
+                    trf("{} was deleted on disk; save to recreate it", &[&name]),
                 );
             } else if editor.is_large() {
                 self.notify_user(
                     NotificationLevel::Warning,
-                    format!("{name} cambió en disco; reábrelo para ver el contenido nuevo"),
+                    trf(
+                        "{} changed on disk; reopen it to see the new content",
+                        &[&name],
+                    ),
                 );
             } else if editor.buffer.is_dirty() {
                 self.notify_user(
                     NotificationLevel::Warning,
-                    format!("{name} cambió en disco y tiene cambios sin guardar"),
+                    trf("{} changed on disk and has unsaved changes", &[&name]),
                 );
             } else if editor.reload_from_disk() {
                 self.notify_user(NotificationLevel::Info, format!("{name} recargado"));

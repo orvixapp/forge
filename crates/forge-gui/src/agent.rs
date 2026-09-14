@@ -2,6 +2,7 @@
 //! `proto-acp`; this module is deliberately pure so streaming updates can be
 //! batched and tested without a GPUI window.
 
+use forge_gui::i18n::{tr, trf};
 use serde_json::Value;
 use std::{
     future::Future,
@@ -147,7 +148,7 @@ impl AgentTab {
     pub fn new(agent_name: impl Into<String>, workspace: PathBuf) -> Self {
         let agent_name = agent_name.into();
         Self {
-            status: "Lista para iniciar sesión".into(),
+            status: tr("Ready to start a session").into(),
             agent_name,
             session_id: None,
             prompt: String::new(),
@@ -211,11 +212,11 @@ impl AgentTab {
             match decision {
                 proto_acp::PermissionDecision::Allow => {
                     *state = ToolState::Running;
-                    *detail = format!("Permiso concedido ({ttl:?})");
+                    *detail = trf("Permission granted ({})", &[&format!("{ttl:?}")]);
                 }
                 proto_acp::PermissionDecision::Deny => {
                     *state = ToolState::Failed;
-                    *detail = "Permiso denegado por el usuario".into();
+                    *detail = tr("Permission denied by the user").into();
                 }
                 proto_acp::PermissionDecision::Ask => {}
             }
@@ -235,7 +236,7 @@ impl AgentTab {
             role: MessageRole::User,
             text: prompt.clone(),
         });
-        self.status = "Esperando al agente…".into();
+        self.status = tr("Waiting for the agent…").into();
         if let Some(commands) = &self.commands {
             let mut blocks = vec![PromptBlock::Text {
                 text: prompt.clone(),
@@ -322,7 +323,7 @@ impl AgentTab {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 self.append_agent_chunk(text);
-                self.status = "Recibiendo respuesta…".into();
+                self.status = tr("Receiving the answer…").into();
             }
             "tool_call" | "tool_call_update" => self.apply_tool_update(update),
             "plan" => {
@@ -444,13 +445,13 @@ pub fn spawn_agent_worker(
             let Some(definition) = definition.or_else(|| discover_agent(&registry_cache)) else {
                 let _ = events.send(UiEvent::AgentStatus {
                     tab_id,
-                    status: "No se encontró ningún adaptador ACP instalado en PATH".into(),
+                    status: tr("No ACP adapter found in PATH").into(),
                 });
                 return;
             };
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
             let Ok(runtime) = runtime else {
-                let _ = events.send(UiEvent::AgentStatus { tab_id, status: "No se pudo crear el runtime ACP".into() });
+                let _ = events.send(UiEvent::AgentStatus { tab_id, status: tr("Could not create the ACP runtime").into() });
                 return;
             };
             runtime.block_on(async move {
@@ -465,14 +466,14 @@ pub fn spawn_agent_worker(
                     let mut process = match AgentProcess::spawn(&definition, Arc::clone(&surface)) {
                         Ok(process) => process,
                         Err(error) => {
-                            let _ = events.send(UiEvent::AgentStatus { tab_id, status: format!("ACP no pudo arrancar: {error}") });
+                            let _ = events.send(UiEvent::AgentStatus { tab_id, status: trf("ACP could not start: {}", &[&error]) });
                             return;
                         }
                     };
                     let client = process.client.clone();
                     let initialized = client.initialize("Forge", env!("CARGO_PKG_VERSION")).await;
                     if let Err(error) = initialized {
-                        let _ = events.send(UiEvent::AgentStatus { tab_id, status: format!("ACP initialize falló: {error}") });
+                        let _ = events.send(UiEvent::AgentStatus { tab_id, status: trf("ACP initialize failed: {}", &[&error]) });
                     } else {
                         if let Some(method) = &definition.auth_method { let _ = client.authenticate(method).await; }
                         let session = match previous_session.as_deref() {
@@ -498,18 +499,18 @@ pub fn spawn_agent_worker(
                                         event = updates.recv() => match event {
                                             Ok(AcpEvent::Disconnected) | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                             Ok(event) => { let _ = events.send(UiEvent::AgentEvent { tab_id, event }); }
-                                            Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => { let _ = events.send(UiEvent::AgentStatus { tab_id, status: format!("ACP omitió {count} eventos") }); }
+                                            Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => { let _ = events.send(UiEvent::AgentStatus { tab_id, status: trf("ACP skipped {} events", &[&count]) }); }
                                         },
                                     }
                                 }
                             }
-                            Err(error) => { let _ = events.send(UiEvent::AgentStatus { tab_id, status: format!("No se pudo abrir sesión ACP: {error}") }); }
+                            Err(error) => { let _ = events.send(UiEvent::AgentStatus { tab_id, status: trf("Could not open the ACP session: {}", &[&error]) }); }
                         }
                     }
                     let _ = process.wait().await;
                     attempt = attempt.saturating_add(1);
                     let delay = Duration::from_millis(250_u64.saturating_mul(1_u64 << attempt.min(5)));
-                    let _ = events.send(UiEvent::AgentStatus { tab_id, status: format!("ACP desconectado; reintentando en {} ms", delay.as_millis()) });
+                    let _ = events.send(UiEvent::AgentStatus { tab_id, status: trf("ACP disconnected; retrying in {} ms", &[&delay.as_millis()]) });
                     tokio::time::sleep(delay).await;
                 }
             });

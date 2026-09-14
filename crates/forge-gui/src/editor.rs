@@ -12,6 +12,7 @@ use forge_buffer::{
     Buffer, BufferError, Cursor, Edit, Journal, LargeFile, LoadedFile, Motion, Position, Selection,
     Selections, Transaction, large,
 };
+use forge_gui::i18n::{tr, trf};
 use forge_syntax::{Span, SyntaxState, Token};
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, Element, ElementId, Entity, Font,
@@ -406,10 +407,9 @@ impl EditorTab {
         if let Some(available) = available_memory_bytes()
             && needed.saturating_mul(2) > available
         {
-            return Err(format!(
-                "el archivo ocupa {} MiB y sólo hay {} MiB disponibles; no se carga en memoria",
-                needed / (1024 * 1024),
-                available / (1024 * 1024)
+            return Err(trf(
+                "the file takes {} MiB and only {} MiB are available; not loading it into memory",
+                &[&(needed / (1024 * 1024)), &(available / (1024 * 1024))],
             ));
         }
         let text = file.text();
@@ -495,7 +495,7 @@ impl EditorTab {
     pub fn title(&self) -> Cow<'_, str> {
         match self.path().and_then(Path::file_name) {
             Some(name) => name.to_string_lossy(),
-            None => Cow::Borrowed("Sin título"),
+            None => Cow::Borrowed(tr("Untitled")),
         }
     }
 
@@ -537,10 +537,10 @@ impl EditorTab {
             parts.push(label);
         }
         if self.recovered {
-            parts.push("recuperado del journal".into());
+            parts.push(tr("recovered from the journal").into());
         }
         if self.buffer.is_dirty() {
-            parts.push("● sin guardar".into());
+            parts.push(tr("● unsaved").into());
         }
         parts.join(" · ")
     }
@@ -1759,15 +1759,15 @@ impl ForgeWindow {
                     self.push_tab(TabContent::Editor(Box::new(editor)), cx);
                     self.notify_user(
                         NotificationLevel::Info,
-                        format!(
-                            "{} abierto en modo archivo grande (solo lectura, sin resaltado)",
-                            path.display()
+                        trf(
+                            "{} opened in large-file mode (read-only, no highlighting)",
+                            &[&path.display()],
                         ),
                     );
                 }
                 Err(error) => self.notify_user(
                     NotificationLevel::Error,
-                    format!("No se pudo mapear {}: {error}", path.display()),
+                    trf("Could not map {}: {}", &[&path.display(), &error]),
                 ),
             }
         } else {
@@ -1776,7 +1776,7 @@ impl ForgeWindow {
                 Err(error) => {
                     self.notify_user(
                         NotificationLevel::Error,
-                        format!("No se pudo abrir {}: {error}", path.display()),
+                        trf("Could not open {}: {}", &[&path.display(), &error]),
                     );
                     return;
                 }
@@ -1784,7 +1784,7 @@ impl ForgeWindow {
             if file.lossy {
                 self.notify_user(
                     NotificationLevel::Warning,
-                    format!("{} contiene bytes no decodificables", path.display()),
+                    trf("{} contains undecodable bytes", &[&path.display()]),
                 );
             }
             let mut buffer = Buffer::new(&file.text);
@@ -1799,9 +1799,9 @@ impl ForgeWindow {
             if recovered {
                 self.notify_user(
                     NotificationLevel::Warning,
-                    format!(
-                        "{} recuperado del journal; guarda para conservar los cambios",
-                        path.display()
+                    trf(
+                        "{} recovered from the journal; save to keep the changes",
+                        &[&path.display()],
                     ),
                 );
             }
@@ -1839,7 +1839,7 @@ impl ForgeWindow {
                 }
                 self.notify_user(
                     NotificationLevel::Info,
-                    "Archivo cargado en memoria; ya se puede editar",
+                    tr("File loaded into memory; it can be edited now"),
                 );
             }
             Err(error) => self.notify_user(NotificationLevel::Warning, error),
@@ -1878,7 +1878,7 @@ impl ForgeWindow {
             Ok(journal) => buffer.attach_journal(journal),
             Err(error) => self.notify_user(
                 NotificationLevel::Warning,
-                format!("Sin journal para {}: {error}", path.display()),
+                trf("No journal for {}: {}", &[&path.display(), &error]),
             ),
         }
         recovered
@@ -1922,7 +1922,7 @@ impl ForgeWindow {
             Err(error) => {
                 self.notify_user(
                     NotificationLevel::Error,
-                    format!("No se pudo guardar: {error}"),
+                    trf("Could not save: {}", &[&error]),
                 );
             }
         }
@@ -1931,7 +1931,7 @@ impl ForgeWindow {
 
     fn save_active_as(&mut self, cx: &mut Context<Self>) {
         let tab_id = self.active_tab().id;
-        let receiver = cx.prompt_for_new_path(&self.factory.cwd, Some("sin-titulo.txt"));
+        let receiver = cx.prompt_for_new_path(&self.factory.cwd, Some(tr("untitled.txt")));
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(path))) = receiver.await {
                 let _ = this.update(cx, |view, cx| {
@@ -1970,7 +1970,7 @@ impl ForgeWindow {
             files: true,
             directories: false,
             multiple: true,
-            prompt: Some("Abrir archivo".into()),
+            prompt: Some(tr("Open file").into()),
         });
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = receiver.await {
@@ -2015,7 +2015,7 @@ impl ForgeWindow {
                 _ if key_char.is_some() && !modifiers.control && !modifiers.alt => {
                     self.notify_user(
                         NotificationLevel::Info,
-                        "Archivo grande en solo lectura: usa editor.materialize para editarlo",
+                        tr("Large file is read-only: use editor.materialize to edit it"),
                     );
                 }
                 _ => {}
@@ -2212,10 +2212,7 @@ impl ForgeWindow {
             _ => return,
         };
         if let Err(error) = result {
-            self.notify_user(
-                NotificationLevel::Error,
-                format!("Edición fallida: {error}"),
-            );
+            self.notify_user(NotificationLevel::Error, trf("Edit failed: {}", &[&error]));
         } else if let Some(editor) = self.active_tab_mut().editor_mut() {
             editor.goal_column = None;
             editor.follow_cursor();

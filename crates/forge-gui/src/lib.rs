@@ -1,6 +1,7 @@
 //! Headless terminal-grid state consumed by the GPUI frontend.
 
 pub mod config;
+pub mod i18n;
 pub mod links;
 pub mod shell;
 pub mod theme;

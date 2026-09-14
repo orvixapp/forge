@@ -10,6 +10,7 @@ use crate::{
     project::{EditorFind, Finder, FinderMode, ProjectState},
     search::{SearchAction, SearchDirection, SearchState, reveal_row},
 };
+use forge_gui::i18n::{tr, trf};
 use forge_gui::{
     CellPos, Selection, TerminalGrid,
     config::{
@@ -379,6 +380,8 @@ pub struct TextPrompt {
 pub enum PromptKind {
     RenameTab,
     AskAgent,
+    /// A step of a settings wizard (`crate::settings::Wizard`).
+    Wizard,
 }
 
 /// List picker inside the window; `index` selects an item.
@@ -395,6 +398,21 @@ pub enum PickerKind {
     Profile,
     /// Providers for `agent.forward`.
     Provider,
+    /// The settings menu itself.
+    Settings,
+    /// `ui.theme`.
+    Theme,
+    /// A choice step of a settings wizard.
+    Wizard,
+}
+
+/// What a right click landed on; decides the context menu's items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuTarget {
+    /// The active pane's content (terminal, editor or agent panel).
+    Pane,
+    /// A tab button in the top bar.
+    Tab,
 }
 
 /// How an agent session is opened: task class, explicit provider, the
@@ -432,6 +450,8 @@ pub struct ForgeWindow {
     pub picker: Option<Picker>,
     /// Prompt and context waiting for a provider choice (`agent.forward`).
     forward_prompt: Option<(String, Vec<PromptContext>)>,
+    /// Settings wizard in progress (`settings.open`).
+    pub(crate) wizard: Option<crate::settings::Wizard>,
     /// Font zoom steps (each ±10 %) on top of `font.size`.
     pub zoom: i8,
     /// Show only the active pane of the split tree.
@@ -452,6 +472,7 @@ impl ForgeWindow {
     fn new(factory: WindowFactory, cx: &mut Context<Self>) -> Self {
         let (event_tx, events) = mpsc::channel();
         Self::spawn_housekeeping(events, cx);
+        forge_gui::i18n::set_language(factory.config.ui.language);
         let (theme, theme_name) = load_theme(&factory);
         let keymap = ShellKeymap::default().with_overrides(&factory.config.keybindings);
         // Remembered grants live next to the user's config, keyed by
@@ -488,6 +509,7 @@ impl ForgeWindow {
             rename: None,
             picker: None,
             forward_prompt: None,
+            wizard: None,
             zoom: 0,
             pane_zoom: false,
             process_explorer: false,
@@ -577,7 +599,7 @@ impl ForgeWindow {
 
     // ----- configuration and theme -------------------------------------
 
-    fn reload_config_if_changed(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn reload_config_if_changed(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(path) = self.factory.config_path.clone() else {
             return false;
         };
@@ -593,7 +615,7 @@ impl ForgeWindow {
             }
             Err(error) => {
                 // Keep the running configuration; report once per distinct error.
-                let text = format!("Configuración inválida: {error}");
+                let text = trf("Invalid configuration: {}", &[&error]);
                 if !self.notifications.iter().any(|note| note.text == text) {
                     self.notify_user(NotificationLevel::Error, text);
                     return true;
@@ -604,6 +626,7 @@ impl ForgeWindow {
     }
 
     fn apply_config(&mut self, config: Config, sources: ConfigSources, cx: &mut Context<Self>) {
+        forge_gui::i18n::set_language(config.ui.language);
         self.keymap = ShellKeymap::default().with_overrides(&config.keybindings);
         self.factory.sources = sources;
         self.factory.config = Arc::new(config);
@@ -611,7 +634,7 @@ impl ForgeWindow {
         let (theme, name) = load_theme(&self.factory);
         self.set_theme(theme, name);
         self.apply_zoom(cx);
-        self.notify_user(NotificationLevel::Info, "Configuración recargada");
+        self.notify_user(NotificationLevel::Info, tr("Configuration reloaded"));
         cx.notify();
     }
 
@@ -636,14 +659,14 @@ impl ForgeWindow {
             Ok(colors) => {
                 let colors = colors.with_overrides(&self.config.colors);
                 self.set_theme(colors, next.clone());
-                self.notify_user(NotificationLevel::Info, format!("Tema: {next}"));
+                self.notify_user(NotificationLevel::Info, trf("Theme: {}", &[&next]));
             }
             Err(error) => self.notify_user(NotificationLevel::Error, error),
         }
         cx.notify();
     }
 
-    fn themes_dir(&self) -> Option<PathBuf> {
+    pub(crate) fn themes_dir(&self) -> Option<PathBuf> {
         self.factory
             .config_path
             .as_deref()
@@ -695,7 +718,7 @@ impl ForgeWindow {
         if let Err(error) = self.session().save(&path) {
             self.notify_user(
                 NotificationLevel::Warning,
-                format!("No se pudo guardar la sesión: {error}"),
+                trf("Could not save the session: {}", &[&error]),
             );
         }
     }
@@ -710,7 +733,7 @@ impl ForgeWindow {
             Err(error) => {
                 self.notify_user(
                     NotificationLevel::Warning,
-                    format!("Sesión guardada inválida, se ignora: {error}"),
+                    trf("Saved session is invalid and was ignored: {}", &[&error]),
                 );
                 None
             }
@@ -848,7 +871,7 @@ impl ForgeWindow {
     /// are fed with [`Self::feed_agent_update`].
     pub fn open_offline_agent_tab(&mut self, name: &str, cx: &mut Context<Self>) -> u64 {
         let mut agent_tab = AgentTab::new(name.to_owned(), self.factory.cwd.clone());
-        agent_tab.route = "benchmark → sin proveedor".into();
+        agent_tab.route = tr("benchmark → no provider").into();
         let index = self.push_tab(TabContent::Agent(Box::new(agent_tab)), cx);
         self.tabs[index].id
     }
@@ -889,7 +912,7 @@ impl ForgeWindow {
             "{} → {}{}",
             launch.class.label(),
             provider.as_ref().map_or_else(
-                || "proveedor del agente".to_owned(),
+                || tr("the agent's own provider").to_owned(),
                 ProviderConfig::describe
             ),
             if workspace == self.factory.cwd {
@@ -990,7 +1013,10 @@ impl ForgeWindow {
         if provider.is_none() {
             self.notify_user(
                 NotificationLevel::Warning,
-                format!("Proveedor {wanted:?} no definido en [[providers]]; se usa el del agente"),
+                trf(
+                    "Provider {} is not defined in [[providers]]; the agent's own is used",
+                    &[&format!("{wanted:?}")],
+                ),
             );
         }
         provider
@@ -1066,16 +1092,19 @@ impl ForgeWindow {
             Ok(output) if output.status.success() => {
                 self.notify_user(
                     NotificationLevel::Info,
-                    format!("Sesión en worktree {} (rama {branch})", directory.display()),
+                    trf(
+                        "Session in worktree {} (branch {})",
+                        &[&directory.display(), &branch],
+                    ),
                 );
                 Some(directory)
             }
             Ok(output) => {
                 self.notify_user(
                     NotificationLevel::Warning,
-                    format!(
-                        "No se pudo crear el worktree; la sesión usa el directorio actual: {}",
-                        String::from_utf8_lossy(&output.stderr).trim()
+                    trf(
+                        "Could not create the worktree; the session uses the current directory: {}",
+                        &[&String::from_utf8_lossy(&output.stderr).trim()],
                     ),
                 );
                 None
@@ -1083,8 +1112,9 @@ impl ForgeWindow {
             Err(error) => {
                 self.notify_user(
                     NotificationLevel::Warning,
-                    format!(
-                        "git no disponible para worktrees ({error}); se usa el directorio actual"
+                    trf(
+                        "git is not available for worktrees ({}); using the current directory",
+                        &[&error],
                     ),
                 );
                 None
@@ -1098,12 +1128,12 @@ impl ForgeWindow {
         if context.is_empty() {
             self.notify_user(
                 NotificationLevel::Info,
-                "Selecciona código (o abre un archivo) para preguntar al agente",
+                tr("Select code (or open a file) to ask the agent"),
             );
             return;
         }
         self.rename = Some(TextPrompt {
-            title: format!("Pregunta al agente sobre {}", context[0].label),
+            title: trf("Ask the agent about {}", &[&context[0].label]),
             value: String::new(),
             kind: PromptKind::AskAgent,
         });
@@ -1132,7 +1162,7 @@ impl ForgeWindow {
         let Some(terminal) = self.active_terminal() else {
             self.notify_user(
                 NotificationLevel::Info,
-                "agent.investigate se usa desde una terminal",
+                tr("agent.investigate works from a terminal"),
             );
             return;
         };
@@ -1164,13 +1194,12 @@ impl ForgeWindow {
         if without_marks {
             self.notify_user(
                 NotificationLevel::Warning,
-                "Sin marcas de prompt (integración de shell); se envía la pantalla visible",
+                tr("No prompt marks (shell integration); sending the visible screen"),
             );
         }
-        let prompt = format!(
-            "El último comando en la terminal falló o no hizo lo esperado. Investiga la causa y propón la solución.\n\nDirectorio: {}\nComando: {}\n",
-            cwd.display(),
-            command.trim()
+        let prompt = trf(
+            "The last command in the terminal failed or did not do what was expected. Investigate the cause and propose a fix.\n\nDirectory: {}\nCommand: {}\n",
+            &[&cwd.display(), &command.trim()],
         );
         let context = vec![PromptContext {
             label: format!("terminal://{session_label}"),
@@ -1193,27 +1222,27 @@ impl ForgeWindow {
         let Some(agent) = self.active_tab().agent() else {
             self.notify_user(
                 NotificationLevel::Info,
-                "agent.forward se usa desde una sesión de agente",
+                tr("agent.forward works from an agent session"),
             );
             return;
         };
         let Some(prompt) = agent.last_prompt.clone() else {
             self.notify_user(
                 NotificationLevel::Info,
-                "Todavía no hay un prompt que reenviar",
+                tr("There is no prompt to forward yet"),
             );
             return;
         };
         if self.config.providers.is_empty() {
             self.notify_user(
                 NotificationLevel::Info,
-                "Sin [[providers]] configurados para reenviar",
+                tr("No [[providers]] configured to forward to"),
             );
             return;
         }
         self.forward_prompt = Some((prompt, agent.context.clone()));
         self.picker = Some(Picker {
-            title: "Reenviar a proveedor".into(),
+            title: tr("Forward to provider").into(),
             items: self
                 .config
                 .providers
@@ -1249,10 +1278,10 @@ impl ForgeWindow {
                     message: Box::new(message),
                     response: reply_tx,
                 })
-                .map_err(|_| "la ventana ya no existe".to_owned())?;
+                .map_err(|_| "the window no longer exists".to_owned())?;
             let reply = reply_rx
                 .blocking_recv()
-                .map_err(|_| "petición sin respuesta (¿sin sesión de agente?)".to_owned())?;
+                .map_err(|_| "request got no answer (no agent session?)".to_owned())?;
             match (reply.result, reply.error) {
                 (_, Some(error)) => Err(error
                     .get("message")
@@ -1264,7 +1293,7 @@ impl ForgeWindow {
         match listener {
             Ok(listener) => Some(listener),
             Err(error) => {
-                tracing::warn!(%error, "no se pudo abrir el socket MCP");
+                tracing::warn!(%error, "could not open the MCP socket");
                 None
             }
         }
@@ -1420,9 +1449,9 @@ impl ForgeWindow {
                 Palette::from(&self.theme),
             ),
             status: if self.factory.start_ipc {
-                "Conectando a forge-termd…".into()
+                tr("Connecting to forge-termd…").into()
             } else {
-                "Panel vacío".into()
+                tr("Empty pane").into()
             },
             input,
             info: SessionInfo::default(),
@@ -1482,11 +1511,11 @@ impl ForgeWindow {
         let title = self.tabs[index].title().into_owned();
         let answer = window.prompt(
             PromptLevel::Warning,
-            &format!("¿Cerrar «{title}» sin guardar?"),
-            Some(
-                "Los cambios se perderán; el journal conserva una copia hasta el próximo guardado.",
-            ),
-            &["Guardar y cerrar", "Descartar", "Cancelar"],
+            &trf("Close “{}” without saving?", &[&title]),
+            Some(tr(
+                "Changes will be lost; the journal keeps a copy until the next save.",
+            )),
+            &[tr("Save and close"), tr("Discard"), tr("Cancel")],
             cx,
         );
         cx.spawn(async move |this, cx| {
@@ -1785,7 +1814,10 @@ impl ForgeWindow {
             return;
         };
         match key {
-            "escape" => self.rename = None,
+            "escape" => {
+                self.rename = None;
+                self.wizard = None;
+            }
             "enter" => {
                 let value = prompt.value.trim().to_owned();
                 let kind = prompt.kind;
@@ -1800,6 +1832,7 @@ impl ForgeWindow {
                             self.agent_ask_submit(&value, cx);
                         }
                     }
+                    PromptKind::Wizard => self.wizard_text(&value, cx),
                 }
             }
             "backspace" => {
@@ -1820,7 +1853,10 @@ impl ForgeWindow {
             return;
         };
         match key {
-            "escape" => self.picker = None,
+            "escape" => {
+                self.picker = None;
+                self.wizard = None;
+            }
             "up" => picker.index = picker.index.saturating_sub(1),
             "down" => picker.index = (picker.index + 1).min(picker.items.len().saturating_sub(1)),
             "enter" => {
@@ -1833,6 +1869,9 @@ impl ForgeWindow {
                             self.open_tab_with(None, None, None, Some(&profile), cx);
                         }
                     }
+                    PickerKind::Settings => self.settings_pick(index, cx),
+                    PickerKind::Theme => self.settings_apply_theme(index, cx),
+                    PickerKind::Wizard => self.wizard_choice(index, cx),
                     PickerKind::Provider => {
                         if let (Some(provider), Some((prompt, context))) = (
                             self.config.providers.get(index).cloned(),
@@ -1883,8 +1922,8 @@ impl ForgeWindow {
                         terminal.agent_exited = true;
                         terminal.agent_exit_code = exit_code;
                         terminal.status = exit_code.map_or_else(
-                            || "Proceso del agente terminado".into(),
-                            |code| format!("Proceso del agente terminó con código {code}"),
+                            || tr("Agent process finished").into(),
+                            |code| trf("Agent process exited with code {}", &[&code]),
                         );
                         for (id, waiter) in terminal.agent_waiters.drain(..) {
                             let _ = waiter.send(proto_acp::JsonRpcMessage::response(
@@ -1907,7 +1946,7 @@ impl ForgeWindow {
                 if let Some(code) = exit_code.filter(|code| *code != 0) {
                     self.notify_user(
                         NotificationLevel::Warning,
-                        format!("La shell terminó con código {code}"),
+                        trf("The shell exited with code {}", &[&code]),
                     );
                 }
             }
@@ -1916,7 +1955,7 @@ impl ForgeWindow {
                 message: ServerMessage::Error { message },
             } => {
                 if let Some(tab) = self.terminal_mut(tab_id) {
-                    tab.status = format!("Error del daemon: {message}");
+                    tab.status = trf("Daemon error: {}", &[&message]);
                 }
             }
             UiEvent::Message {
@@ -2045,7 +2084,7 @@ impl ForgeWindow {
                     let _ = response.send(proto_acp::JsonRpcMessage::error(
                         Some(id),
                         -32602,
-                        "terminalId inválido",
+                        "invalid terminalId",
                     ));
                     return;
                 };
@@ -2057,8 +2096,8 @@ impl ForgeWindow {
                     return;
                 }
             }
-            Some(method) => Err(format!("método ACP no soportado: {method}")),
-            None => Err("solicitud ACP sin método".into()),
+            Some(method) => Err(format!("unsupported ACP method: {method}")),
+            None => Err("ACP request without method".into()),
         };
         let reply = match result {
             Ok(value) => proto_acp::JsonRpcMessage::response(id, value),
@@ -2073,7 +2112,7 @@ impl ForgeWindow {
             .get("path")
             .and_then(serde_json::Value::as_str)
             .map(PathBuf::from)
-            .ok_or_else(|| "se requiere path".to_owned())?;
+            .ok_or_else(|| "path is required".to_owned())?;
         if !path.is_absolute() {
             return Err("path debe ser absoluto".into());
         }
@@ -2087,18 +2126,18 @@ impl ForgeWindow {
         } else {
             let parent = path
                 .parent()
-                .ok_or_else(|| "path sin directorio padre".to_owned())?
+                .ok_or_else(|| "path has no parent directory".to_owned())?
                 .canonicalize()
                 .map_err(|error| error.to_string())?;
             parent.join(
                 path.file_name()
-                    .ok_or_else(|| "path sin nombre".to_owned())?,
+                    .ok_or_else(|| "path has no file name".to_owned())?,
             )
         };
         checked
             .starts_with(&workspace)
             .then_some(checked)
-            .ok_or_else(|| "path está fuera del workspace".into())
+            .ok_or_else(|| "path is outside the workspace".into())
     }
 
     fn acp_read_file(&self, params: &serde_json::Value) -> Result<serde_json::Value, String> {
@@ -2115,7 +2154,7 @@ impl ForgeWindow {
                     .map(|_| editor.buffer.text())
             })
             .or_else(|| std::fs::read_to_string(&path).ok())
-            .ok_or_else(|| format!("no se pudo leer {}", path.display()))?;
+            .ok_or_else(|| format!("could not read {}", path.display()))?;
         let line = params
             .get("line")
             .and_then(serde_json::Value::as_u64)
@@ -2165,22 +2204,22 @@ impl ForgeWindow {
             vec![
                 crate::agent::PendingPermissionOption {
                     id: "allow_once".into(),
-                    name: "Permitir una vez".into(),
+                    name: tr("Allow once").into(),
                     kind: "allow_once".into(),
                 },
                 crate::agent::PendingPermissionOption {
                     id: "allow_session".into(),
-                    name: "Permitir en esta sesión".into(),
+                    name: tr("Allow for this session").into(),
                     kind: "allow_always".into(),
                 },
                 crate::agent::PendingPermissionOption {
                     id: "allow_always".into(),
-                    name: "Permitir siempre".into(),
+                    name: tr("Allow always").into(),
                     kind: "allow_always".into(),
                 },
                 crate::agent::PendingPermissionOption {
                     id: "deny".into(),
-                    name: "Rechazar".into(),
+                    name: tr("Reject").into(),
                     kind: "deny".into(),
                 },
             ]
@@ -2267,12 +2306,12 @@ impl ForgeWindow {
                 if let Some(agent) = self.tab_mut(agent_id).and_then(Tab::agent_mut) {
                     agent.timeline.push(crate::agent::TimelineItem::ToolCall {
                         id: format!("perm-{id}"),
-                        title: format!("Permiso requerido · {title}"),
+                        title: trf("Permission required · {}", &[&title]),
                         state: crate::agent::ToolState::WaitingPermission,
                         detail: if scope.is_empty() {
-                            format!("{tool_name} solicita autorización")
+                            trf("{} requests authorization", &[&tool_name])
                         } else {
-                            format!("{tool_name} solicita autorización para: {scope}")
+                            trf("{} requests authorization for: {}", &[&tool_name, &scope])
                         },
                     });
                     agent
@@ -2330,7 +2369,7 @@ impl ForgeWindow {
         let proposed = params
             .get("content")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "se requiere content".to_owned())?
+            .ok_or_else(|| "content is required".to_owned())?
             .to_owned();
         let original = std::fs::read_to_string(&path).unwrap_or_default();
         let agent_name = self
@@ -2370,14 +2409,14 @@ impl ForgeWindow {
         let agent = self
             .tab_mut(agent_id)
             .and_then(Tab::agent_mut)
-            .ok_or_else(|| "la sesión agente ya no existe".to_owned())?;
+            .ok_or_else(|| "the agent session no longer exists".to_owned())?;
         agent.proposed_edits.retain(|edit| edit.path != path);
         agent.proposed_edits.push(proposed_edit);
         agent.timeline.push(crate::agent::TimelineItem::ToolCall {
             id: format!("fs-write-{id}"),
-            title: format!("Edición propuesta · {}", path.display()),
+            title: trf("Proposed edit · {}", &[&path.display()]),
             state: crate::agent::ToolState::Succeeded,
-            detail: format!("{hunks_count} hunks propuestos; pendiente de revisión"),
+            detail: trf("{} proposed hunks; awaiting review", &[&hunks_count]),
         });
         Ok(serde_json::json!({}))
     }
@@ -2442,7 +2481,7 @@ impl ForgeWindow {
             if let Some(error) = failure {
                 self.notify_user(
                     NotificationLevel::Warning,
-                    format!("No se aplicó el cambio propuesto: {error}"),
+                    trf("The proposed change was not applied: {}", &[&error]),
                 );
             }
         } else {
@@ -2463,9 +2502,9 @@ impl ForgeWindow {
             }
             self.notify_user(
                 NotificationLevel::Error,
-                format!(
-                    "No se pudo abrir {} para aplicar la propuesta",
-                    path.display()
+                trf(
+                    "Could not open {} to apply the proposal",
+                    &[&path.display()],
                 ),
             );
         }
@@ -2548,13 +2587,14 @@ impl ForgeWindow {
             if let Some(error) = failure {
                 self.notify_user(
                     NotificationLevel::Warning,
-                    format!("No se aplicaron los cambios propuestos: {error}"),
+                    trf("The proposed changes were not applied: {}", &[&error]),
                 );
             } else if conflicts > 0 {
                 self.notify_user(
                     NotificationLevel::Warning,
-                    format!(
-                        "{conflicts} hunks en conflicto quedan sin aplicar; revísalos uno a uno"
+                    trf(
+                        "{} conflicting hunks were left unapplied; review them one by one",
+                        &[&conflicts],
                     ),
                 );
             }
@@ -2573,9 +2613,9 @@ impl ForgeWindow {
             }
             self.notify_user(
                 NotificationLevel::Error,
-                format!(
-                    "No se pudo abrir {} para aplicar la propuesta",
-                    path.display()
+                trf(
+                    "Could not open {} to apply the proposal",
+                    &[&path.display()],
                 ),
             );
         }
@@ -2606,7 +2646,7 @@ impl ForgeWindow {
         let command = params
             .get("command")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "se requiere command".to_owned())?;
+            .ok_or_else(|| "command is required".to_owned())?;
         let args = params
             .get("args")
             .and_then(serde_json::Value::as_array)
@@ -2671,7 +2711,7 @@ impl ForgeWindow {
     ) -> Result<serde_json::Value, String> {
         let terminal = self
             .acp_terminal_mut(agent_id, params)
-            .ok_or_else(|| "terminalId inválido".to_owned())?;
+            .ok_or_else(|| "invalid terminalId".to_owned())?;
         let mut result = serde_json::json!({
             "output": terminal.agent_output,
             "truncated": terminal.agent_output_truncated,
@@ -2691,7 +2731,7 @@ impl ForgeWindow {
     ) -> Result<serde_json::Value, String> {
         let terminal = self
             .acp_terminal_mut(agent_id, params)
-            .ok_or_else(|| "terminalId inválido".to_owned())?;
+            .ok_or_else(|| "invalid terminalId".to_owned())?;
         terminal
             .input
             .send(IpcCommand::Signal(ProcessSignal::Kill))
@@ -2710,7 +2750,7 @@ impl ForgeWindow {
             .get("terminalId")
             .and_then(serde_json::Value::as_str)
             .and_then(|id| id.parse::<u64>().ok())
-            .ok_or_else(|| "terminalId inválido".to_owned())?;
+            .ok_or_else(|| "invalid terminalId".to_owned())?;
         let index = self
             .tabs
             .iter()
@@ -2720,7 +2760,7 @@ impl ForgeWindow {
                         .terminal()
                         .is_some_and(|terminal| terminal.agent_owner == Some(agent_id))
             })
-            .ok_or_else(|| "terminalId inválido".to_owned())?;
+            .ok_or_else(|| "invalid terminalId".to_owned())?;
         self.close_tab(index, cx);
         Ok(serde_json::json!({}))
     }
@@ -2728,7 +2768,7 @@ impl ForgeWindow {
     fn connect_agent(&mut self, tab_id: u64, session_id: String) {
         if let Some(agent) = self.tab_mut(tab_id).and_then(Tab::agent_mut) {
             agent.session_id = Some(session_id);
-            agent.status = "Sesión activa".into();
+            agent.status = tr("Session active").into();
         }
     }
 
@@ -2792,7 +2832,10 @@ impl ForgeWindow {
                 if after.0 != before.0 {
                     tab.terminal.selection = None;
                 }
-                tab.status = format!("Sesión activa · revisión {}", tab.terminal.grid.revision());
+                tab.status = trf(
+                    "Session active · revision {}",
+                    &[&tab.terminal.grid.revision()],
+                );
                 // Reflow or new output moves rows; the matches are re-run
                 // (throttled) so highlights stay in place.
                 if after != before && self.search.open && self.search.tab_id == Some(tab_id) {
@@ -2801,7 +2844,7 @@ impl ForgeWindow {
                 }
             }
             Ok(false) => {}
-            Err(error) => tab.status = format!("Patch inválido: {error}"),
+            Err(error) => tab.status = trf("Invalid patch: {}", &[&error]),
         }
     }
 
@@ -2932,7 +2975,7 @@ impl ForgeWindow {
         match key {
             "escape" => {
                 agent.cancel();
-                agent.status = "Cancelación solicitada".into();
+                agent.status = tr("Cancellation requested").into();
             }
             "enter" if !modifiers.shift => {
                 let typed = agent.prompt.clone();
@@ -2949,7 +2992,10 @@ impl ForgeWindow {
                     agent.prompt.clear();
                     agent.timeline.push(crate::agent::TimelineItem::Message {
                         role: crate::agent::MessageRole::Agent,
-                        text: format!("Reenviado a {wanted} ({} → nueva sesión)", class.label()),
+                        text: trf(
+                            "Forwarded to {} ({} → new session)",
+                            &[&wanted, &class.label()],
+                        ),
                     });
                     self.create_agent_tab_with(
                         AgentLaunch {
@@ -3174,6 +3220,7 @@ impl ForgeWindow {
             ShellCommand::NewAgentSession => {
                 self.create_agent_tab(cx);
             }
+            ShellCommand::OpenSettings => self.open_settings_menu(cx),
             ShellCommand::AgentAsk => self.agent_ask(cx),
             ShellCommand::AgentInvestigate => self.agent_investigate(cx),
             ShellCommand::AgentForward => self.agent_forward(cx),
@@ -3252,7 +3299,7 @@ impl ForgeWindow {
             ShellCommand::CycleTheme => self.cycle_theme(cx),
             ShellCommand::ReloadConfig => {
                 if !self.reload_config_if_changed(cx) {
-                    self.notify_user(NotificationLevel::Info, "Configuración sin cambios");
+                    self.notify_user(NotificationLevel::Info, tr("Configuration unchanged"));
                     cx.notify();
                 }
             }
@@ -3314,7 +3361,7 @@ impl ForgeWindow {
         match command {
             ShellCommand::RenameTab => {
                 self.rename = Some(TextPrompt {
-                    title: "Nombre de la pestaña".into(),
+                    title: tr("Tab name").into(),
                     value: self.active_tab().custom_title.clone().unwrap_or_default(),
                     kind: PromptKind::RenameTab,
                 });
@@ -3347,12 +3394,12 @@ impl ForgeWindow {
                 if self.config.profiles.is_empty() {
                     self.notify_user(
                         NotificationLevel::Info,
-                        "Sin perfiles: añade [[profiles]] con name/shell/args/cwd/env en config.toml",
+                        tr("No profiles: add [[profiles]] with name/shell/args/cwd/env to config.toml"),
                     );
                 } else {
                     self.picker = Some(Picker {
                         kind: PickerKind::Profile,
-                        title: "Perfil de terminal".into(),
+                        title: tr("Terminal profile").into(),
                         items: self
                             .config
                             .profiles
@@ -3361,7 +3408,7 @@ impl ForgeWindow {
                                 format!(
                                     "{} · {}",
                                     profile.name,
-                                    profile.shell.as_deref().unwrap_or("shell por defecto")
+                                    profile.shell.as_deref().unwrap_or(tr("default shell"))
                                 )
                             })
                             .collect(),
@@ -3383,7 +3430,7 @@ impl ForgeWindow {
         self.send_to_terminal(IpcCommand::Signal(signal));
         self.notify_user(
             NotificationLevel::Info,
-            format!("Señal enviada: {signal:?}"),
+            trf("Signal sent: {}", &[&format!("{signal:?}")]),
         );
     }
 
@@ -3391,20 +3438,47 @@ impl ForgeWindow {
 
     /// Opens the right-click menu for the active tab at `position`.
     fn open_context_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let items = if self.active_tab().editor().is_some() {
-            vec![
+        self.open_context_menu_for(MenuTarget::Pane, position, cx);
+    }
+
+    pub fn open_context_menu_for(
+        &mut self,
+        target: MenuTarget,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let items = match (target, &self.active_tab().content) {
+            (MenuTarget::Tab, _) => vec![
+                ShellCommand::RenameTab,
+                ShellCommand::MoveTabLeft,
+                ShellCommand::MoveTabRight,
+                ShellCommand::SplitVertical,
+                ShellCommand::SplitHorizontal,
+                ShellCommand::CloseWindow,
+                ShellCommand::OpenSettings,
+            ],
+            (MenuTarget::Pane, TabContent::Editor(_)) => vec![
                 ShellCommand::EditorCut,
                 ShellCommand::EditorCopy,
                 ShellCommand::EditorPaste,
                 ShellCommand::EditorSelectAll,
                 ShellCommand::EditorFind,
                 ShellCommand::EditorReplace,
+                ShellCommand::AgentAsk,
                 ShellCommand::ToggleWordWrap,
                 ShellCommand::ToggleMinimap,
                 ShellCommand::SaveFile,
-            ]
-        } else {
-            vec![
+                ShellCommand::OpenSettings,
+            ],
+            (MenuTarget::Pane, TabContent::Agent(_)) => vec![
+                ShellCommand::NewAgentSession,
+                ShellCommand::AgentForward,
+                ShellCommand::AgentAcceptAllHunks,
+                ShellCommand::AgentRejectAllHunks,
+                ShellCommand::RenameTab,
+                ShellCommand::OpenSettings,
+            ],
+            (MenuTarget::Pane, TabContent::Terminal(_)) => vec![
                 ShellCommand::TerminalCopy,
                 ShellCommand::TerminalPaste,
                 ShellCommand::SearchScrollback,
@@ -3413,7 +3487,8 @@ impl ForgeWindow {
                 ShellCommand::SplitHorizontal,
                 ShellCommand::AgentInvestigate,
                 ShellCommand::RenameTab,
-            ]
+                ShellCommand::OpenSettings,
+            ],
         };
         self.context_menu = Some(ContextMenu {
             position,
@@ -3506,23 +3581,22 @@ impl ForgeWindow {
             ClipboardPolicy::Deny => {
                 self.notify_user(
                     NotificationLevel::Info,
-                    "Un programa intentó escribir el portapapeles (OSC 52); denegado por configuración",
+                    tr("A program tried to write the clipboard (OSC 52); denied by configuration"),
                 );
             }
             ClipboardPolicy::Allow => write_clipboard(cx, target, text),
             ClipboardPolicy::Ask if allowed => write_clipboard(cx, target, text),
             ClipboardPolicy::Ask => {
                 let who = if program.is_empty() {
-                    "Un programa de la terminal".to_owned()
+                    tr("A terminal program").to_owned()
                 } else {
                     format!("«{program}»")
                 };
                 self.confirmation = Some(Confirmation {
-                    title: "¿Permitir escribir el portapapeles?".into(),
-                    body: format!(
-                        "{who} quiere copiar {} caracteres: {}",
-                        text.chars().count(),
-                        single_line(&text, 80)
+                    title: tr("Allow writing the clipboard?").into(),
+                    body: trf(
+                        "{} wants to copy {} characters: {}",
+                        &[&who, &text.chars().count(), &single_line(&text, 80)],
                     ),
                     kind: ConfirmationKind::Clipboard {
                         tab_id,
@@ -3611,7 +3685,7 @@ impl ForgeWindow {
                     Ok(_) => tracing::debug!(%program, ?args, "opened file reference"),
                     Err(error) => self.notify_user(
                         NotificationLevel::Error,
-                        format!("No se pudo ejecutar {program}: {error}"),
+                        trf("Could not run {}: {}", &[&program, &error]),
                     ),
                 }
             }
@@ -3624,7 +3698,7 @@ impl ForgeWindow {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Abrir terminal en…".into()),
+            prompt: Some(tr("Open terminal in…").into()),
         });
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = receiver.await
@@ -3642,9 +3716,9 @@ impl ForgeWindow {
     fn confirm_close_window(window: &mut Window, cx: &mut Context<Self>) {
         let answer = window.prompt(
             PromptLevel::Warning,
-            "¿Cerrar la ventana de Forge?",
-            Some("La sesión de terminal sigue viva en forge-termd."),
-            &["Cerrar", "Cancelar"],
+            tr("Close the Forge window?"),
+            Some(tr("The terminal session stays alive in forge-termd.")),
+            &[tr("Close"), tr("Cancel")],
             cx,
         );
         cx.spawn(async move |this, cx| {
@@ -3684,13 +3758,14 @@ impl ForgeWindow {
             Some(risk) => {
                 let lines = text.lines().count();
                 let body = match risk {
-                    PasteRisk::Multiline => format!(
-                        "El texto tiene {lines} líneas y la aplicación no usa bracketed paste: cada salto de línea se ejecutará como Enter."
+                    PasteRisk::Multiline => trf(
+                        "The text has {} lines and the application does not use bracketed paste: every line break will run as Enter.",
+                        &[&lines],
                     ),
-                    PasteRisk::BracketEscape => "El texto contiene la secuencia de fin de bracketed paste (ESC [201~), que puede inyectar comandos.".into(),
+                    PasteRisk::BracketEscape => tr("The text contains the end sequence of bracketed paste (ESC [201~), which can inject commands.").into(),
                 };
                 self.confirmation = Some(Confirmation {
-                    title: "¿Pegar de todas formas?".into(),
+                    title: tr("Paste anyway?").into(),
                     body,
                     kind: ConfirmationKind::Paste(text),
                 });
@@ -3716,6 +3791,14 @@ impl ForgeWindow {
             }
         }
         let Some(index) = self.pane_at(event.position) else {
+            // The agent panel records no bounds; while it is the active tab
+            // any right click below the top bar belongs to it.
+            if event.button == MouseButton::Right
+                && self.active_tab().agent().is_some()
+                && event.position.y > px(chrome::TOPBAR_HEIGHT)
+            {
+                self.open_context_menu(event.position, cx);
+            }
             return;
         };
         self.activate_tab(index, cx);
