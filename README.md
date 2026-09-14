@@ -160,8 +160,14 @@ lines per notch. Long lines scroll horizontally (horizontal wheel or
 `Shift`+wheel; the view follows the cursor) or wrap at word boundaries with
 `Alt+Z` / `editor.word_wrap`; a minimap on the right (`editor.minimap`,
 `editor.toggleMinimap`) shows the file with the visible region as a slider
-you can click or drag; the right mouse button (or `Shift+F10`) opens a
-context menu with the usual commands in editors and terminals. Unsaved buffers are journaled
+you can click or drag (dragging moves through the whole document over the
+strip's height); the right mouse button (or `Shift+F10`) opens a context
+menu with the usual commands in editors and terminals. Files inside a git
+checkout show the branch and `+added ~modified −deleted` counts in the
+status line and VS Code-style change bars in the gutter (green added, blue
+modified, a red wedge where lines were removed), recomputed 300 ms after
+the last edit and after saves (`git_added`/`git_modified`/`git_deleted` in
+themes). Unsaved buffers are journaled
 under `<config dir>/journal/` and recovered on the next open. `[editor]`
 config: `tab_size`, `indent_with_tabs`, `line_numbers`. Syntax highlighting
 via tree-sitter for Rust, TOML, JSON, Bash, Python, JavaScript, Markdown and

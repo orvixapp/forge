@@ -63,6 +63,14 @@ sin snippets, sin emulación Vim completa.
   zona visible con clic y arrastre.
 - [x] Menú contextual con el botón derecho (o `Shift+F10`/tecla Menú) en
   editores y terminales, con los comandos y sus atajos; teclado ↑↓/Enter.
+- [x] Git (adelanto de la Fase 6, crate `forge-git` con `gix` +
+  `imara-diff`): descubrimiento del repositorio y rama, texto de `HEAD`
+  cacheado, diff por líneas en un hilo (debounce 300 ms) con marcas en
+  el gutter (añadido/modificado/borrado) y contadores en la línea de
+  estado; se recalcula al guardar o recargar. Pendiente para la Fase 6:
+  staging, blame, historial y vista de diff.
+- [x] Arrastre del slider del minimapa a «velocidad de documento»: la
+  altura de la franja recorre todo el archivo.
 - [ ] «Recuperar N archivos» al arrancar para archivos que no se vuelven a
   abrir (hoy sólo al abrirlos).
 
