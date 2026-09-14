@@ -107,6 +107,24 @@ pub struct TerminalConfig {
     pub padding: f32,
     /// Show the "Forge · cols×rows · status" line above the grid.
     pub show_status: bool,
+    /// Inject Forge's shell integration (OSC 133 prompt marks, OSC 7 cwd)
+    /// into bash, zsh and fish started without custom `args`.
+    pub shell_integration: bool,
+    /// What to do when a program writes the clipboard (OSC 52).
+    pub clipboard_write: ClipboardPolicy,
+    /// Command that opens `file:line` references from Ctrl+click; `{file}`,
+    /// `{line}` and `{column}` are substituted. Empty uses the desktop
+    /// opener (`xdg-open`/`open`).
+    pub open_file_command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipboardPolicy {
+    /// Show a confirmation the first time per tab.
+    Ask,
+    Allow,
+    Deny,
 }
 
 /// `#rrggbb` colour that deserializes from a string.
@@ -178,6 +196,9 @@ impl Default for TerminalConfig {
             args: Vec::new(),
             padding: 16.0,
             show_status: true,
+            shell_integration: true,
+            clipboard_write: ClipboardPolicy::Ask,
+            open_file_command: Vec::new(),
         }
     }
 }

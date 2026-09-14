@@ -26,10 +26,12 @@ pub enum ShellCommand {
     SearchScrollback,
     SearchNext,
     SearchPrevious,
+    PreviousPrompt,
+    NextPrompt,
 }
 
 impl ShellCommand {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::NewTerminalTab,
         Self::NewTerminalTabInDirectory,
         Self::CloseWindow,
@@ -44,6 +46,8 @@ impl ShellCommand {
         Self::SearchScrollback,
         Self::SearchNext,
         Self::SearchPrevious,
+        Self::PreviousPrompt,
+        Self::NextPrompt,
     ];
 
     #[must_use]
@@ -63,6 +67,8 @@ impl ShellCommand {
             Self::SearchScrollback => "terminal.search",
             Self::SearchNext => "terminal.searchNext",
             Self::SearchPrevious => "terminal.searchPrevious",
+            Self::PreviousPrompt => "terminal.previousPrompt",
+            Self::NextPrompt => "terminal.nextPrompt",
         }
     }
 
@@ -83,6 +89,8 @@ impl ShellCommand {
             Self::SearchScrollback => "Search scrollback",
             Self::SearchNext => "Search: next match (older)",
             Self::SearchPrevious => "Search: previous match (newer)",
+            Self::PreviousPrompt => "Scroll to previous prompt",
+            Self::NextPrompt => "Scroll to next prompt",
         }
     }
 
@@ -187,8 +195,9 @@ pub struct ShellKeymap {
 impl Default for ShellKeymap {
     fn default() -> Self {
         use ShellCommand::{
-            CloseWindow, CycleTheme, FocusNextPane, NewTerminalTab, SearchNext, SearchPrevious,
-            SearchScrollback, ShowCommandPalette, SplitHorizontal, SplitVertical,
+            CloseWindow, CycleTheme, FocusNextPane, NewTerminalTab, NextPrompt, PreviousPrompt,
+            SearchNext, SearchPrevious, SearchScrollback, ShowCommandPalette, SplitHorizontal,
+            SplitVertical,
         };
         use ShellContext::{Terminal, Window};
         Self {
@@ -203,6 +212,8 @@ impl Default for ShellKeymap {
                 binding("f", true, false, true, Terminal, SearchScrollback),
                 binding("g", true, false, true, Terminal, SearchNext),
                 binding("h", true, false, true, Terminal, SearchPrevious),
+                binding("up", true, false, true, Terminal, PreviousPrompt),
+                binding("down", true, false, true, Terminal, NextPrompt),
             ],
         }
     }

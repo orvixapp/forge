@@ -5,7 +5,7 @@
 //! in-flight reads on every keystroke and desynchronize the framed stream
 //! under heavy output.
 
-use proto_ipc::{KeyEvent, MouseEvent, ScrollRequest, ServerMessage};
+use proto_ipc::{KeyEvent, MouseEvent, ProcessSignal, PromptDirection, ScrollRequest, ServerMessage};
 use std::{path::PathBuf, sync::mpsc::Sender};
 use tokio::sync::mpsc as async_mpsc;
 
@@ -37,6 +37,8 @@ pub enum IpcCommand {
     Mouse(MouseEvent),
     Paste(String),
     Scroll(ScrollRequest),
+    ScrollToPrompt(PromptDirection),
+    Signal(ProcessSignal),
     /// Scrollback search; the daemon answers with `SearchResults` carrying
     /// the same `request_id`.
     Search {
@@ -64,6 +66,8 @@ pub struct SessionSpec {
     /// reflowing the shell's first prompt from the historical 80x24 default.
     pub cols: u16,
     pub rows: u16,
+    /// Extra environment for the shell (shell integration, TERM_PROGRAM).
+    pub env: Vec<(String, String)>,
     /// Daemon session from the saved layout; a new one is created when the
     /// daemon no longer has it.
     pub attach: Option<u64>,
@@ -248,6 +252,7 @@ mod unix {
                     cwd: spec.cwd,
                     cols: spec.cols,
                     rows: spec.rows,
+                    env: spec.env,
                 },
             )
             .await?;
@@ -317,6 +322,8 @@ mod unix {
                     | IpcCommand::Mouse(_)
                     | IpcCommand::Paste(_)
                     | IpcCommand::Scroll(_)
+                    | IpcCommand::ScrollToPrompt(_)
+                    | IpcCommand::Signal(_)
                     | IpcCommand::Search { .. } => {
                         write_message(
                             &mut writer,
@@ -380,6 +387,11 @@ mod unix {
             IpcCommand::Mouse(event) => ClientMessage::Mouse { session_id, event },
             IpcCommand::Paste(text) => ClientMessage::Paste { session_id, text },
             IpcCommand::Scroll(scroll) => ClientMessage::Scroll { session_id, scroll },
+            IpcCommand::ScrollToPrompt(direction) => ClientMessage::ScrollToPrompt {
+                session_id,
+                direction,
+            },
+            IpcCommand::Signal(signal) => ClientMessage::Signal { session_id, signal },
             IpcCommand::Search {
                 request_id,
                 query,
