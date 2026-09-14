@@ -10,11 +10,22 @@ portable-pty.workspace = true
 proto-ghostty-vt = { path = "../proto-ghostty-vt" }
 proto-ipc = { path = "../proto-ipc" }
 regex.workspace = true
-rustix = { version = "1", features = ["process"] }
 unicode-width = "0.2"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[features]
+# Second `VtEngine` (`--engine alacritty`) for parser/scrollback comparisons.
+alacritty = ["dep:alacritty_terminal"]
+
+[dependencies.alacritty_terminal]
+version = "0.26"
+optional = true
+default-features = false
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
 
 [lints]
 workspace = true

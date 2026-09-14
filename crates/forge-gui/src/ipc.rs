@@ -11,9 +11,9 @@ use proto_ipc::{
 use std::{path::PathBuf, sync::mpsc::Sender};
 use tokio::sync::mpsc as async_mpsc;
 
-// Without a daemon (non-Unix builds) the messages are only ever sent, never
+// Without a daemon (other platforms) the messages are only ever sent, never
 // produced, so the compiler sees the payloads as unused.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 pub enum UiEvent {
     Message {
         tab_id: u64,
@@ -31,7 +31,7 @@ pub enum UiEvent {
     },
 }
 
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 pub enum IpcCommand {
     /// Kill the program behind the tab (the user closed it).
     Shutdown,
@@ -58,7 +58,7 @@ pub enum IpcCommand {
 /// Everything needed to create one daemon session, or to reattach to one
 /// that survived a previous Forge process.
 #[derive(Clone)]
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 pub struct SessionSpec {
     pub socket: PathBuf,
     pub command: String,
@@ -77,7 +77,7 @@ pub struct SessionSpec {
     pub daemon_instance: Option<u64>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn spawn_ipc_worker(
     spec: SessionSpec,
     tab_id: u64,
@@ -92,7 +92,7 @@ pub fn spawn_ipc_worker(
                 .build()
                 .map_err(anyhow::Error::from)
                 .and_then(|runtime| {
-                    runtime.block_on(unix::run_ipc(spec, tab_id, events.clone(), input))
+                    runtime.block_on(client::run_ipc(spec, tab_id, events.clone(), input))
                 });
             if let Err(error) = result {
                 let _ = events.send(UiEvent::Status {
@@ -104,9 +104,7 @@ pub fn spawn_ipc_worker(
         .expect("spawn GUI IPC worker");
 }
 
-/// Phase 1 targets Windows as "build only": the daemon needs `ConPTY` and
-/// named pipes, which arrive with the terminal phase.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 #[allow(clippy::needless_pass_by_value)]
 pub fn spawn_ipc_worker(
     _spec: SessionSpec,
@@ -120,8 +118,10 @@ pub fn spawn_ipc_worker(
     });
 }
 
-#[cfg(unix)]
-mod unix {
+/// The client side of the daemon transport: a Unix socket, or a named pipe
+/// on Windows. Both are plain `AsyncRead + AsyncWrite` streams from here.
+#[cfg(any(unix, windows))]
+mod client {
     use super::{IpcCommand, SessionSpec, UiEvent};
     use anyhow::{Context as _, Result, bail};
     use proto_ipc::{
@@ -134,10 +134,53 @@ mod unix {
         time::{Duration, Instant},
     };
     use tokio::{
-        net::UnixStream,
+        io::{ReadHalf, WriteHalf},
         process::{Child, Command},
         sync::mpsc as async_mpsc,
     };
+
+    #[cfg(unix)]
+    type Stream = tokio::net::UnixStream;
+    #[cfg(windows)]
+    type Stream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+    #[cfg(unix)]
+    async fn connect(socket: &Path) -> std::io::Result<Stream> {
+        tokio::net::UnixStream::connect(socket).await
+    }
+
+    /// Named pipes report "busy" while the server recreates its instance
+    /// between clients; wait briefly instead of failing.
+    #[cfg(windows)]
+    async fn connect(socket: &Path) -> std::io::Result<Stream> {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        const ERROR_PIPE_BUSY: i32 = 231;
+        let name = pipe_name(socket);
+        for _ in 0..50 {
+            match ClientOptions::new().open(&name) {
+                Ok(client) => return Ok(client),
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::other("named pipe stayed busy"))
+    }
+
+    /// Mirrors the daemon's mapping from a socket path to a pipe name.
+    #[cfg(windows)]
+    fn pipe_name(path: &Path) -> String {
+        let text = path.to_string_lossy();
+        if text.starts_with(r"\\.\pipe\") {
+            return text.into_owned();
+        }
+        let stem = path.file_name().map_or_else(
+            || "forge-termd".into(),
+            |name| name.to_string_lossy().replace(['\\', '/', ':'], "-"),
+        );
+        format!(r"\\.\pipe\{stem}")
+    }
 
     /// Tabs initialize on separate worker threads. Serialize protocol recovery
     /// so two tabs cannot unlink the replacement socket at the same time.
@@ -156,15 +199,15 @@ mod unix {
 
     /// Connects (starting the daemon if needed), creates the session and
     /// attaches. Returns the framed reader, the writer and the session id.
-    async fn handshake(
-        spec: SessionSpec,
-    ) -> Result<(
-        FrameReader<tokio::net::unix::OwnedReadHalf>,
-        tokio::net::unix::OwnedWriteHalf,
+    type Connection = (
+        FrameReader<ReadHalf<Stream>>,
+        WriteHalf<Stream>,
         u64,
         u64,
         Option<DaemonGuard>,
-    )> {
+    );
+
+    async fn handshake(spec: SessionSpec) -> Result<Connection> {
         match handshake_once(spec.clone()).await {
             Ok(connection) => return Ok(connection),
             Err(error) if error.downcast_ref::<ProtocolMismatch>().is_some() => {}
@@ -179,6 +222,9 @@ mod unix {
             Err(error) => return Err(error),
         }
 
+        // A daemon speaking an old protocol is left to die with its last
+        // client; on Unix its socket file is taken over right away.
+        #[cfg(unix)]
         match std::fs::remove_file(&spec.socket) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -189,17 +235,9 @@ mod unix {
             .context("reiniciar forge-termd después de actualizar el protocolo")
     }
 
-    async fn handshake_once(
-        spec: SessionSpec,
-    ) -> Result<(
-        FrameReader<tokio::net::unix::OwnedReadHalf>,
-        tokio::net::unix::OwnedWriteHalf,
-        u64,
-        u64,
-        Option<DaemonGuard>,
-    )> {
+    async fn handshake_once(spec: SessionSpec) -> Result<Connection> {
         let (stream, daemon) = connect_or_start_daemon(&spec.socket).await?;
-        let (reader, mut writer) = stream.into_split();
+        let (reader, mut writer) = tokio::io::split(stream);
         let mut reader = FrameReader::new(reader);
         write_message(
             &mut writer,
@@ -435,8 +473,8 @@ mod unix {
     /// GUI exits: surviving the UI is the daemon's reason to exist (§14.2).
     struct DaemonGuard(Child);
 
-    async fn connect_or_start_daemon(socket: &Path) -> Result<(UnixStream, Option<DaemonGuard>)> {
-        if let Ok(stream) = UnixStream::connect(socket).await {
+    async fn connect_or_start_daemon(socket: &Path) -> Result<(Stream, Option<DaemonGuard>)> {
+        if let Ok(stream) = connect(socket).await {
             return Ok((stream, None));
         }
         let ghostty = ghostty_library();
@@ -447,25 +485,29 @@ mod unix {
             );
         }
         let mut command = daemon_command(socket, &ghostty)?;
-        let child = command
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
-            .kill_on_drop(false)
-            .process_group(0)
+            .kill_on_drop(false);
+        // Its own process group, so a Ctrl+C aimed at the GUI's terminal
+        // does not take the daemon (and every shell) down with it.
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = command
             .spawn()
             .context("arrancar forge-termd automáticamente")?;
         let mut daemon = DaemonGuard(child);
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            match UnixStream::connect(socket).await {
+            match connect(socket).await {
                 Ok(stream) => return Ok((stream, Some(daemon))),
                 Err(_) if Instant::now() < deadline => {
                     if let Some(status) = daemon.0.try_wait().context("consultar forge-termd")? {
                         // Several tabs may race to start the daemon; the
                         // losers exit because the socket is taken, and the
                         // winner is the one to connect to.
-                        if let Ok(stream) = UnixStream::connect(socket).await {
+                        if let Ok(stream) = connect(socket).await {
                             return Ok((stream, None));
                         }
                         bail!("forge-termd terminó durante el arranque: {status}");
@@ -480,7 +522,11 @@ mod unix {
     fn daemon_command(socket: &Path, ghostty: &Path) -> Result<Command> {
         let sibling = std::env::current_exe()
             .context("resolver ejecutable actual")?
-            .with_file_name("proto-termd");
+            .with_file_name(if cfg!(windows) {
+                "proto-termd.exe"
+            } else {
+                "proto-termd"
+            });
         let mut command = if sibling.is_file() {
             Command::new(sibling)
         } else {
@@ -506,9 +552,18 @@ mod unix {
             .to_path_buf()
     }
 
+    /// `libghostty-vt` built by `scripts/bootstrap-ghostty.sh`, unless
+    /// `FORGE_GHOSTTY_LIB` points elsewhere.
     pub fn ghostty_library() -> PathBuf {
+        let file = if cfg!(target_os = "macos") {
+            "libghostty-vt.dylib"
+        } else if cfg!(windows) {
+            "ghostty-vt.dll"
+        } else {
+            "libghostty-vt.so"
+        };
         std::env::var_os("FORGE_GHOSTTY_LIB").map_or_else(
-            || workspace_dir().join("target/ghostty/lib/libghostty-vt.so"),
+            || workspace_dir().join("target/ghostty/lib").join(file),
             PathBuf::from,
         )
     }
@@ -524,7 +579,7 @@ mod unix {
                 Some("forge")
             );
             if std::env::var_os("FORGE_GHOSTTY_LIB").is_none() {
-                assert!(ghostty_library().ends_with("target/ghostty/lib/libghostty-vt.so"));
+                assert!(ghostty_library().starts_with(workspace_dir().join("target/ghostty/lib")));
             }
         }
     }

@@ -1,14 +1,21 @@
-#[cfg(not(unix))]
+//! `forge-termd` prototype: PTY sessions behind Ghostty's VT engine, served
+//! over a Unix socket (Linux/macOS) or a named pipe (Windows, `ConPTY` via
+//! `portable-pty`).
+
+#[cfg(not(any(unix, windows)))]
 fn main() {
-    eprintln!("proto-termd currently implements Unix sockets only; Windows named pipes are next");
+    eprintln!("proto-termd supports Unix sockets and Windows named pipes only");
     std::process::exit(2);
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod search;
 
-#[cfg(unix)]
-mod unix {
+#[cfg(any(unix, windows))]
+mod transport;
+
+#[cfg(any(unix, windows))]
+mod daemon {
     use anyhow::{Context, Result, bail};
     use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
     use proto_ghostty_vt::{
@@ -24,14 +31,13 @@ mod unix {
     use std::{
         collections::{HashMap, VecDeque},
         io::{Read, Write},
-        os::unix::fs::PermissionsExt,
         path::PathBuf,
         sync::{Arc, Mutex, mpsc},
         thread,
         time::{SystemTime, UNIX_EPOCH},
     };
     use tokio::{
-        net::{UnixListener, UnixStream},
+        io::{AsyncRead, AsyncWrite},
         sync::{RwLock, broadcast, mpsc as async_mpsc},
     };
     use tracing::{error, info, warn};
@@ -215,6 +221,7 @@ mod unix {
         /// Signals the whole process group of the shell (it is a session
         /// leader, so the group id is its pid), like the driver does for
         /// Ctrl+C but for any signal and regardless of terminal modes.
+        #[cfg(unix)]
         fn signal(&self, signal: ProcessSignal) -> Result<()> {
             let pid = self
                 .child
@@ -231,6 +238,21 @@ mod unix {
                 ProcessSignal::Hangup => rustix::process::Signal::HUP,
             };
             rustix::process::kill_process_group(pid, signal).context("send signal")
+        }
+
+        /// `ConPTY` has no signals: an interrupt is the Ctrl+C byte, and
+        /// everything else terminates the console process.
+        #[cfg(windows)]
+        fn signal(&self, signal: ProcessSignal) -> Result<()> {
+            match signal {
+                ProcessSignal::Interrupt => self
+                    .input
+                    .send(vec![0x03])
+                    .context("PTY input queue closed"),
+                ProcessSignal::Terminate | ProcessSignal::Kill | ProcessSignal::Hangup => {
+                    self.shutdown()
+                }
+            }
         }
 
         /// Scrolls the viewport to the previous/next prompt line marked by
@@ -929,23 +951,11 @@ mod unix {
             )
         })?;
         let socket = options.socket;
-        if socket.exists() {
-            if UnixStream::connect(&socket).await.is_ok() {
-                bail!(
-                    "another terminal daemon is already listening at {}",
-                    socket.display()
-                );
-            }
-            std::fs::remove_file(&socket).context("remove stale socket")?;
-        }
-        let listener =
-            UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-            .context("restrict socket permissions")?;
+        let mut listener = crate::transport::Listener::bind(&socket).await?;
         info!(path = %socket.display(), "terminal daemon listening");
         let daemon = Arc::new(Daemon::new(ghostty));
         loop {
-            let (stream, _) = listener.accept().await?;
+            let stream = listener.accept().await?;
             let daemon = Arc::clone(&daemon);
             tokio::spawn(async move {
                 if let Err(error) = handle_connection(stream, daemon).await {
@@ -982,8 +992,11 @@ mod unix {
         })
     }
 
-    async fn handle_connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
-        let (mut reader, mut writer) = stream.into_split();
+    async fn handle_connection<S>(stream: S, daemon: Arc<Daemon>) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let (mut reader, mut writer) = tokio::io::split(stream);
         let (out_tx, mut out_rx) =
             async_mpsc::channel::<(FrameKind, ServerMessage)>(CONNECTION_QUEUE);
         let writer_task = tokio::spawn(async move {
@@ -1362,8 +1375,8 @@ mod unix {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    unix::run().await
+    daemon::run().await
 }
