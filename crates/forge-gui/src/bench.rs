@@ -178,6 +178,7 @@ pub fn synthetic_grid_patch(revision: usize) -> ServerMessage {
             }),
             background: None,
             styled: true,
+            style: proto_ipc::CellStyle::default(),
         }
     };
     ServerMessage::ScreenPatch {

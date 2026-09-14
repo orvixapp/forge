@@ -171,6 +171,37 @@ struct GhosttyColorRgb {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+union GhosttyStyleColorValue {
+    padding: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GhosttyStyleColor {
+    tag: i32,
+    value: GhosttyStyleColorValue,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GhosttyStyle {
+    size: usize,
+    foreground: GhosttyStyleColor,
+    background: GhosttyStyleColor,
+    underline_color: GhosttyStyleColor,
+    bold: bool,
+    italic: bool,
+    faint: bool,
+    blink: bool,
+    inverse: bool,
+    invisible: bool,
+    strikethrough: bool,
+    overline: bool,
+    underline: i32,
+}
+
+#[repr(C)]
 struct GhosttyRenderCursor {
     size: usize,
     viewport_has_value: bool,
@@ -1131,6 +1162,7 @@ impl GhosttyTerminal {
                     foreground: self.cell_color(cells.raw, 6)?,
                     background: self.cell_color(cells.raw, 5)?,
                     styled: self.cell_value::<bool>(cells.raw, 8, "cell has styling")?,
+                    style: self.cell_style(cells.raw)?,
                 });
             }
             rows.push(RenderRow {
@@ -1175,6 +1207,41 @@ impl GhosttyTerminal {
             g: color.g,
             b: color.b,
         }))
+    }
+
+    fn cell_style(&self, cells: RawRowCells) -> Result<CellStyle, GhosttyError> {
+        let empty_color = GhosttyStyleColor {
+            tag: 0,
+            value: GhosttyStyleColorValue { padding: 0 },
+        };
+        let mut value = GhosttyStyle {
+            size: size_of::<GhosttyStyle>(),
+            foreground: empty_color,
+            background: empty_color,
+            underline_color: empty_color,
+            bold: false,
+            italic: false,
+            faint: false,
+            blink: false,
+            inverse: false,
+            invisible: false,
+            strikethrough: false,
+            overline: false,
+            underline: 0,
+        };
+        let result = unsafe { (self.api.row_cells_get)(cells, 2, (&raw mut value).cast()) };
+        check("render_state_row_cells_get(style)", result)?;
+        Ok(CellStyle {
+            bold: value.bold,
+            italic: value.italic,
+            faint: value.faint,
+            blink: value.blink,
+            inverse: value.inverse,
+            invisible: value.invisible,
+            strikethrough: value.strikethrough,
+            overline: value.overline,
+            underline: u8::try_from(value.underline).unwrap_or(0),
+        })
     }
 
     fn cell_value<T: Default>(
@@ -1343,6 +1410,21 @@ pub struct RenderCell {
     pub foreground: Option<Rgb>,
     pub background: Option<Rgb>,
     pub styled: bool,
+    pub style: CellStyle,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct CellStyle {
+    pub bold: bool,
+    pub italic: bool,
+    pub faint: bool,
+    pub blink: bool,
+    pub inverse: bool,
+    pub invisible: bool,
+    pub strikethrough: bool,
+    pub overline: bool,
+    pub underline: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

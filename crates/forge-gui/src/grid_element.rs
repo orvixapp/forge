@@ -533,6 +533,7 @@ fn paint_grid(surface: &mut TerminalSurface, bounds: Bounds<Pixels>, window: &mu
                 bounds,
                 window,
             );
+            paint_decorations(grid, &frame, metrics, &mut scratch.colors, &palette, window);
         });
     });
 }
@@ -618,7 +619,7 @@ fn collect_glyph_cells(
         let mut last_color: Option<(Option<Rgb>, Hsla)> = None;
         for x in frame.cols.clone() {
             let data = &cells[usize::from(x)];
-            if data.text.is_empty() || data.text == " " {
+            if data.text.is_empty() || data.text == " " || data.style.invisible {
                 continue;
             }
             let color = if block_cursor == Some((x, y)) {
@@ -627,20 +628,78 @@ fn collect_glyph_cells(
                 match last_color {
                     Some((foreground, color)) if foreground == data.foreground => color,
                     _ => {
-                        let color = data
-                            .foreground
-                            .map_or(default_foreground, |color| scratch.colors.get(color));
+                        let color = if data.style.inverse {
+                            data.background
+                                .map_or(Hsla::from(palette.background), |color| {
+                                    scratch.colors.get(color)
+                                })
+                        } else {
+                            data.foreground
+                                .map_or(default_foreground, |color| scratch.colors.get(color))
+                        };
                         last_color = Some((data.foreground, color));
                         color
                     }
                 }
             };
+            let mut color = color;
+            if data.style.faint {
+                color.a *= 0.55;
+            }
             scratch.pending.push(PendingCell {
                 x,
                 y,
                 rank: glyphs.rank(&data.text, text_system),
                 color,
             });
+        }
+    }
+}
+
+fn paint_decorations(
+    grid: &TerminalGrid,
+    frame: &GridFrame,
+    metrics: CellMetrics,
+    colors: &mut ColorCache,
+    palette: &Palette,
+    window: &mut Window,
+) {
+    for y in frame.rows.clone() {
+        let Some(cells) = grid.row(y) else { continue };
+        for x in frame.cols.clone() {
+            let cell = &cells[usize::from(x)];
+            if cell.style.invisible {
+                continue;
+            }
+            let color = cell
+                .foreground
+                .map_or(Hsla::from(palette.foreground), |rgb| colors.get(rgb));
+            let origin = frame.cell_origin(x, y);
+            let thickness = px(if cell.style.underline == 2 { 2.0 } else { 1.0 });
+            if cell.style.underline != 0 {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        origin + point(px(0.0), px(metrics.height - 2.0)),
+                        size(frame.cell.width, thickness),
+                    ),
+                    color,
+                ));
+            }
+            if cell.style.strikethrough {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        origin + point(px(0.0), px(metrics.height * 0.55)),
+                        size(frame.cell.width, px(1.0)),
+                    ),
+                    color,
+                ));
+            }
+            if cell.style.overline {
+                window.paint_quad(fill(
+                    Bounds::new(origin, size(frame.cell.width, px(1.0))),
+                    color,
+                ));
+            }
         }
     }
 }

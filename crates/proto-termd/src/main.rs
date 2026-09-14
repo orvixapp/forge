@@ -13,9 +13,10 @@ mod unix {
         MouseInput, RenderSnapshot, ScrollViewport, SessionState,
     };
     use proto_ipc::{
-        ClientMessage, CursorStyle, FrameKind, KeyAction, KeyEvent, KeyMods, MouseAction,
-        MouseButton, MouseEvent, PROTOCOL_VERSION, Rgb, ScreenCell, ScreenCursor, ScreenRow,
-        ScrollRequest, ServerMessage, TerminalKey, Viewport, read_message, write_message,
+        CellStyle, ClientMessage, CursorStyle, FrameKind, KeyAction, KeyEvent, KeyMods,
+        MouseAction, MouseButton, MouseEvent, PROTOCOL_VERSION, Rgb, ScreenCell, ScreenCursor,
+        ScreenRow, ScrollRequest, ServerMessage, TerminalKey, Viewport, read_message,
+        write_message,
     };
     use std::{
         collections::{HashMap, VecDeque},
@@ -51,14 +52,89 @@ mod unix {
         Exited(Option<u32>),
     }
 
+    /// Terminal state-machine boundary. PTY/session code depends on this
+    /// contract rather than on Ghostty, so another engine can be benchmarked
+    /// without changing lifecycle, IPC or rendering code.
+    trait VtEngine: Send {
+        fn write(&mut self, data: &[u8]);
+        fn resize(&mut self, cols: u16, rows: u16) -> Result<()>;
+        fn snapshot(&mut self) -> Result<RenderSnapshot>;
+        fn full_snapshot(&mut self) -> Result<RenderSnapshot>;
+        fn state(&self) -> Result<SessionState>;
+        fn viewport(&self) -> Result<Viewport>;
+        fn scroll(&mut self, scroll: ScrollViewport);
+        fn encode_key(&mut self, event: &KeyEvent) -> Result<Vec<u8>>;
+        fn encode_mouse(&mut self, cols: u16, rows: u16, event: MouseEvent) -> Result<Vec<u8>>;
+        fn encode_paste(&mut self, text: &str) -> Result<Vec<u8>>;
+    }
+
+    struct GhosttyVtEngine {
+        terminal: GhosttyTerminal,
+        key_encoder: KeyEncoder,
+        mouse_encoder: MouseEncoder,
+    }
+
+    impl VtEngine for GhosttyVtEngine {
+        fn write(&mut self, data: &[u8]) {
+            self.terminal.write(data);
+        }
+
+        fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+            self.terminal
+                .resize(cols, rows)
+                .context("resize Ghostty terminal")
+        }
+
+        fn snapshot(&mut self) -> Result<RenderSnapshot> {
+            self.terminal
+                .render_snapshot()
+                .context("update Ghostty render state")
+        }
+
+        fn full_snapshot(&mut self) -> Result<RenderSnapshot> {
+            self.terminal.full_snapshot().context("read full frame")
+        }
+
+        fn state(&self) -> Result<SessionState> {
+            self.terminal.session_state().context("read session state")
+        }
+
+        fn viewport(&self) -> Result<Viewport> {
+            let scrollbar = self.terminal.scrollbar().context("read scrollbar")?;
+            Ok(Viewport {
+                total: scrollbar.total,
+                offset: scrollbar.offset,
+                len: scrollbar.len,
+            })
+        }
+
+        fn scroll(&mut self, scroll: ScrollViewport) {
+            self.terminal.scroll_viewport(scroll);
+        }
+
+        fn encode_key(&mut self, event: &KeyEvent) -> Result<Vec<u8>> {
+            self.key_encoder
+                .encode(&self.terminal, &key_input(event))
+                .context("encode key")
+        }
+
+        fn encode_mouse(&mut self, cols: u16, rows: u16, event: MouseEvent) -> Result<Vec<u8>> {
+            self.mouse_encoder
+                .encode(&self.terminal, cols, rows, mouse_input(event))
+                .context("encode mouse event")
+        }
+
+        fn encode_paste(&mut self, text: &str) -> Result<Vec<u8>> {
+            self.terminal.encode_paste(text).context("encode paste")
+        }
+    }
+
     struct Session {
         input: mpsc::SyncSender<Vec<u8>>,
         master: Mutex<Box<dyn MasterPty + Send>>,
         child: Mutex<Box<dyn Child + Send + Sync>>,
         backlog: Mutex<VecDeque<u8>>,
-        terminal: Mutex<GhosttyTerminal>,
-        key_encoder: Mutex<KeyEncoder>,
-        mouse_encoder: Mutex<MouseEncoder>,
+        terminal: Mutex<Box<dyn VtEngine>>,
         cols: std::sync::atomic::AtomicU16,
         rows: std::sync::atomic::AtomicU16,
         revision: std::sync::atomic::AtomicU64,
@@ -98,8 +174,7 @@ mod unix {
             self.terminal
                 .lock()
                 .expect("terminal mutex poisoned")
-                .resize(cols, rows)
-                .context("resize Ghostty terminal")?;
+                .resize(cols, rows)?;
             self.emit_screen()
         }
 
@@ -122,11 +197,9 @@ mod unix {
         fn emit_screen(&self) -> Result<()> {
             let (frame, viewport, state) = {
                 let mut terminal = self.terminal.lock().expect("terminal mutex poisoned");
-                let frame = terminal
-                    .render_snapshot()
-                    .context("update Ghostty render state")?;
-                let viewport = viewport_of(&terminal)?;
-                let state = terminal.session_state().context("read session state")?;
+                let frame = terminal.snapshot()?;
+                let viewport = terminal.viewport()?;
+                let state = terminal.state()?;
                 (frame, viewport, state)
             };
             let cursor = frame.cursor.map(convert_cursor);
@@ -171,9 +244,9 @@ mod unix {
         /// Everything a client that attaches mid-session needs to draw.
         fn full_frame(&self) -> Result<(SessionEvent, SessionState)> {
             let mut terminal = self.terminal.lock().expect("terminal mutex poisoned");
-            let frame = terminal.full_snapshot().context("read full frame")?;
-            let viewport = viewport_of(&terminal)?;
-            let state = terminal.session_state().context("read session state")?;
+            let frame = terminal.full_snapshot()?;
+            let viewport = terminal.viewport()?;
+            let state = terminal.state()?;
             let cursor = frame.cursor.map(convert_cursor);
             *self.last_frame.lock().expect("last frame mutex poisoned") = (cursor, viewport);
             let revision = self
@@ -199,14 +272,9 @@ mod unix {
         fn key(&self, event: &KeyEvent) -> Result<()> {
             let bytes = {
                 let mut terminal = self.terminal.lock().expect("terminal mutex poisoned");
-                let bytes = self
-                    .key_encoder
-                    .lock()
-                    .expect("key encoder mutex poisoned")
-                    .encode(&terminal, &key_input(event))
-                    .context("encode key")?;
+                let bytes = terminal.encode_key(event)?;
                 if event.action != KeyAction::Release && !bytes.is_empty() {
-                    terminal.scroll_viewport(ScrollViewport::Bottom);
+                    terminal.scroll(ScrollViewport::Bottom);
                 }
                 bytes
             };
@@ -219,14 +287,10 @@ mod unix {
 
         fn mouse(&self, event: MouseEvent) -> Result<()> {
             let bytes = {
-                let terminal = self.terminal.lock().expect("terminal mutex poisoned");
+                let mut terminal = self.terminal.lock().expect("terminal mutex poisoned");
                 let cols = self.cols.load(std::sync::atomic::Ordering::Relaxed);
                 let rows = self.rows.load(std::sync::atomic::Ordering::Relaxed);
-                self.mouse_encoder
-                    .lock()
-                    .expect("mouse encoder mutex poisoned")
-                    .encode(&terminal, cols, rows, mouse_input(event))
-                    .context("encode mouse event")?
+                terminal.encode_mouse(cols, rows, event)?
             };
             if !bytes.is_empty() {
                 self.input.send(bytes).context("PTY input queue closed")?;
@@ -237,8 +301,8 @@ mod unix {
         fn paste(&self, text: &str) -> Result<()> {
             let bytes = {
                 let mut terminal = self.terminal.lock().expect("terminal mutex poisoned");
-                terminal.scroll_viewport(ScrollViewport::Bottom);
-                terminal.encode_paste(text).context("encode paste")?
+                terminal.scroll(ScrollViewport::Bottom);
+                terminal.encode_paste(text)?
             };
             self.input.send(bytes).context("PTY input queue closed")?;
             self.emit_screen()
@@ -248,7 +312,7 @@ mod unix {
             self.terminal
                 .lock()
                 .expect("terminal mutex poisoned")
-                .scroll_viewport(match scroll {
+                .scroll(match scroll {
                     ScrollRequest::Top => ScrollViewport::Top,
                     ScrollRequest::Bottom => ScrollViewport::Bottom,
                     ScrollRequest::Delta(delta) => ScrollViewport::Delta(delta),
@@ -256,15 +320,6 @@ mod unix {
                 });
             self.emit_screen()
         }
-    }
-
-    fn viewport_of(terminal: &GhosttyTerminal) -> Result<Viewport> {
-        let scrollbar = terminal.scrollbar().context("read scrollbar")?;
-        Ok(Viewport {
-            total: scrollbar.total,
-            offset: scrollbar.offset,
-            len: scrollbar.len,
-        })
     }
 
     fn convert_cursor(cursor: proto_ghostty_vt::RenderCursor) -> ScreenCursor {
@@ -301,6 +356,17 @@ mod unix {
                         b: color.b,
                     }),
                     styled: cell.styled,
+                    style: CellStyle {
+                        bold: cell.style.bold,
+                        italic: cell.style.italic,
+                        faint: cell.style.faint,
+                        blink: cell.style.blink,
+                        inverse: cell.style.inverse,
+                        invisible: cell.style.invisible,
+                        strikethrough: cell.style.strikethrough,
+                        overline: cell.style.overline,
+                        underline: cell.style.underline,
+                    },
                 })
                 .collect(),
         }
@@ -590,14 +656,17 @@ mod unix {
                 .ghostty
                 .mouse_encoder()
                 .context("create mouse encoder")?;
+            let engine = GhosttyVtEngine {
+                terminal,
+                key_encoder,
+                mouse_encoder,
+            };
             let session = Arc::new(Session {
                 input: input_tx,
                 master: Mutex::new(pair.master),
                 child: Mutex::new(child),
                 backlog: Mutex::new(VecDeque::with_capacity(64 * 1024)),
-                terminal: Mutex::new(terminal),
-                key_encoder: Mutex::new(key_encoder),
-                mouse_encoder: Mutex::new(mouse_encoder),
+                terminal: Mutex::new(Box::new(engine)),
                 cols: std::sync::atomic::AtomicU16::new(cols.max(1)),
                 rows: std::sync::atomic::AtomicU16::new(rows.max(1)),
                 revision: std::sync::atomic::AtomicU64::new(0),

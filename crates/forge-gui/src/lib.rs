@@ -414,6 +414,7 @@ fn blank_cell() -> ScreenCell {
         foreground: None,
         background: None,
         styled: false,
+        style: proto_ipc::CellStyle::default(),
     }
 }
 
@@ -558,6 +559,7 @@ mod tests {
             foreground: Some(Rgb { r: 1, g: 2, b: 3 }),
             background: None,
             styled: true,
+            style: proto_ipc::CellStyle::default(),
         }
     }
 
