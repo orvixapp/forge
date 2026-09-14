@@ -184,10 +184,8 @@ async fn scrollback_keys_and_session_info_cross_the_daemon_boundary() {
         eprintln!("skipping Ghostty integration test; set FORGE_GHOSTTY_LIB");
         return;
     };
-    let socket = std::env::temp_dir().join(format!(
-        "forge-termd-scroll-{}.sock",
-        std::process::id()
-    ));
+    let socket =
+        std::env::temp_dir().join(format!("forge-termd-scroll-{}.sock", std::process::id()));
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_proto-termd"))
         .arg("--socket")
         .arg(&socket)
@@ -286,10 +284,14 @@ async fn scrollback_keys_and_session_info_cross_the_daemon_boundary() {
             viewport,
             dirty_rows,
             ..
-        } if viewport.offset == 0 && viewport.scrolled_back() => dirty_rows
-            .iter()
-            .find(|row| row.y == 0)
-            .map(|row| row.cells.iter().map(|cell| cell.text.as_str()).collect::<String>()),
+        } if viewport.offset == 0 && viewport.scrolled_back() => {
+            dirty_rows.iter().find(|row| row.y == 0).map(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+            })
+        }
         _ => None,
     })
     .await;
@@ -362,9 +364,7 @@ async fn scrollback_keys_and_session_info_cross_the_daemon_boundary() {
     .await
     .unwrap();
     let mouse_bytes = wait_for(&mut reader, |message| match message {
-        ServerMessage::Output { data, .. }
-            if data.windows(5).any(|window| window == b"[M #$") =>
-        {
+        ServerMessage::Output { data, .. } if data.windows(5).any(|window| window == b"[M #$") => {
             Some(data.clone())
         }
         _ => None,
@@ -406,10 +406,7 @@ async fn scrollback_keys_and_session_info_cross_the_daemon_boundary() {
 }
 
 /// Reads messages until `pick` accepts one, failing after five seconds.
-async fn wait_for<T>(
-    reader: &mut OwnedReadHalf,
-    pick: impl Fn(&ServerMessage) -> Option<T>,
-) -> T {
+async fn wait_for<T>(reader: &mut OwnedReadHalf, pick: impl Fn(&ServerMessage) -> Option<T>) -> T {
     timeout(Duration::from_secs(5), async {
         loop {
             let (_, message) = read_message::<_, ServerMessage>(reader).await.unwrap();

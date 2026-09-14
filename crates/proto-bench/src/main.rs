@@ -45,8 +45,9 @@ async fn main() -> Result<()> {
             ],
         )?,
         "idle" => gui_scenario("idle", 1, &["--benchmark-idle-ms", "60000"])?,
+        "key_echo" => key_echo::run(options.iterations).await?,
         _ => bail!(
-            "unknown scenario {scenario}; use ipc_round_trip, startup_empty, idle, grid_full, or panes_20"
+            "unknown scenario {scenario}; use ipc_round_trip, startup_empty, idle, grid_full, panes_20, or key_echo"
         ),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -143,16 +144,220 @@ fn gui_scenario(scenario: &str, iterations: usize, args: &[&str]) -> Result<Benc
 }
 
 fn forge_gui_executable() -> PathBuf {
+    profile_directory().join("forge-gui")
+}
+
+/// Directory of the binaries built in the same profile as this runner.
+fn profile_directory() -> PathBuf {
     let executable = std::env::current_exe().expect("resolve forge-bench executable");
     let directory = executable
         .parent()
         .expect("forge-bench executable directory");
-    let profile_directory = if directory.ends_with("deps") {
-        directory.parent().expect("Cargo profile directory")
+    if directory.ends_with("deps") {
+        directory.parent().expect("Cargo profile directory").into()
     } else {
-        directory
+        directory.into()
+    }
+}
+
+/// Bet B from ARCHITECTURE.md: key press → the daemon's screen patch with
+/// the echoed character, across the socket, the PTY and Ghostty. The shell
+/// is `cat`, so the echo comes from the kernel's line discipline.
+#[cfg(unix)]
+mod key_echo {
+    use super::{BenchmarkResult, profile_directory, summarize};
+    use anyhow::{Context, Result, bail};
+    use proto_ipc::{
+        ClientMessage, FrameKind, FrameReader, KeyAction, KeyEvent, KeyMods, PROTOCOL_VERSION,
+        ServerMessage, TerminalKey, write_message,
     };
-    profile_directory.join("forge-gui")
+    use std::{
+        path::PathBuf,
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    use tokio::{
+        net::{
+            UnixStream,
+            unix::{OwnedReadHalf, OwnedWriteHalf},
+        },
+        process::{Child, Command},
+        time::timeout,
+    };
+
+    struct Session {
+        daemon: Child,
+        socket: PathBuf,
+        reader: FrameReader<OwnedReadHalf>,
+        writer: OwnedWriteHalf,
+        id: u64,
+    }
+
+    /// Starts a private daemon and attaches to a `cat` session.
+    async fn start() -> Result<Session> {
+        let ghostty = std::env::var_os("FORGE_GHOSTTY_LIB").map_or_else(
+            || {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/ghostty/lib/libghostty-vt.so")
+            },
+            PathBuf::from,
+        );
+        if !ghostty.is_file() {
+            bail!(
+                "{} not found; run scripts/bootstrap-ghostty.sh",
+                ghostty.display()
+            );
+        }
+        let socket = std::env::temp_dir().join(format!("forge-bench-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let daemon = Command::new(profile_directory().join("proto-termd"))
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--ghostty-lib")
+            .arg(&ghostty)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawn proto-termd")?;
+        let stream = timeout(Duration::from_secs(5), async {
+            loop {
+                match UnixStream::connect(&socket).await {
+                    Ok(stream) => return stream,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .context("daemon did not open its socket")?;
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = FrameReader::new(reader);
+        write_message(
+            &mut writer,
+            FrameKind::Request,
+            &ClientMessage::Initialize {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "forge-bench".into(),
+            },
+        )
+        .await?;
+        reader.read_message::<ServerMessage>().await?;
+        write_message(
+            &mut writer,
+            FrameKind::Request,
+            &ClientMessage::CreateSession {
+                request_id: 1,
+                command: "/bin/cat".into(),
+                args: Vec::new(),
+                cwd: std::env::current_dir()?,
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .await?;
+        let session_id = match reader.read_message::<ServerMessage>().await?.1 {
+            ServerMessage::SessionCreated { session_id, .. } => session_id,
+            other => bail!("unexpected response {other:?}"),
+        };
+        write_message(
+            &mut writer,
+            FrameKind::Request,
+            &ClientMessage::Attach { session_id },
+        )
+        .await?;
+        Ok(Session {
+            daemon,
+            socket,
+            reader,
+            writer,
+            id: session_id,
+        })
+    }
+
+    fn key(session_id: u64, key: TerminalKey, text: Option<&str>) -> ClientMessage {
+        ClientMessage::Key {
+            session_id,
+            event: KeyEvent {
+                action: KeyAction::Press,
+                key,
+                mods: KeyMods::default(),
+                text: text.map(str::to_string),
+                unshifted_codepoint: text
+                    .and_then(|text| text.chars().next())
+                    .map_or(0, u32::from),
+            },
+        }
+    }
+
+    /// One key press until the screen patch that shows its echo.
+    async fn press_and_wait(
+        session: &mut Session,
+        key_code: TerminalKey,
+        text: &str,
+    ) -> Result<f64> {
+        let started = Instant::now();
+        write_message(
+            &mut session.writer,
+            FrameKind::Notification,
+            &key(session.id, key_code, Some(text)),
+        )
+        .await?;
+        let reader = &mut session.reader;
+        timeout(Duration::from_secs(2), async {
+            loop {
+                match reader.read_message::<ServerMessage>().await?.1 {
+                    ServerMessage::ScreenPatch { dirty_rows, .. }
+                        if dirty_rows
+                            .iter()
+                            .any(|row| row.cells.iter().any(|cell| cell.text == text)) =>
+                    {
+                        return Ok::<_, anyhow::Error>(started.elapsed().as_secs_f64() * 1_000.0);
+                    }
+                    ServerMessage::Error { message } => bail!("daemon: {message}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .context("echo timed out")?
+    }
+
+    pub async fn run(iterations: usize) -> Result<BenchmarkResult> {
+        let mut session = start().await?;
+        let mut samples = Vec::with_capacity(iterations);
+        for iteration in 0..iterations + 5 {
+            // Alternate two characters so consecutive patches always differ.
+            let (key_code, text) = if iteration % 2 == 0 {
+                (TerminalKey::X, "x")
+            } else {
+                (TerminalKey::Y, "y")
+            };
+            let sample = press_and_wait(&mut session, key_code, text).await?;
+            // Clear the line so the next character is the only change.
+            write_message(
+                &mut session.writer,
+                FrameKind::Notification,
+                &key(session.id, TerminalKey::Backspace, None),
+            )
+            .await?;
+            if iteration >= 5 {
+                samples.push(sample);
+            }
+        }
+        session.daemon.kill().await?;
+        let _ = std::fs::remove_file(&session.socket);
+        Ok(summarize("key_echo", samples, &[], None))
+    }
+}
+
+#[cfg(not(unix))]
+mod key_echo {
+    use super::BenchmarkResult;
+    use anyhow::{Result, bail};
+
+    pub async fn run(_iterations: usize) -> Result<BenchmarkResult> {
+        bail!("key_echo needs the Unix daemon")
+    }
 }
 
 fn check_thresholds(result: &BenchmarkResult, thresholds: Option<&Path>) -> Result<()> {

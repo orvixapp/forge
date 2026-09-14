@@ -17,3 +17,6 @@ p95_ms = 4.0
 
 [panes_20]
 p95_ms = 2.0
+
+[key_echo]
+p95_ms = 8.0
