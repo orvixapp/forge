@@ -21,6 +21,9 @@ p95_ms = 2.0
 [key_echo]
 p95_ms = 8.0
 
+[flood_input]
+p95_ms = 16.0
+
 # Phase 2 intermediate scale gate. The final R1 gate repeats this with 200
 # terminals under the same 100 MiB daemon budget.
 [termd_idle]

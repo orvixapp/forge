@@ -25,11 +25,13 @@ y presupuestos continúa siendo [`ARCHITECTURE.md`](ARCHITECTURE.md), §29.
 - [x] Ejecutar 200 sesiones en DEV-1: 22.141 KiB PSS, dentro del límite de 100 MiB.
 - [ ] Repetir la puerta de 200 sesiones en R1.
 - [ ] Ejecutar `vtebench` contra Alacritty y alcanzar ≥0,8× en R1.
-- [ ] Medir latencia de input durante `cat` de 1 GiB (≤16 ms).
+- [x] Medir latencia de input durante una salida de 1 GiB: 11,43 ms mediana,
+  15,56 ms p95 en 50 muestras de DEV-1 (límite ≤16 ms).
 
 Evidencia: [`2026-09-13-key-echo.md`](../bench/results/2026-09-13-key-echo.md)
 y [`2026-09-13-termd-idle-50.md`](../bench/results/2026-09-13-termd-idle-50.md)
-y [`2026-09-13-termd-idle-200.md`](../bench/results/2026-09-13-termd-idle-200.md).
+y [`2026-09-13-termd-idle-200.md`](../bench/results/2026-09-13-termd-idle-200.md)
+y [`2026-09-13-flood-input.md`](../bench/results/2026-09-13-flood-input.md).
 
 ## 2.3 — Compatibilidad del emulador
 
@@ -39,9 +41,11 @@ y [`2026-09-13-termd-idle-200.md`](../bench/results/2026-09-13-termd-idle-200.md
 - [x] Mouse, selección, copiar/pegar y bracketed paste atraviesan daemon y GUI.
 - [x] Graphemes UTF-8 y emoji se conservan y se shapean en el renderer GPUI.
 - [x] Cursor bar/block/underline/hollow y colores FG/BG llegan al renderer.
-- [ ] Ampliar `ScreenCell` con bold, italic, faint, inverse, invisible,
-  strikethrough, overline y variantes de underline; actualmente sólo conserva
-  si la celda tiene estilo y sus colores resueltos.
+- [x] `ScreenCell` transporta bold, italic, faint, blink, inverse, invisible,
+  strikethrough, overline y variantes de underline desde Ghostty por IPC.
+- [x] El renderer aplica faint, inverse, invisible, underline simple/doble,
+  strikethrough y overline.
+- [ ] Aplicar variantes tipográficas bold/italic y animación blink en GPUI.
 - [ ] Conformance interactiva con `vim`, `htop`, `tmux`, `fzf`, Codex y Claude.
 - [ ] Segunda implementación o adaptador de benchmark Alacritty para comparar
   detrás del mismo `VtEngine`.

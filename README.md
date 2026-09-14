@@ -18,6 +18,8 @@ cargo run --release -p forge-bench -- idle --check
 cargo run --release -p forge-bench -- grid_full --iterations 120 --check
 cargo run --release -p forge-bench -- panes_20 --iterations 120 --check
 cargo run --release -p forge-bench -- key_echo --iterations 500 --check
+cargo run --release -p forge-bench -- flood_input --iterations 50 --check
+cargo run --release -p forge-bench -- termd_idle --iterations 200 --check
 ```
 
 `cargo run` opens the GPUI client. It connects to an existing terminal daemon

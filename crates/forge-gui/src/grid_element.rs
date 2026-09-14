@@ -13,9 +13,9 @@ use forge_gui::{
 };
 use gpui::{
     App, BorderStyle, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Font, FontId, GlobalElementId, GlyphId, Hsla,
-    InspectorElementId, IntoElement, LayoutId, Pixels, Point, Rgba, Size, Style, TextRun, Window,
-    WindowTextSystem, black, fill, outline, point, px, rgb, size,
+    EntityInputHandler, FocusHandle, Font, FontId, FontStyle, FontWeight, GlobalElementId, GlyphId,
+    Hsla, InspectorElementId, IntoElement, LayoutId, Pixels, Point, Rgba, Size, Style, TextRun,
+    Window, WindowTextSystem, black, fill, outline, point, px, rgb, size,
 };
 use proto_ipc::{CursorStyle, Rgb};
 use std::{collections::HashMap, ops::Range};
@@ -173,8 +173,8 @@ struct GlyphCache {
     font_size: Pixels,
     line_height: Pixels,
     baseline: Pixels,
-    ascii: Vec<Option<GlyphRank>>,
-    other: HashMap<String, GlyphRank>,
+    ascii: Vec<[Option<GlyphRank>; 4]>,
+    other: HashMap<(String, u8), GlyphRank>,
     entries: Vec<Vec<CellGlyph>>,
 }
 
@@ -193,33 +193,50 @@ impl GlyphCache {
         self.font = Some(font.clone());
         self.font_size = font_size;
         self.line_height = line_height;
-        self.ascii = vec![None; 128];
+        self.ascii = vec![[None; 4]; 128];
         self.other.clear();
         self.entries.clear();
     }
 
-    fn rank(&mut self, text: &str, text_system: &WindowTextSystem) -> GlyphRank {
+    fn rank(
+        &mut self,
+        text: &str,
+        bold: bool,
+        italic: bool,
+        text_system: &WindowTextSystem,
+    ) -> GlyphRank {
+        let variant = usize::from(bold) | (usize::from(italic) << 1);
         if let [byte] = text.as_bytes()
             && byte.is_ascii()
         {
             let index = usize::from(*byte);
-            if let Some(rank) = self.ascii[index] {
+            if let Some(rank) = self.ascii[index][variant] {
                 return rank;
             }
-            let rank = self.push(text, text_system);
-            self.ascii[index] = Some(rank);
+            let rank = self.push(text, bold, italic, text_system);
+            self.ascii[index][variant] = Some(rank);
             return rank;
         }
-        if let Some(rank) = self.other.get(text) {
+        let key = (
+            text.to_owned(),
+            u8::try_from(variant).expect("style variant fits u8"),
+        );
+        if let Some(rank) = self.other.get(&key) {
             return *rank;
         }
-        let rank = self.push(text, text_system);
-        self.other.insert(text.to_owned(), rank);
+        let rank = self.push(text, bold, italic, text_system);
+        self.other.insert(key, rank);
         rank
     }
 
-    fn push(&mut self, text: &str, text_system: &WindowTextSystem) -> GlyphRank {
-        let shaped = self.shape(text, text_system);
+    fn push(
+        &mut self,
+        text: &str,
+        bold: bool,
+        italic: bool,
+        text_system: &WindowTextSystem,
+    ) -> GlyphRank {
+        let shaped = self.shape(text, bold, italic, text_system);
         self.entries.push(shaped);
         GlyphRank::try_from(self.entries.len() - 1).expect("fewer than u32::MAX distinct cells")
     }
@@ -228,13 +245,26 @@ impl GlyphCache {
         self.entries.get(rank as usize).map_or(&[], Vec::as_slice)
     }
 
-    fn shape(&self, text: &str, text_system: &WindowTextSystem) -> Vec<CellGlyph> {
+    fn shape(
+        &self,
+        text: &str,
+        bold: bool,
+        italic: bool,
+        text_system: &WindowTextSystem,
+    ) -> Vec<CellGlyph> {
         let Some(font) = &self.font else {
             return Vec::new();
         };
+        let mut font = font.clone();
+        if bold {
+            font.weight = FontWeight::BOLD;
+        }
+        if italic {
+            font.style = FontStyle::Italic;
+        }
         let run = TextRun {
             len: text.len(),
-            font: font.clone(),
+            font,
             color: black(),
             background_color: None,
             underline: None,
@@ -649,7 +679,7 @@ fn collect_glyph_cells(
             scratch.pending.push(PendingCell {
                 x,
                 y,
-                rank: glyphs.rank(&data.text, text_system),
+                rank: glyphs.rank(&data.text, data.style.bold, data.style.italic, text_system),
                 color,
             });
         }

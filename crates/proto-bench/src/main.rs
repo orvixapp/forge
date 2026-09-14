@@ -46,9 +46,10 @@ async fn main() -> Result<()> {
         )?,
         "idle" => gui_scenario("idle", 1, &["--benchmark-idle-ms", "60000"])?,
         "key_echo" => key_echo::run(options.iterations).await?,
+        "flood_input" => key_echo::run_flood(options.iterations).await?,
         "termd_idle" => termd_idle::run(options.iterations).await?,
         _ => bail!(
-            "unknown scenario {scenario}; use ipc_round_trip, startup_empty, idle, grid_full, panes_20, key_echo, or termd_idle"
+            "unknown scenario {scenario}; use ipc_round_trip, startup_empty, idle, grid_full, panes_20, key_echo, flood_input, or termd_idle"
         ),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -194,8 +195,8 @@ mod key_echo {
         id: u64,
     }
 
-    /// Starts a private daemon and attaches to a `cat` session.
-    async fn start() -> Result<Session> {
+    /// Starts a private daemon and attaches to the requested command.
+    async fn start(command: &str, args: Vec<String>) -> Result<Session> {
         let ghostty = std::env::var_os("FORGE_GHOSTTY_LIB").map_or_else(
             || {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -248,8 +249,8 @@ mod key_echo {
             FrameKind::Request,
             &ClientMessage::CreateSession {
                 request_id: 1,
-                command: "/bin/cat".into(),
-                args: Vec::new(),
+                command: command.into(),
+                args,
                 cwd: std::env::current_dir()?,
                 cols: 80,
                 rows: 24,
@@ -324,7 +325,7 @@ mod key_echo {
     }
 
     pub async fn run(iterations: usize) -> Result<BenchmarkResult> {
-        let mut session = start().await?;
+        let mut session = start("/bin/cat", Vec::new()).await?;
         let mut samples = Vec::with_capacity(iterations);
         for iteration in 0..iterations + 5 {
             // Alternate two characters so consecutive patches always differ.
@@ -349,6 +350,88 @@ mod key_echo {
         let _ = std::fs::remove_file(&session.socket);
         Ok(summarize("key_echo", samples, &[], None))
     }
+
+    /// Measures input delivery while a 1 GiB producer is saturating the PTY.
+    /// The producer is stopped only after the byte reaches the foreground
+    /// reader, which emits a marker through the same congested output path.
+    pub async fn run_flood(iterations: usize) -> Result<BenchmarkResult> {
+        const READY: &[u8] = b"FORGE_FLOOD_READY";
+        const MARKER: &[u8] = b"FORGE_FLOOD_INPUT_OK";
+        let script = concat!(
+            "stty raw -echo; ",
+            "(dd bs=1 count=1 of=/dev/null 2>/dev/null; ",
+            "printf FORGE_FLOOD_INPUT_OK) & ",
+            "printf FORGE_FLOOD_READY; ",
+            "head -c 1073741824 /dev/zero"
+        );
+        let mut samples = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let mut session = start("/bin/sh", vec!["-c".into(), script.into()]).await?;
+
+            // The reader is armed before READY. Observe READY and at least one
+            // later output chunk so the clock starts only once the 1 GiB
+            // producer is actively applying backpressure.
+            let mut startup_tail = Vec::new();
+            timeout(Duration::from_secs(5), async {
+                let mut ready = false;
+                loop {
+                    if let ServerMessage::Output { data, .. } =
+                        session.reader.read_message::<ServerMessage>().await?.1
+                    {
+                        if ready && !data.is_empty() {
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                        startup_tail.extend_from_slice(&data);
+                        ready = startup_tail
+                            .windows(READY.len())
+                            .any(|window| window == READY);
+                        if startup_tail.len() > READY.len() * 2 {
+                            startup_tail.drain(..startup_tail.len() - READY.len());
+                        }
+                    }
+                }
+            })
+            .await
+            .context("the 1 GiB producer emitted no output")??;
+
+            let started = Instant::now();
+            write_message(
+                &mut session.writer,
+                FrameKind::Notification,
+                &ClientMessage::Input {
+                    session_id: session.id,
+                    data: vec![b'x'],
+                },
+            )
+            .await?;
+            let mut tail = Vec::new();
+            let elapsed = timeout(Duration::from_secs(5), async {
+                loop {
+                    match session.reader.read_message::<ServerMessage>().await?.1 {
+                        ServerMessage::Output { data, .. } => {
+                            tail.extend_from_slice(&data);
+                            if tail.windows(MARKER.len()).any(|window| window == MARKER) {
+                                return Ok::<_, anyhow::Error>(
+                                    started.elapsed().as_secs_f64() * 1_000.0,
+                                );
+                            }
+                            if tail.len() > MARKER.len() * 2 {
+                                tail.drain(..tail.len() - MARKER.len());
+                            }
+                        }
+                        ServerMessage::Error { message } => bail!("daemon: {message}"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .context("input marker timed out under 1 GiB output pressure")??;
+            samples.push(elapsed);
+            session.daemon.kill().await?;
+            let _ = std::fs::remove_file(&session.socket);
+        }
+        Ok(summarize("flood_input", samples, &[], None))
+    }
 }
 
 #[cfg(not(unix))]
@@ -358,6 +441,10 @@ mod key_echo {
 
     pub async fn run(_iterations: usize) -> Result<BenchmarkResult> {
         bail!("key_echo needs the Unix daemon")
+    }
+
+    pub async fn run_flood(_iterations: usize) -> Result<BenchmarkResult> {
+        bail!("flood_input needs the Unix daemon")
     }
 }
 

@@ -717,7 +717,10 @@ mod unix {
         thread::Builder::new()
             .name(format!("forge-pty-read-{session_id}"))
             .spawn(move || {
-                let mut chunk = vec![0_u8; 16 * 1024];
+                // Larger reads reduce snapshot/event amplification during
+                // sustained output while the dedicated writer thread keeps
+                // keyboard input independent from VT parsing.
+                let mut chunk = vec![0_u8; 64 * 1024];
                 loop {
                     match reader.read(&mut chunk) {
                         Ok(0) => break,
