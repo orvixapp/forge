@@ -2,6 +2,7 @@ mod bench;
 mod chrome;
 mod grid_element;
 mod ipc;
+mod search;
 mod window;
 
 use crate::{

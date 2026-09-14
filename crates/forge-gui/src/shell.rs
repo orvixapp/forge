@@ -23,10 +23,13 @@ pub enum ShellCommand {
     ShowProcessExplorer,
     CycleTheme,
     ReloadConfig,
+    SearchScrollback,
+    SearchNext,
+    SearchPrevious,
 }
 
 impl ShellCommand {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 14] = [
         Self::NewTerminalTab,
         Self::NewTerminalTabInDirectory,
         Self::CloseWindow,
@@ -38,6 +41,9 @@ impl ShellCommand {
         Self::ShowProcessExplorer,
         Self::CycleTheme,
         Self::ReloadConfig,
+        Self::SearchScrollback,
+        Self::SearchNext,
+        Self::SearchPrevious,
     ];
 
     #[must_use]
@@ -54,6 +60,9 @@ impl ShellCommand {
             Self::ShowProcessExplorer => "processExplorer.show",
             Self::CycleTheme => "theme.cycle",
             Self::ReloadConfig => "config.reload",
+            Self::SearchScrollback => "terminal.search",
+            Self::SearchNext => "terminal.searchNext",
+            Self::SearchPrevious => "terminal.searchPrevious",
         }
     }
 
@@ -71,6 +80,9 @@ impl ShellCommand {
             Self::ShowProcessExplorer => "Show process explorer",
             Self::CycleTheme => "Cycle theme",
             Self::ReloadConfig => "Reload configuration",
+            Self::SearchScrollback => "Search scrollback",
+            Self::SearchNext => "Search: next match (older)",
+            Self::SearchPrevious => "Search: previous match (newer)",
         }
     }
 
@@ -175,8 +187,8 @@ pub struct ShellKeymap {
 impl Default for ShellKeymap {
     fn default() -> Self {
         use ShellCommand::{
-            CloseWindow, CycleTheme, FocusNextPane, NewTerminalTab, ShowCommandPalette,
-            SplitHorizontal, SplitVertical,
+            CloseWindow, CycleTheme, FocusNextPane, NewTerminalTab, SearchNext, SearchPrevious,
+            SearchScrollback, ShowCommandPalette, SplitHorizontal, SplitVertical,
         };
         use ShellContext::{Terminal, Window};
         Self {
@@ -188,6 +200,9 @@ impl Default for ShellKeymap {
                 binding("5", true, false, true, Window, SplitHorizontal),
                 binding("tab", true, false, false, Window, FocusNextPane),
                 binding("t", true, false, true, Window, CycleTheme),
+                binding("f", true, false, true, Terminal, SearchScrollback),
+                binding("g", true, false, true, Terminal, SearchNext),
+                binding("h", true, false, true, Terminal, SearchPrevious),
             ],
         }
     }

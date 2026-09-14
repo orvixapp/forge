@@ -76,6 +76,7 @@ pub fn render_window(
             root.child(process_explorer(view, cx))
         })
         .when(view.palette.open, |root| root.child(palette(view)))
+        .when(view.search.open, |root| root.child(search_bar(view, cx)))
         .children(resize_handles())
         .into_any_element()
 }
@@ -540,6 +541,130 @@ fn process_explorer(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> impl I
                 .mt(px(4.0))
                 .child(format!("{} · {cols}×{rows} · {}", tab.title(), tab.status))
         }))
+}
+
+/// Find bar over the top-right corner of the pane area. Enter walks towards
+/// older rows (the direction a search from the prompt wants), Shift+Enter
+/// back; Alt+R / Alt+C toggle regex and case sensitivity.
+fn search_bar(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> impl IntoElement {
+    let theme = view.theme;
+    let english = view.config.ui.language == Language::English;
+    let search = &view.search;
+    let position = search.position_label();
+    let status = match &search.error {
+        Some(error) => error.clone(),
+        None if search.query.is_empty() => {
+            if english {
+                "type to search".into()
+            } else {
+                "escribe para buscar".into()
+            }
+        }
+        None if search.matches.is_empty() => {
+            if english {
+                "no matches".into()
+            } else {
+                "sin coincidencias".into()
+            }
+        }
+        None => position.clone(),
+    };
+    div()
+        .id("search-bar")
+        .absolute()
+        .top(px(TOPBAR_HEIGHT + 8.0))
+        .right(px(24.0))
+        .w(px(420.0))
+        .px(px(10.0))
+        .py(px(8.0))
+        .rounded(px(8.0))
+        .bg(color(theme.chrome))
+        .border_1()
+        .border_color(color(theme.chrome_border))
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_size(px(14.0))
+                        .text_color(color(theme.foreground))
+                        .child(format!("⌕ {}▏", search.query)),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(color(if search.error.is_some() {
+                            theme.danger
+                        } else {
+                            theme.accent
+                        }))
+                        .whitespace_nowrap()
+                        .child(status),
+                )
+                .children(search_toggles(view, cx)),
+        )
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(color(theme.muted))
+                .child(if english {
+                    "Enter/↑ older · Shift+Enter/↓ newer · Alt+R regex · Alt+C case · Esc closes"
+                } else {
+                    "Enter/↑ anterior · Shift+Enter/↓ siguiente · Alt+R regex · Alt+C mayúsculas · Esc cierra"
+                }),
+        )
+}
+
+/// Regex and case toggles plus the close button of the search bar.
+fn search_toggles(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> Vec<AnyElement> {
+    let theme = view.theme;
+    let options = view.search.options;
+    let toggle = |id: &'static str, label: &'static str, on: bool| {
+        div()
+            .id(id)
+            .px(px(6.0))
+            .py(px(2.0))
+            .rounded(px(4.0))
+            .text_size(px(11.0))
+            .cursor_pointer()
+            .bg(color(if on {
+                theme.highlight
+            } else {
+                theme.chrome_active
+            }))
+            .text_color(color(if on { theme.foreground } else { theme.muted }))
+            .child(label)
+    };
+    vec![
+        toggle("search-regex", ".*", options.regex)
+            .on_click(cx.listener(|view, _, _, cx| {
+                view.search.options.regex = !view.search.options.regex;
+                view.resubmit_search(cx);
+            }))
+            .into_any_element(),
+        toggle("search-case", "Aa", options.case_sensitive)
+            .on_click(cx.listener(|view, _, _, cx| {
+                view.search.options.case_sensitive = !view.search.options.case_sensitive;
+                view.resubmit_search(cx);
+            }))
+            .into_any_element(),
+        div()
+            .id("search-close")
+            .cursor_pointer()
+            .text_color(color(theme.muted))
+            .child("×")
+            .on_click(cx.listener(|view, _, _, cx| view.close_search_click(cx)))
+            .into_any_element(),
+    ]
 }
 
 fn palette(view: &ForgeWindow) -> impl IntoElement {

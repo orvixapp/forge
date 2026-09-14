@@ -33,6 +33,8 @@ pub struct Palette {
     /// Overlay painted on selected cells; carries its own opacity.
     pub selection: Rgba,
     pub accent: Rgba,
+    pub search_match: Rgba,
+    pub search_current: Rgba,
 }
 
 impl From<&ThemeColors> for Palette {
@@ -45,7 +47,38 @@ impl From<&ThemeColors> for Palette {
             cursor: color(colors.cursor),
             selection,
             accent: color(colors.accent),
+            search_match: color(colors.search_match),
+            search_current: color(colors.search_current),
         }
+    }
+}
+
+/// Scrollback search matches to highlight, in absolute rows; the paint pass
+/// maps them onto the viewport. `matches` are sorted by row so only the
+/// visible slice is visited each frame.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchHighlights {
+    pub matches: Vec<SearchSpan>,
+    /// Index into `matches` of the selected one.
+    pub current: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchSpan {
+    pub row: u64,
+    pub start: u16,
+    pub end: u16,
+}
+
+impl SearchHighlights {
+    /// Matches whose row lies in `rows`, as `(index, span)`.
+    fn visible(&self, rows: Range<u64>) -> impl Iterator<Item = (usize, SearchSpan)> + '_ {
+        let first = self.matches.partition_point(|span| span.row < rows.start);
+        self.matches[first..]
+            .iter()
+            .take_while(move |span| span.row < rows.end)
+            .enumerate()
+            .map(move |(offset, span)| (first + offset, *span))
     }
 }
 
@@ -87,6 +120,7 @@ pub struct TerminalSurface {
     pub metrics: CellMetrics,
     pub palette: Palette,
     pub selection: Option<Selection>,
+    pub search: SearchHighlights,
     glyphs: GlyphCache,
     scratch: PaintScratch,
     /// Where the grid was last painted, in window coordinates; mouse events
@@ -105,6 +139,7 @@ impl TerminalSurface {
             metrics,
             palette,
             selection: None,
+            search: SearchHighlights::default(),
             glyphs: GlyphCache::default(),
             scratch: PaintScratch::default(),
             last_bounds: None,
@@ -529,6 +564,7 @@ fn paint_grid(surface: &mut TerminalSurface, bounds: Bounds<Pixels>, window: &mu
         glyphs,
         scratch,
         painted_cells,
+        search,
         ..
     } = surface;
     glyphs.prepare(&font, metrics, &text_system);
@@ -564,6 +600,9 @@ fn paint_grid(surface: &mut TerminalSurface, bounds: Bounds<Pixels>, window: &mu
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         window.paint_layer(bounds, |window| {
             paint_backgrounds(grid, &frame, &mut scratch.colors, window);
+            if !search.matches.is_empty() {
+                paint_search(search, grid.viewport().offset, &frame, &palette, window);
+            }
             if let Some(selection) = selection {
                 paint_selection(selection, &frame, palette.selection, window);
             }
@@ -596,6 +635,36 @@ fn paint_grid(surface: &mut TerminalSurface, bounds: Bounds<Pixels>, window: &mu
             );
         });
     });
+}
+
+/// One quad per visible search match, between the backgrounds and the
+/// glyphs; the selected match uses the stronger colour.
+fn paint_search(
+    search: &SearchHighlights,
+    viewport_offset: u64,
+    frame: &GridFrame,
+    palette: &Palette,
+    window: &mut Window,
+) {
+    let rows =
+        viewport_offset + u64::from(frame.rows.start)..viewport_offset + u64::from(frame.rows.end);
+    for (index, span) in search.visible(rows) {
+        #[allow(clippy::cast_possible_truncation)]
+        let y = (span.row - viewport_offset) as u16;
+        let start = span.start.max(frame.cols.start);
+        let end = span.end.min(frame.cols.end);
+        if start >= end {
+            continue;
+        }
+        let color = if search.current == Some(index) {
+            palette.search_current
+        } else {
+            palette.search_match
+        };
+        let origin = frame.cell_origin(start, y);
+        let extent = size(frame.cell.width * f32::from(end - start), frame.cell.height);
+        window.paint_quad(fill(Bounds::new(origin, extent), color));
+    }
 }
 
 /// One translucent quad per selected row segment, over the backgrounds and
@@ -890,6 +959,25 @@ mod tests {
         assert_eq!(grid, size(px(720.0), px(432.0)));
         let benchmark = CellMetrics::BENCHMARK.grid_size(200, 60);
         assert!(benchmark.width < px(1366.0) && benchmark.height < px(700.0));
+    }
+
+    #[test]
+    fn search_highlights_yield_only_the_visible_rows_with_their_indices() {
+        let span = |row| SearchSpan {
+            row,
+            start: 0,
+            end: 1,
+        };
+        let search = SearchHighlights {
+            matches: vec![span(3), span(10), span(10), span(11), span(40)],
+            current: Some(2),
+        };
+        let visible: Vec<(usize, u64)> = search
+            .visible(10..20)
+            .map(|(index, span)| (index, span.row))
+            .collect();
+        assert_eq!(visible, [(1, 10), (2, 10), (3, 11)]);
+        assert_eq!(search.visible(50..60).count(), 0);
     }
 
     #[test]

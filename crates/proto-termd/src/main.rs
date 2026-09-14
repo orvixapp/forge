@@ -5,6 +5,9 @@ fn main() {
 }
 
 #[cfg(unix)]
+mod search;
+
+#[cfg(unix)]
 mod unix {
     use anyhow::{Context, Result, bail};
     use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -66,6 +69,9 @@ mod unix {
         fn encode_key(&mut self, event: &KeyEvent) -> Result<Vec<u8>>;
         fn encode_mouse(&mut self, cols: u16, rows: u16, event: MouseEvent) -> Result<Vec<u8>>;
         fn encode_paste(&mut self, text: &str) -> Result<Vec<u8>>;
+        /// Plain text of the whole scrollable area, one line per row, for
+        /// search. Must not disturb render state or the viewport.
+        fn text(&self) -> Result<String>;
     }
 
     struct GhosttyVtEngine {
@@ -126,6 +132,12 @@ mod unix {
 
         fn encode_paste(&mut self, text: &str) -> Result<Vec<u8>> {
             self.terminal.encode_paste(text).context("encode paste")
+        }
+
+        fn text(&self) -> Result<String> {
+            self.terminal
+                .snapshot_text()
+                .context("format scrollback as text")
         }
     }
 
@@ -321,57 +333,20 @@ mod unix {
             self.emit_screen()
         }
 
+        /// Formats the scrollback once and matches in Rust; the terminal
+        /// lock is held only while Ghostty dumps the text.
         fn search(
             &self,
             query: &str,
             use_regex: bool,
             case_sensitive: bool,
         ) -> Result<Vec<SearchMatch>> {
-            if query.is_empty() {
-                return Ok(Vec::new());
-            }
-            let matcher = use_regex
-                .then(|| {
-                    regex::RegexBuilder::new(query)
-                        .case_insensitive(!case_sensitive)
-                        .build()
-                        .context("expresión regular inválida")
-                })
-                .transpose()?;
-            let literal = (!case_sensitive && !use_regex).then(|| query.to_lowercase());
-            let mut engine = self.terminal.lock().expect("terminal mutex poisoned");
-            let original = engine.viewport()?;
-            let page = original.len.max(1);
-            let mut matches = Vec::new();
-            let mut offset = 0_u64;
-            while offset < original.total && matches.len() < 10_000 {
-                engine.scroll(ScrollViewport::Row(offset));
-                let snapshot = engine.full_snapshot()?;
-                for row in snapshot.dirty_rows {
-                    let text: String = row.cells.into_iter().map(|cell| cell.text).collect();
-                    let haystack = literal.as_ref().map_or_else(|| text.clone(), |_| text.to_lowercase());
-                    let ranges: Vec<(usize, usize)> = if let Some(regex) = &matcher {
-                        regex.find_iter(&text).map(|found| (found.start(), found.end())).collect()
-                    } else {
-                        let needle = literal.as_deref().unwrap_or(query);
-                        haystack.match_indices(needle).map(|(start, value)| (start, start + value.len())).collect()
-                    };
-                    for (start, end) in ranges {
-                        matches.push(SearchMatch {
-                            row: offset + u64::from(row.y),
-                            start: u16::try_from(text[..start].chars().count()).unwrap_or(u16::MAX),
-                            end: u16::try_from(text[..end].chars().count()).unwrap_or(u16::MAX),
-                            preview: text.trim_end().to_owned(),
-                        });
-                        if matches.len() == 10_000 {
-                            break;
-                        }
-                    }
-                }
-                offset = offset.saturating_add(page);
-            }
-            engine.scroll(ScrollViewport::Row(original.offset));
-            Ok(matches)
+            let text = self
+                .terminal
+                .lock()
+                .expect("terminal mutex poisoned")
+                .text()?;
+            crate::search::search_text(&text, query, use_regex, case_sensitive)
         }
     }
 
@@ -1048,10 +1023,17 @@ mod unix {
                 regex,
                 case_sensitive,
             } => {
-                let matches = daemon
-                    .session(session_id)
-                    .await?
-                    .search(&query, regex, case_sensitive)?;
+                // A bad pattern is the user's typo, not a daemon failure:
+                // it travels inside the results so the search bar shows it.
+                let (matches, error) =
+                    match daemon
+                        .session(session_id)
+                        .await?
+                        .search(&query, regex, case_sensitive)
+                    {
+                        Ok(matches) => (matches, None),
+                        Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+                    };
                 out_tx
                     .send((
                         FrameKind::Response,
@@ -1060,46 +1042,53 @@ mod unix {
                             request_id,
                             query,
                             matches,
+                            error,
                         },
                     ))
                     .await?;
             }
-            ClientMessage::ListSessions => {
-                let sessions = daemon.sessions.read().await;
-                let mut summaries = Vec::with_capacity(sessions.len());
-                for (id, session) in sessions.iter() {
-                    let state = session
-                        .last_state
-                        .lock()
-                        .expect("state mutex poisoned")
-                        .clone();
-                    summaries.push(proto_ipc::SessionSummary {
-                        session_id: *id,
-                        title: state.title,
-                        pwd: decode_pwd(&state.pwd),
-                        alive: session
-                            .exit_code
-                            .lock()
-                            .expect("exit code mutex poisoned")
-                            .is_none(),
-                    });
-                }
-                summaries.sort_by_key(|summary| summary.session_id);
-                out_tx
-                    .send((
-                        FrameKind::Response,
-                        ServerMessage::Sessions {
-                            sessions: summaries,
-                        },
-                    ))
-                    .await?;
-            }
+            ClientMessage::ListSessions => list_sessions(daemon, out_tx).await?,
             ClientMessage::Detach { .. } => {
                 // Attach forwarding tasks end when this connection closes. Per-session
                 // detach tokens arrive in the next protocol iteration.
             }
             ClientMessage::Initialize { .. } => bail!("connection is already initialized"),
         }
+        Ok(())
+    }
+
+    async fn list_sessions(
+        daemon: &Arc<Daemon>,
+        out_tx: &async_mpsc::Sender<(FrameKind, ServerMessage)>,
+    ) -> Result<()> {
+        let sessions = daemon.sessions.read().await;
+        let mut summaries = Vec::with_capacity(sessions.len());
+        for (id, session) in sessions.iter() {
+            let state = session
+                .last_state
+                .lock()
+                .expect("state mutex poisoned")
+                .clone();
+            summaries.push(proto_ipc::SessionSummary {
+                session_id: *id,
+                title: state.title,
+                pwd: decode_pwd(&state.pwd),
+                alive: session
+                    .exit_code
+                    .lock()
+                    .expect("exit code mutex poisoned")
+                    .is_none(),
+            });
+        }
+        summaries.sort_by_key(|summary| summary.session_id);
+        out_tx
+            .send((
+                FrameKind::Response,
+                ServerMessage::Sessions {
+                    sessions: summaries,
+                },
+            ))
+            .await?;
         Ok(())
     }
 

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const HEADER_BYTES: usize = 8;
 
@@ -583,11 +583,16 @@ pub enum ServerMessage {
         mouse_tracking: bool,
         alternate_screen: bool,
     },
+    /// Answer to `Search`; `matches` are ordered from the oldest row to the
+    /// newest. `error` reports an invalid pattern instead of a daemon error,
+    /// so the search bar can show it inline.
     SearchResults {
         session_id: u64,
         request_id: u64,
         query: String,
         matches: Vec<SearchMatch>,
+        #[serde(default)]
+        error: Option<String>,
     },
     Exited {
         session_id: u64,
@@ -600,10 +605,14 @@ pub enum ServerMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SearchMatch {
-    /// Absolute row from the beginning of the retained scrollback.
+    /// Absolute row from the beginning of the retained scrollback, in the
+    /// same row space as [`Viewport::offset`].
     pub row: u64,
+    /// First column of the match.
     pub start: u16,
+    /// Column after the last one of the match.
     pub end: u16,
+    /// The matched row's text, trimmed, for result lists.
     pub preview: String,
 }
 

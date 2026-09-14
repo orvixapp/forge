@@ -4061,9 +4061,11 @@ dependencies = [
  "portable-pty",
  "proto-ghostty-vt",
  "proto-ipc",
+ "regex",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
 ]
 
 [[package]]

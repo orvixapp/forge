@@ -32,6 +32,10 @@ pub struct ThemeColors {
     pub highlight: HexColor,
     /// Close-window hover.
     pub danger: HexColor,
+    /// Background of scrollback search matches.
+    pub search_match: HexColor,
+    /// Background of the selected search match.
+    pub search_current: HexColor,
 }
 
 /// Every field optional so a theme file can override just a few colours.
@@ -53,6 +57,8 @@ pub struct ThemeFile {
     pub muted: Option<HexColor>,
     pub highlight: Option<HexColor>,
     pub danger: Option<HexColor>,
+    pub search_match: Option<HexColor>,
+    pub search_current: Option<HexColor>,
 }
 
 pub const FORGE_DARK: &str = "forge-dark";
@@ -76,6 +82,8 @@ impl ThemeColors {
             muted: HexColor::new(0x7f, 0x8a, 0xa3),
             highlight: HexColor::new(0x3b, 0x52, 0x6e),
             danger: HexColor::new(0xa8, 0x41, 0x52),
+            search_match: HexColor::new(0x5c, 0x4a, 0x1a),
+            search_current: HexColor::new(0xb5, 0x8a, 0x2e),
         }
     }
 
@@ -95,6 +103,8 @@ impl ThemeColors {
             muted: HexColor::new(0x6b, 0x75, 0x88),
             highlight: HexColor::new(0xc8, 0xd8, 0xea),
             danger: HexColor::new(0xd0, 0x6b, 0x7a),
+            search_match: HexColor::new(0xf6, 0xe3, 0xa1),
+            search_current: HexColor::new(0xf0, 0xb4, 0x29),
         }
     }
 
@@ -125,6 +135,8 @@ impl ThemeColors {
             muted,
             highlight,
             danger,
+            search_match,
+            search_current,
         } = file;
         set(&mut self.background, *background);
         set(&mut self.foreground, *foreground);
@@ -139,6 +151,8 @@ impl ThemeColors {
         set(&mut self.muted, *muted);
         set(&mut self.highlight, *highlight);
         set(&mut self.danger, *danger);
+        set(&mut self.search_match, *search_match);
+        set(&mut self.search_current, *search_current);
         self.selection_opacity = self.selection_opacity.clamp(0.0, 1.0);
         self
     }

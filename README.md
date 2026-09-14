@@ -79,15 +79,23 @@ keys = "ctrl+alt+v"
 User themes live next to the config: `~/.config/forge/themes/solar.toml` with
 `base = "forge-light"` and any of `background`, `foreground`, `cursor`,
 `selection`, `selection_opacity`, `accent`, `chrome`, `chrome_border`,
-`chrome_active`, `chrome_active_border`, `muted`, `highlight`, `danger`.
+`chrome_active`, `chrome_active_border`, `muted`, `highlight`, `danger`,
+`search_match`, `search_current`.
 
 Commands (palette: `Ctrl+Shift+P`): `terminal.newTab` (`Ctrl+T`),
 `terminal.newTabInDirectory`, `window.close` (`Ctrl+W`: closes the tab, or asks
 before closing the last one), `window.toggleMaximize`, `layout.splitVertical`
 (`Ctrl+\`), `layout.splitHorizontal` (`Ctrl+Shift+5`), `layout.focusNextPane`
 (`Ctrl+Tab`), `theme.cycle` (`Ctrl+Shift+T`), `config.reload`,
-`processExplorer.show`. The last window layout, size and theme are restored
-from `session.json` next to the config.
+`processExplorer.show`, `terminal.search` (`Ctrl+Shift+F`),
+`terminal.searchNext` (`Ctrl+Shift+G`, towards older rows),
+`terminal.searchPrevious` (`Ctrl+Shift+H`). The last window layout, size and
+theme are restored from `session.json` next to the config.
+
+Search: the bar searches the whole scrollback in `forge-termd` (literal and
+case-insensitive by default; `Alt+R` regex, `Alt+C` case), highlights every
+match, walks them with `Enter`/`Shift+Enter` and re-runs itself when the
+terminal is resized or new output arrives.
 
 Mouse: drag to select, double-click selects a word, triple-click a line; a
 finished selection lands on the Linux primary buffer (middle click).

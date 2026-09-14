@@ -609,3 +609,188 @@ async fn reattach_recovers_screen_and_ten_thousand_lines() {
     daemon.kill().await.expect("stop daemon");
     let _ = std::fs::remove_file(socket);
 }
+
+/// Search results use the viewport's row space: scrolling the viewport to
+/// a match's row shows that row at the top of the screen.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn search_finds_scrollback_rows_and_reports_bad_patterns() {
+    let Some(ghostty_lib) = ghostty_library() else {
+        eprintln!("skipping Ghostty integration test; set FORGE_GHOSTTY_LIB");
+        return;
+    };
+    let socket = unique_socket();
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_proto-termd"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--ghostty-lib")
+        .arg(ghostty_lib)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn daemon");
+    let stream = timeout(Duration::from_secs(5), connect_when_ready(&socket))
+        .await
+        .expect("daemon startup timed out")
+        .expect("connect to daemon");
+    let (mut reader, mut writer) = stream.into_split();
+    write_message(
+        &mut writer,
+        FrameKind::Request,
+        &ClientMessage::Initialize {
+            protocol_version: PROTOCOL_VERSION,
+            client_name: "integration-test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    read_message::<_, ServerMessage>(&mut reader).await.unwrap();
+    write_message(
+        &mut writer,
+        FrameKind::Request,
+        &ClientMessage::CreateSession {
+            request_id: 1,
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "i=1; while [ $i -le 200 ]; do echo \"row $i needle$i\"; i=$((i+1)); done; cat"
+                    .into(),
+            ],
+            cwd: std::env::current_dir().unwrap(),
+            cols: 40,
+            rows: 10,
+        },
+    )
+    .await
+    .unwrap();
+    let session_id = match read_message::<_, ServerMessage>(&mut reader)
+        .await
+        .unwrap()
+        .1
+    {
+        ServerMessage::SessionCreated { session_id, .. } => session_id,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    write_message(
+        &mut writer,
+        FrameKind::Request,
+        &ClientMessage::Attach { session_id },
+    )
+    .await
+    .unwrap();
+    wait_for(&mut reader, |message| match message {
+        ServerMessage::ScreenPatch { viewport, .. } if viewport.total >= 200 => Some(()),
+        _ => None,
+    })
+    .await;
+
+    // Literal search, case-insensitive: one match on row 41 (0-based).
+    write_message(
+        &mut writer,
+        FrameKind::Request,
+        &ClientMessage::Search {
+            session_id,
+            request_id: 7,
+            query: "NEEDLE42".into(),
+            regex: false,
+            case_sensitive: false,
+        },
+    )
+    .await
+    .unwrap();
+    let matches = wait_for(&mut reader, |message| match message {
+        ServerMessage::SearchResults {
+            request_id: 7,
+            matches,
+            error: None,
+            ..
+        } => Some(matches.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(matches.len(), 1, "{matches:?}");
+    assert_eq!(matches[0].row, 41);
+    assert_eq!((matches[0].start, matches[0].end), (7, 15));
+    assert_eq!(matches[0].preview, "row 42 needle42");
+
+    // Scrolling the viewport to that row puts it on the first screen line.
+    write_message(
+        &mut writer,
+        FrameKind::Notification,
+        &ClientMessage::Scroll {
+            session_id,
+            scroll: proto_ipc::ScrollRequest::Row(matches[0].row),
+        },
+    )
+    .await
+    .unwrap();
+    let top_row = wait_for(&mut reader, |message| match message {
+        ServerMessage::ScreenPatch {
+            viewport,
+            dirty_rows,
+            ..
+        } if viewport.offset == 41 => dirty_rows.iter().find(|row| row.y == 0).map(|row| {
+            row.cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        }),
+        _ => None,
+    })
+    .await;
+    assert_eq!(top_row, "row 42 needle42");
+
+    // A regular expression matches many rows; a broken one reports inline.
+    write_message(
+        &mut writer,
+        FrameKind::Request,
+        &ClientMessage::Search {
+            session_id,
+            request_id: 8,
+            query: "needle1[0-9]$".into(),
+            regex: true,
+            case_sensitive: true,
+        },
+    )
+    .await
+    .unwrap();
+    let count = wait_for(&mut reader, |message| match message {
+        ServerMessage::SearchResults {
+            request_id: 8,
+            matches,
+            ..
+        } => Some(matches.len()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(count, 10);
+    write_message(
+        &mut writer,
+        FrameKind::Request,
+        &ClientMessage::Search {
+            session_id,
+            request_id: 9,
+            query: "(".into(),
+            regex: true,
+            case_sensitive: true,
+        },
+    )
+    .await
+    .unwrap();
+    let error = wait_for(&mut reader, |message| match message {
+        ServerMessage::SearchResults {
+            request_id: 9,
+            error,
+            ..
+        } => Some(error.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(error.is_some_and(|text| text.contains("expresión regular")));
+
+    daemon.kill().await.ok();
+    let _ = std::fs::remove_file(&socket);
+}

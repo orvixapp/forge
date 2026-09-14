@@ -3,8 +3,9 @@
 
 use crate::{
     chrome,
-    grid_element::{CellMetrics, Palette, TerminalSurface},
+    grid_element::{CellMetrics, Palette, SearchHighlights, TerminalSurface},
     ipc::{IpcCommand, SessionSpec, UiEvent, spawn_ipc_worker},
+    search::{SearchAction, SearchDirection, SearchState, reveal_row},
 };
 use forge_gui::{
     CellPos, Selection, TerminalGrid,
@@ -205,6 +206,7 @@ pub struct ForgeWindow {
     pub factory: WindowFactory,
     pub keymap: ShellKeymap,
     pub palette: PaletteState,
+    pub search: SearchState,
     pub process_explorer: bool,
     pub split: Option<PaneTree>,
     pub notifications: Vec<Notification>,
@@ -233,6 +235,7 @@ impl ForgeWindow {
             factory,
             keymap,
             palette: PaletteState::default(),
+            search: SearchState::default(),
             process_explorer: false,
             split: None,
             notifications: Vec::new(),
@@ -291,6 +294,7 @@ impl ForgeWindow {
         self.notifications.retain(|note| note.expires > now);
         dirty |= self.notifications.len() != before;
         self.save_session();
+        self.refresh_search_if_due();
         dirty
     }
 
@@ -556,6 +560,9 @@ impl ForgeWindow {
     pub fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.tabs.len() && index != self.active_tab {
             self.active_tab = index;
+            if self.search.open {
+                self.retarget_search();
+            }
             cx.notify();
         }
     }
@@ -574,6 +581,184 @@ impl ForgeWindow {
             self.active_tab.min(self.tabs.len() - 1)
         };
         self.split = self.split.take().and_then(|tree| tree.remove(index));
+        if self.search.open {
+            self.retarget_search();
+        }
+        cx.notify();
+    }
+
+    // ----- scrollback search --------------------------------------------
+
+    fn open_search(&mut self, cx: &mut Context<Self>) {
+        self.search.open = true;
+        self.palette.open = false;
+        self.retarget_search();
+        cx.notify();
+    }
+
+    fn close_search(&mut self, cx: &mut Context<Self>) {
+        self.search.open = false;
+        self.search.clear_results();
+        for tab in &mut self.tabs {
+            tab.terminal.search = SearchHighlights::default();
+        }
+        cx.notify();
+    }
+
+    /// Points the search at the active tab and re-runs the query there.
+    fn retarget_search(&mut self) {
+        let active = self.active_tab().id;
+        if self.search.tab_id != Some(active) {
+            for tab in &mut self.tabs {
+                tab.terminal.search = SearchHighlights::default();
+            }
+            self.search.tab_id = Some(active);
+            self.search.clear_results();
+        }
+        self.submit_search();
+    }
+
+    /// Sends the current query to the daemon; an empty query clears.
+    fn submit_search(&mut self) {
+        let request = self.search.begin_request();
+        let query = self.search.query.clone();
+        let options = self.search.options;
+        let Some(tab) = self.search.tab_id.and_then(|id| self.tab_mut(id)) else {
+            return;
+        };
+        match request {
+            Some(request_id) => {
+                let _ = tab.input.send(IpcCommand::Search {
+                    request_id,
+                    query,
+                    regex: options.regex,
+                    case_sensitive: options.case_sensitive,
+                });
+            }
+            None => tab.terminal.search = SearchHighlights::default(),
+        }
+    }
+
+    /// Toggle buttons in the bar changed a flag.
+    pub fn resubmit_search(&mut self, cx: &mut Context<Self>) {
+        self.submit_search();
+        cx.notify();
+    }
+
+    pub fn close_search_click(&mut self, cx: &mut Context<Self>) {
+        self.close_search(cx);
+    }
+
+    fn refresh_search_if_due(&mut self) {
+        if self.search.refresh_due() {
+            self.submit_search();
+        }
+    }
+
+    fn on_search_results(
+        &mut self,
+        tab_id: u64,
+        request_id: u64,
+        matches: Vec<proto_ipc::SearchMatch>,
+        error: Option<String>,
+    ) {
+        if self.search.tab_id != Some(tab_id) {
+            return;
+        }
+        let had_selection = self.search.current.is_some();
+        if !self.search.apply_results(request_id, matches, error) {
+            return;
+        }
+        self.apply_search_highlights();
+        // The first answer to a query jumps to its newest match; refreshes
+        // after new output leave the viewport where the user put it.
+        if !had_selection {
+            self.reveal_current_match();
+        }
+        if self.search.refresh_due() {
+            self.submit_search();
+        }
+    }
+
+    fn apply_search_highlights(&mut self) {
+        let highlights = self.search.highlights();
+        if let Some(tab) = self.search.tab_id.and_then(|id| self.tab_mut(id)) {
+            tab.terminal.search = highlights;
+        }
+    }
+
+    fn reveal_current_match(&mut self) {
+        let Some(row) = self.search.current_row() else {
+            return;
+        };
+        let Some(tab) = self.search.tab_id.and_then(|id| self.tab_mut(id)) else {
+            return;
+        };
+        if let Some(top) = reveal_row(row, tab.terminal.grid.viewport()) {
+            let _ = tab.input.send(IpcCommand::Scroll(ScrollRequest::Row(top)));
+        }
+    }
+
+    fn search_step(&mut self, direction: SearchDirection, cx: &mut Context<Self>) {
+        if !self.search.open {
+            self.open_search(cx);
+        }
+        if self.search.step(direction) == SearchAction::Reveal {
+            self.apply_search_highlights();
+            self.reveal_current_match();
+        }
+        cx.notify();
+    }
+
+    /// Keys while the search bar has focus. Shell chords still work so the
+    /// user can open a tab or the palette without closing the search.
+    fn search_key(
+        &mut self,
+        key: &str,
+        key_char: Option<&str>,
+        modifiers: KeyMods,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let plain = !modifiers.control && !modifiers.alt;
+        match key {
+            "escape" => return self.close_search(cx),
+            "enter" | "up" if plain && !(key == "enter" && modifiers.shift) => {
+                return self.search_step(SearchDirection::Older, cx);
+            }
+            "enter" | "down" if plain => return self.search_step(SearchDirection::Newer, cx),
+            "backspace" if plain => {
+                self.search.query.pop();
+                self.submit_search();
+            }
+            "r" if modifiers.alt => {
+                self.search.options.regex = !self.search.options.regex;
+                self.submit_search();
+            }
+            "c" if modifiers.alt => {
+                self.search.options.case_sensitive = !self.search.options.case_sensitive;
+                self.submit_search();
+            }
+            "v" if modifiers.control => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    self.search
+                        .query
+                        .push_str(text.lines().next().unwrap_or_default());
+                    self.submit_search();
+                }
+            }
+            _ => {
+                let shell_key =
+                    ShellKeystroke::new(key, modifiers.control, modifiers.alt, modifiers.shift);
+                if let Some(command) = self.keymap.resolve(&shell_key, ShellContext::Terminal) {
+                    return self.run_shell_command(command, window, cx);
+                }
+                if plain && let Some(text) = key_char {
+                    self.search.query.push_str(text);
+                    self.submit_search();
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -647,40 +832,17 @@ impl ForgeWindow {
                     };
                 }
             }
-            UiEvent::Message { tab_id, message } => {
-                let Some(tab) = self.tab_mut(tab_id) else {
-                    return;
-                };
-                if let ServerMessage::ScreenPatch {
-                    revision,
-                    full,
-                    dirty_rows,
-                    viewport,
-                    ..
-                } = &message
-                {
-                    tracing::debug!(
-                        tab_id,
-                        revision,
-                        full,
-                        rows = dirty_rows.len(),
-                        ?viewport,
-                        "screen patch"
-                    );
-                }
-                let before = tab.terminal.grid.dimensions();
-                match tab.terminal.grid.apply_server_message(message) {
-                    Ok(true) => {
-                        if tab.terminal.grid.dimensions() != before {
-                            tab.terminal.selection = None;
-                        }
-                        tab.status =
-                            format!("Sesión activa · revisión {}", tab.terminal.grid.revision());
-                    }
-                    Ok(false) => {}
-                    Err(error) => tab.status = format!("Patch inválido: {error}"),
-                }
-            }
+            UiEvent::Message {
+                tab_id,
+                message:
+                    ServerMessage::SearchResults {
+                        request_id,
+                        matches,
+                        error,
+                        ..
+                    },
+            } => self.on_search_results(tab_id, request_id, matches, error),
+            UiEvent::Message { tab_id, message } => self.apply_screen_message(tab_id, message),
             UiEvent::Status { tab_id, status } => {
                 if let Some(tab) = self.tab_mut(tab_id) {
                     tab.status = status;
@@ -700,6 +862,55 @@ impl ForgeWindow {
         }
     }
 
+    /// Applies a screen patch (or ignores an unrelated message) and keeps
+    /// selection and search highlights consistent with the new rows.
+    fn apply_screen_message(&mut self, tab_id: u64, message: ServerMessage) {
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return;
+        };
+        if let ServerMessage::ScreenPatch {
+            revision,
+            full,
+            dirty_rows,
+            viewport,
+            ..
+        } = &message
+        {
+            tracing::debug!(
+                tab_id,
+                revision,
+                full,
+                rows = dirty_rows.len(),
+                ?viewport,
+                "screen patch"
+            );
+        }
+        let before = (
+            tab.terminal.grid.dimensions(),
+            tab.terminal.grid.viewport().total,
+        );
+        match tab.terminal.grid.apply_server_message(message) {
+            Ok(true) => {
+                let after = (
+                    tab.terminal.grid.dimensions(),
+                    tab.terminal.grid.viewport().total,
+                );
+                if after.0 != before.0 {
+                    tab.terminal.selection = None;
+                }
+                tab.status = format!("Sesión activa · revisión {}", tab.terminal.grid.revision());
+                // Reflow or new output moves rows; the matches are re-run
+                // (throttled) so highlights stay in place.
+                if after != before && self.search.open && self.search.tab_id == Some(tab_id) {
+                    self.search.invalidate();
+                    self.refresh_search_if_due();
+                }
+            }
+            Ok(false) => {}
+            Err(error) => tab.status = format!("Patch inválido: {error}"),
+        }
+    }
+
     // ----- keyboard -----------------------------------------------------
 
     pub fn on_key_down(
@@ -716,6 +927,16 @@ impl ForgeWindow {
         let modifiers = key_mods(keystroke.modifiers);
         if self.palette.open {
             self.palette_key(
+                keystroke.key.as_str(),
+                keystroke.key_char.as_deref(),
+                modifiers,
+                window,
+                cx,
+            );
+            return;
+        }
+        if self.search.open {
+            self.search_key(
                 keystroke.key.as_str(),
                 keystroke.key_char.as_deref(),
                 modifiers,
@@ -932,6 +1153,10 @@ impl ForgeWindow {
                     cx.notify();
                 }
             }
+            ShellCommand::SearchScrollback if self.search.open => self.close_search(cx),
+            ShellCommand::SearchScrollback => self.open_search(cx),
+            ShellCommand::SearchNext => self.search_step(SearchDirection::Older, cx),
+            ShellCommand::SearchPrevious => self.search_step(SearchDirection::Newer, cx),
         }
     }
 

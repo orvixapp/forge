@@ -37,6 +37,14 @@ pub enum IpcCommand {
     Mouse(MouseEvent),
     Paste(String),
     Scroll(ScrollRequest),
+    /// Scrollback search; the daemon answers with `SearchResults` carrying
+    /// the same `request_id`.
+    Search {
+        request_id: u64,
+        query: String,
+        regex: bool,
+        case_sensitive: bool,
+    },
     Resize {
         cols: u16,
         rows: u16,
@@ -308,7 +316,8 @@ mod unix {
                     IpcCommand::Key(_)
                     | IpcCommand::Mouse(_)
                     | IpcCommand::Paste(_)
-                    | IpcCommand::Scroll(_) => {
+                    | IpcCommand::Scroll(_)
+                    | IpcCommand::Search { .. } => {
                         write_message(
                             &mut writer,
                             FrameKind::Notification,
@@ -371,6 +380,18 @@ mod unix {
             IpcCommand::Mouse(event) => ClientMessage::Mouse { session_id, event },
             IpcCommand::Paste(text) => ClientMessage::Paste { session_id, text },
             IpcCommand::Scroll(scroll) => ClientMessage::Scroll { session_id, scroll },
+            IpcCommand::Search {
+                request_id,
+                query,
+                regex,
+                case_sensitive,
+            } => ClientMessage::Search {
+                session_id,
+                request_id,
+                query,
+                regex,
+                case_sensitive,
+            },
             IpcCommand::Resize { cols, rows } => ClientMessage::Resize {
                 session_id,
                 cols,

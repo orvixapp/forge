@@ -52,13 +52,31 @@ y [`2026-09-13-flood-input.md`](../bench/results/2026-09-13-flood-input.md).
 - [ ] Segunda implementación o adaptador de benchmark Alacritty para comparar
   detrás del mismo `VtEngine`.
 
+## 2.4 — Búsqueda de scrollback
+
+- [x] `Search`/`SearchResults` en el protocolo (v7): el daemon vuelca el área
+  desplazable completa con el formatter de Ghostty (una línea por fila, sin
+  tocar el render state ni el viewport) y compara en Rust (`search.rs`):
+  literal o regex, sensible o no a mayúsculas, columnas en celdas (los
+  caracteres anchos cuentan dos), tope de 10.000 coincidencias, error de
+  patrón devuelto en la respuesta.
+- [x] Barra de búsqueda (`terminal.search`, `Ctrl+Shift+F`): resaltado de
+  todas las coincidencias visibles y de la actual, navegación con
+  `Enter`/`Shift+Enter`/`↑`/`↓` y comandos `terminal.searchNext`/`searchPrevious`
+  configurables, `Alt+R` regex y `Alt+C` mayúsculas; el viewport se centra
+  en la coincidencia elegida (`Scroll::Row`).
+- [x] Resultados estables: se descartan respuestas de peticiones antiguas
+  (`request_id`), la búsqueda se repite (≤ 4 veces/s) al redimensionar o
+  cuando llega salida nueva, y la selección se queda en la fila más cercana.
+- [x] Prueba de integración `search_finds_scrollback_rows_and_reports_bad_patterns`:
+  la fila de la coincidencia coincide con el espacio de filas del viewport.
+
 ## Resto de Fase 2
 
 - [ ] Comparación Ghostty/Alacritty (`VtEngine` ya desacoplado).
 - [ ] ConPTY y transporte equivalente en Windows.
 - [ ] Renderer completo: atlas, wide chars, emoji, estilos y redraw incremental.
 - [ ] Entrada xterm/Kitty, mouse, selección, copiar/pegar y protección.
-- [ ] Búsqueda de scrollback y navegación de resultados.
 - [ ] OSC 7/8/52/133, integración de shell e hipervínculos `file:line`.
 - [ ] Acciones finales de tabs/splits, renombrado, settings y señales.
 - [ ] Conformance (`vttest`/`esctest`), benchmarks finales y CI verde.
