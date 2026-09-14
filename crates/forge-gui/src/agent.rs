@@ -527,7 +527,7 @@ impl AgentTab {
         let detail = update
             .get("content")
             .or_else(|| update.get("detail"))
-            .map(Value::to_string)
+            .map(acp_content_text)
             .unwrap_or_default();
         if let Some(TimelineItem::ToolCall {
             title: old_title,
@@ -558,6 +558,27 @@ fn timeline_text(item: &TimelineItem) -> String {
         TimelineItem::Message { text, .. } | TimelineItem::Thought { text, .. } => text.clone(),
         TimelineItem::ToolCall { title, detail, .. } => format!("{title}\n{detail}"),
         TimelineItem::Plan { title, entries } => format!("{title}\n{}", entries.join("\n")),
+    }
+}
+
+fn acp_content_text(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(acp_content_text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(object) => object
+            .get("text")
+            .or_else(|| object.get("content"))
+            .map_or_else(
+                || serde_json::to_string_pretty(value).unwrap_or_default(),
+                acp_content_text,
+            ),
+        Value::Bool(_) | Value::Number(_) => value.to_string(),
     }
 }
 
@@ -708,6 +729,26 @@ mod tests {
                 state: ToolState::Succeeded,
                 ..
             }]
+        ));
+    }
+
+    #[test]
+    fn tool_content_blocks_are_plain_text_not_protocol_json() {
+        let mut tab = AgentTab::new("OpenCode", PathBuf::from("."));
+        tab.apply_update(&json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "readme",
+            "title": "README.md",
+            "status": "completed",
+            "content": [{
+                "type": "content",
+                "content": {"type": "text", "text": "línea 1\nlínea 2"}
+            }]
+        }));
+
+        assert!(matches!(
+            tab.timeline.as_slice(),
+            [TimelineItem::ToolCall { detail, .. }] if detail == "línea 1\nlínea 2"
         ));
     }
 

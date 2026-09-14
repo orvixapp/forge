@@ -1199,30 +1199,44 @@ fn agent_timeline_item(
     theme: forge_gui::theme::ThemeColors,
     cx: &mut Context<ForgeWindow>,
 ) -> AnyElement {
-    let (label, body, tint) = match item {
+    let (label, tint, body) = match item {
         TimelineItem::Message { role, text } => {
             let label = match role {
                 MessageRole::User => tr("You"),
                 MessageRole::Agent => tr("Agent"),
             };
-            (label, text.clone(), theme.foreground)
+            let body = match role {
+                MessageRole::User => div()
+                    .text_size(px(13.0))
+                    .child(text.clone())
+                    .into_any_element(),
+                MessageRole::Agent => agent_markdown(text, streaming, theme),
+            };
+            (label.to_owned(), theme.foreground, body)
         }
-        TimelineItem::Thought { text, active, .. } => (
-            if *active {
+        TimelineItem::Thought { text, active, .. } => {
+            let label = if *active {
                 tr("● Thinking…")
             } else {
                 tr("Reasoning")
-            },
-            text.clone(),
-            theme.muted,
-        ),
+            };
+            (
+                label.to_owned(),
+                theme.muted,
+                div()
+                    .text_size(px(12.0))
+                    .text_color(color(theme.muted))
+                    .child(text.clone())
+                    .into_any_element(),
+            )
+        }
         TimelineItem::ToolCall {
             title,
             state,
             detail,
             ..
         } => {
-            let state = match state {
+            let state_label = match state {
                 ToolState::Pending => tr("pending"),
                 ToolState::Running => tr("running"),
                 ToolState::Succeeded => tr("completed"),
@@ -1230,15 +1244,15 @@ fn agent_timeline_item(
                 ToolState::WaitingPermission => tr("waiting for permission"),
             };
             (
-                tr("Tool"),
-                format!("{title} · {state}\n{detail}"),
+                format!("▸ {} · {state_label}", tr("Tool")),
                 theme.accent,
+                agent_tool_body(title, detail, *state, theme),
             )
         }
         TimelineItem::Plan { title, entries } => (
-            "Plan",
-            format!("{title}\n{}", entries.join("\n")),
+            "Plan".to_owned(),
             theme.accent,
+            agent_markdown(&format!("## {title}\n{}", entries.join("\n")), false, theme),
         ),
     };
     let thought = matches!(item, TimelineItem::Thought { .. });
@@ -1283,25 +1297,205 @@ fn agent_timeline_item(
                         .text_color(color(tint))
                         .child(label),
                 )
-                .child(
-                    div()
-                        .text_size(px(13.0))
-                        .text_color(color(if thought {
-                            theme.muted
-                        } else {
-                            theme.foreground
-                        }))
-                        .child(if streaming && !thought {
-                            format!("{body} ▋")
-                        } else {
-                            body
-                        }),
-                ),
+                .child(body),
         )
         .when(streaming && thought, |row| {
             row.child(agent_activity_dot(true, tab_id.saturating_add(1), theme))
         })
         .into_any_element()
+}
+
+fn agent_tool_body(
+    title: &str,
+    detail: &str,
+    state: ToolState,
+    theme: forge_gui::theme::ThemeColors,
+) -> AnyElement {
+    let detail = tool_output_preview(detail, state);
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(color(theme.foreground))
+                .child(title.to_owned()),
+        )
+        .when(!detail.is_empty(), |body| {
+            body.child(
+                div()
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(3.0))
+                    .bg(with_alpha(color(theme.chrome), 0.65))
+                    .text_size(px(11.0))
+                    .text_color(color(if state == ToolState::Failed {
+                        theme.danger
+                    } else {
+                        theme.muted
+                    }))
+                    .child(detail),
+            )
+        })
+        .into_any_element()
+}
+
+fn tool_output_preview(detail: &str, state: ToolState) -> String {
+    const LINES: usize = 8;
+    let lines = detail.lines().collect::<Vec<_>>();
+    if lines.len() <= LINES {
+        return detail.to_owned();
+    }
+    let hidden = lines.len() - LINES;
+    if state == ToolState::Running {
+        trf(
+            "… {} earlier lines\n{}",
+            &[&hidden, &lines[hidden..].join("\n")],
+        )
+    } else {
+        trf(
+            "{}\n… {} more lines",
+            &[&lines[..LINES].join("\n"), &hidden],
+        )
+    }
+}
+
+fn agent_markdown(
+    source: &str,
+    streaming: bool,
+    theme: forge_gui::theme::ThemeColors,
+) -> AnyElement {
+    let source = if streaming {
+        format!("{source} ▋")
+    } else {
+        source.to_owned()
+    };
+    let mut blocks = Vec::new();
+    let mut code = Vec::new();
+    let mut language = String::new();
+    let mut in_code = false;
+    for line in source.lines() {
+        if let Some(info) = line.trim_start().strip_prefix("```") {
+            if in_code {
+                blocks.push(markdown_code_block(&language, &code.join("\n"), theme));
+                code.clear();
+                language.clear();
+            } else {
+                info.trim().clone_into(&mut language);
+            }
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            code.push(line);
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            blocks.push(div().h(px(5.0)).into_any_element());
+        } else if let Some(heading) = trimmed.strip_prefix("### ") {
+            blocks.push(markdown_heading(heading, 13.0, theme));
+        } else if let Some(heading) = trimmed.strip_prefix("## ") {
+            blocks.push(markdown_heading(heading, 14.0, theme));
+        } else if let Some(heading) = trimmed.strip_prefix("# ") {
+            blocks.push(markdown_heading(heading, 15.0, theme));
+        } else if let Some(entry) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            blocks.push(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .text_size(px(13.0))
+                    .child(div().text_color(color(theme.accent)).child("•"))
+                    .child(div().flex_1().child(clean_inline_markdown(entry)))
+                    .into_any_element(),
+            );
+        } else if let Some((number, entry)) = markdown_ordered_entry(trimmed) {
+            blocks.push(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .text_size(px(13.0))
+                    .child(
+                        div()
+                            .text_color(color(theme.accent))
+                            .child(format!("{number}.")),
+                    )
+                    .child(div().flex_1().child(clean_inline_markdown(entry)))
+                    .into_any_element(),
+            );
+        } else {
+            blocks.push(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(color(theme.foreground))
+                    .child(clean_inline_markdown(trimmed))
+                    .into_any_element(),
+            );
+        }
+    }
+    if !code.is_empty() {
+        blocks.push(markdown_code_block(&language, &code.join("\n"), theme));
+    }
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(3.0))
+        .children(blocks)
+        .into_any_element()
+}
+
+fn markdown_ordered_entry(line: &str) -> Option<(&str, &str)> {
+    let (number, entry) = line.split_once(". ")?;
+    number
+        .chars()
+        .all(|character| character.is_ascii_digit())
+        .then_some((number, entry))
+}
+
+fn markdown_heading(text: &str, size: f32, theme: forge_gui::theme::ThemeColors) -> AnyElement {
+    div()
+        .mt(px(3.0))
+        .text_size(px(size))
+        .text_color(color(theme.accent))
+        .child(clean_inline_markdown(text))
+        .into_any_element()
+}
+
+fn markdown_code_block(
+    language: &str,
+    code: &str,
+    theme: forge_gui::theme::ThemeColors,
+) -> AnyElement {
+    div()
+        .mt(px(4.0))
+        .rounded(px(3.0))
+        .bg(with_alpha(color(theme.chrome), 0.75))
+        .when(!language.is_empty(), |block| {
+            block.child(
+                div()
+                    .px(px(9.0))
+                    .pt(px(6.0))
+                    .text_size(px(9.0))
+                    .text_color(color(theme.muted))
+                    .child(language.to_owned()),
+            )
+        })
+        .child(
+            div()
+                .px(px(9.0))
+                .py(px(7.0))
+                .text_size(px(11.0))
+                .child(code.to_owned()),
+        )
+        .into_any_element()
+}
+
+fn clean_inline_markdown(text: &str) -> String {
+    text.replace("**", "").replace("__", "").replace('`', "")
 }
 
 fn with_alpha(mut color: gpui::Rgba, opacity: f32) -> gpui::Rgba {
@@ -1905,4 +2099,34 @@ fn palette(view: &ForgeWindow) -> impl IntoElement {
                     .child(tr("Type to filter commands")),
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markdown_helpers_remove_source_markers_and_recognise_lists() {
+        assert_eq!(
+            clean_inline_markdown("**Forge** y `cargo test`"),
+            "Forge y cargo test"
+        );
+        assert_eq!(
+            markdown_ordered_entry("12. elemento"),
+            Some(("12", "elemento"))
+        );
+        assert_eq!(markdown_ordered_entry("no es lista"), None);
+    }
+
+    #[test]
+    fn completed_tool_output_is_kept_compact() {
+        let output = (1..=12)
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preview = tool_output_preview(&output, ToolState::Succeeded);
+        assert!(preview.contains('8'));
+        assert!(!preview.contains("\n9\n"));
+        assert!(preview.contains('4'));
+    }
 }

@@ -380,6 +380,8 @@ fn spanish(english: &str) -> Option<&'static str> {
         }
         "Esc stop" => "Esc detener",
         "Enter send · Shift+Enter newline" => "Enter enviar · Shift+Enter nueva línea",
+        "… {} earlier lines\n{}" => "… {} líneas anteriores\n{}",
+        "{}\n… {} more lines" => "{}\n… {} líneas más",
         "No ACP adapter found in PATH" => "No se encontró ningún adaptador ACP instalado en PATH",
         "Could not create the ACP runtime" => "No se pudo crear el runtime ACP",
         "ACP could not start: {}" => "ACP no pudo arrancar: {}",
