@@ -902,6 +902,36 @@ mod unix {
             ClientMessage::Scroll { session_id, scroll } => {
                 daemon.session(session_id).await?.scroll(scroll)?;
             }
+            ClientMessage::ListSessions => {
+                let sessions = daemon.sessions.read().await;
+                let mut summaries = Vec::with_capacity(sessions.len());
+                for (id, session) in sessions.iter() {
+                    let state = session
+                        .last_state
+                        .lock()
+                        .expect("state mutex poisoned")
+                        .clone();
+                    summaries.push(proto_ipc::SessionSummary {
+                        session_id: *id,
+                        title: state.title,
+                        pwd: decode_pwd(&state.pwd),
+                        alive: session
+                            .exit_code
+                            .lock()
+                            .expect("exit code mutex poisoned")
+                            .is_none(),
+                    });
+                }
+                summaries.sort_by_key(|summary| summary.session_id);
+                out_tx
+                    .send((
+                        FrameKind::Response,
+                        ServerMessage::Sessions {
+                            sessions: summaries,
+                        },
+                    ))
+                    .await?;
+            }
             ClientMessage::Detach { .. } => {
                 // Attach forwarding tasks end when this connection closes. Per-session
                 // detach tokens arrive in the next protocol iteration.

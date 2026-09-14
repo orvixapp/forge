@@ -437,3 +437,111 @@ async fn wait_for<T>(reader: &mut OwnedReadHalf, pick: impl Fn(&ServerMessage) -
     .await
     .expect("timed out waiting for a daemon message")
 }
+
+/// A client that attaches after output was produced gets the whole screen.
+#[tokio::test]
+async fn late_attach_receives_the_full_screen() {
+    let Some(ghostty_lib) = ghostty_library() else {
+        eprintln!("skipping Ghostty integration test; set FORGE_GHOSTTY_LIB");
+        return;
+    };
+    let socket = std::env::temp_dir().join(format!(
+        "forge-termd-attach-{}.sock",
+        std::process::id()
+    ));
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_proto-termd"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--ghostty-lib")
+        .arg(ghostty_lib)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn daemon");
+    let stream = timeout(Duration::from_secs(5), connect_when_ready(&socket))
+        .await
+        .expect("daemon startup timed out")
+        .expect("connect to daemon");
+    let (mut reader, mut writer) = stream.into_split();
+    write_message(
+        &mut writer,
+        FrameKind::Request,
+        &ClientMessage::Initialize {
+            protocol_version: PROTOCOL_VERSION,
+            client_name: "integration-test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    read_message::<_, ServerMessage>(&mut reader).await.unwrap();
+    write_message(
+        &mut writer,
+        FrameKind::Request,
+        &ClientMessage::CreateSession {
+            request_id: 1,
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "echo LATE-ATTACH-MARK; cat".into()],
+            cwd: std::env::current_dir().unwrap(),
+            cols: 40,
+            rows: 10,
+        },
+    )
+    .await
+    .unwrap();
+    let session_id = match read_message::<_, ServerMessage>(&mut reader)
+        .await
+        .unwrap()
+        .1
+    {
+        ServerMessage::SessionCreated { session_id, .. } => session_id,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    // Let the program print before anyone is attached.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    write_message(&mut writer, FrameKind::Request, &ClientMessage::ListSessions)
+        .await
+        .unwrap();
+    let listed = wait_for(&mut reader, |message| match message {
+        ServerMessage::Sessions { sessions } => Some(sessions.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].session_id, session_id);
+    assert!(listed[0].alive);
+
+    write_message(
+        &mut writer,
+        FrameKind::Request,
+        &ClientMessage::Attach { session_id },
+    )
+    .await
+    .unwrap();
+    let screen = wait_for(&mut reader, |message| match message {
+        ServerMessage::ScreenPatch {
+            full, dirty_rows, ..
+        } if *full => Some(
+            dirty_rows
+                .iter()
+                .map(|row| {
+                    row.cells
+                        .iter()
+                        .map(|cell| cell.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>(),
+        ),
+        _ => None,
+    })
+    .await;
+    assert_eq!(screen.len(), 10, "{screen:?}");
+    assert!(
+        screen[0].starts_with("LATE-ATTACH-MARK"),
+        "first row was {:?}",
+        screen[0]
+    );
+    daemon.kill().await.expect("stop daemon");
+    let _ = std::fs::remove_file(socket);
+}

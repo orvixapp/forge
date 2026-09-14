@@ -297,6 +297,17 @@ pub enum ClientMessage {
         session_id: u64,
         scroll: ScrollRequest,
     },
+    /// Sessions the daemon still holds, so a restarted client can reattach.
+    ListSessions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub session_id: u64,
+    pub title: String,
+    pub pwd: Option<String>,
+    /// `false` once the program exited; the last screen is still readable.
+    pub alive: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -545,6 +556,10 @@ pub enum ServerMessage {
         cursor: Option<ScreenCursor>,
         #[serde(default)]
         viewport: Viewport,
+    },
+    /// Answer to `ListSessions`.
+    Sessions {
+        sessions: Vec<SessionSummary>,
     },
     /// Slow-changing session state, sent on attach and whenever it changes.
     SessionInfo {

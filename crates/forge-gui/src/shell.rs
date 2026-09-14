@@ -478,6 +478,11 @@ pub struct WindowSession {
     pub height: f32,
     #[serde(default)]
     pub theme: Option<String>,
+    /// Daemon session behind each tab, so a restart reattaches instead of
+    /// spawning new shells. Shorter than `count` for files written before
+    /// this field existed.
+    #[serde(default)]
+    pub sessions: Vec<Option<u64>>,
 }
 
 impl WindowSession {
@@ -553,7 +558,16 @@ impl WindowSession {
         if !(self.width.is_finite() && self.height.is_finite()) {
             return Err("window size is not finite".into());
         }
+        if self.sessions.len() > self.count {
+            return Err("more daemon sessions than tabs".into());
+        }
         Ok(())
+    }
+
+    /// Daemon session for tab `index`, if the file recorded one.
+    #[must_use]
+    pub fn daemon_session(&self, index: usize) -> Option<u64> {
+        self.sessions.get(index).copied().flatten()
     }
 }
 
@@ -761,6 +775,7 @@ mod tests {
             width: 960.0,
             height: 600.0,
             theme: Some("forge-light".into()),
+            sessions: vec![Some(7), None],
         };
         session.save(&path).unwrap();
         assert_eq!(WindowSession::load(&path).unwrap(), Some(session.clone()));
@@ -776,9 +791,17 @@ mod tests {
         assert!(broken.validate().is_err());
         let stale = WindowSession {
             version: 1,
-            ..session
+            ..session.clone()
         };
         assert!(stale.validate().is_err());
+        assert_eq!(session.daemon_session(0), Some(7));
+        assert_eq!(session.daemon_session(1), None);
+        assert_eq!(session.daemon_session(5), None);
+        let too_many = WindowSession {
+            sessions: vec![None; 3],
+            ..session
+        };
+        assert!(too_many.validate().is_err());
         fs::write(&path, "{not json").unwrap();
         assert!(WindowSession::load(&path).is_err());
         fs::remove_file(&path).unwrap();

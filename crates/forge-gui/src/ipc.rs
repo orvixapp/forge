@@ -13,20 +13,37 @@ use tokio::sync::mpsc as async_mpsc;
 // produced, so the compiler sees the payloads as unused.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub enum UiEvent {
-    Message { tab_id: u64, message: ServerMessage },
-    Status { tab_id: u64, status: String },
+    Message {
+        tab_id: u64,
+        message: ServerMessage,
+    },
+    Status {
+        tab_id: u64,
+        status: String,
+    },
+    /// The daemon session a tab is attached to, for `session.json`.
+    Attached {
+        tab_id: u64,
+        session_id: u64,
+    },
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
 pub enum IpcCommand {
+    /// Kill the program behind the tab (the user closed it).
+    Shutdown,
     Key(KeyEvent),
     Mouse(MouseEvent),
     Paste(String),
     Scroll(ScrollRequest),
-    Resize { cols: u16, rows: u16 },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
 }
 
-/// Everything needed to create one daemon session.
+/// Everything needed to create one daemon session, or to reattach to one
+/// that survived a previous Forge process.
 #[derive(Clone)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub struct SessionSpec {
@@ -34,6 +51,9 @@ pub struct SessionSpec {
     pub command: String,
     pub args: Vec<String>,
     pub cwd: PathBuf,
+    /// Daemon session from the saved layout; a new one is created when the
+    /// daemon no longer has it.
+    pub attach: Option<u64>,
 }
 
 #[cfg(unix)]
@@ -125,22 +145,44 @@ mod unix {
                 if protocol_version == PROTOCOL_VERSION => {}
             message => bail!("respuesta initialize inesperada: {message:?}"),
         }
-        write_message(
-            &mut writer,
-            FrameKind::Request,
-            &ClientMessage::CreateSession {
-                request_id: 1,
-                command: spec.command,
-                args: spec.args,
-                cwd: spec.cwd,
-                cols: 80,
-                rows: 24,
-            },
-        )
-        .await?;
-        let session_id = match reader.read_message::<ServerMessage>().await?.1 {
-            ServerMessage::SessionCreated { session_id, .. } => session_id,
-            message => bail!("respuesta create_session inesperada: {message:?}"),
+        let existing = match spec.attach {
+            Some(wanted) => {
+                write_message(
+                    &mut writer,
+                    FrameKind::Request,
+                    &ClientMessage::ListSessions,
+                )
+                .await?;
+                match reader.read_message::<ServerMessage>().await?.1 {
+                    ServerMessage::Sessions { sessions } => sessions
+                        .iter()
+                        .find(|session| session.session_id == wanted && session.alive)
+                        .map(|session| session.session_id),
+                    message => bail!("respuesta list_sessions inesperada: {message:?}"),
+                }
+            }
+            None => None,
+        };
+        let session_id = if let Some(session_id) = existing {
+            session_id
+        } else {
+            write_message(
+                &mut writer,
+                FrameKind::Request,
+                &ClientMessage::CreateSession {
+                    request_id: 1,
+                    command: spec.command,
+                    args: spec.args,
+                    cwd: spec.cwd,
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .await?;
+            match reader.read_message::<ServerMessage>().await?.1 {
+                ServerMessage::SessionCreated { session_id, .. } => session_id,
+                message => bail!("respuesta create_session inesperada: {message:?}"),
+            }
         };
         write_message(
             &mut writer,
@@ -157,10 +199,16 @@ mod unix {
         events: Sender<UiEvent>,
         mut input: async_mpsc::UnboundedReceiver<IpcCommand>,
     ) -> Result<()> {
+        let wanted = spec.attach;
         let (mut reader, mut writer, session_id, _daemon) = handshake(spec).await?;
+        let _ = events.send(UiEvent::Attached { tab_id, session_id });
         let _ = events.send(UiEvent::Status {
             tab_id,
-            status: format!("Sesión {session_id} conectada"),
+            status: if wanted == Some(session_id) {
+                format!("Sesión {session_id} recuperada")
+            } else {
+                format!("Sesión {session_id} conectada")
+            },
         });
 
         let mut incoming = tokio::spawn(async move {
@@ -178,6 +226,15 @@ mod unix {
         let mut outgoing = tokio::spawn(async move {
             while let Some(command) = input.recv().await {
                 match command {
+                    IpcCommand::Shutdown => {
+                        write_message(
+                            &mut writer,
+                            FrameKind::Request,
+                            &ClientMessage::ShutdownSession { session_id },
+                        )
+                        .await?;
+                        return Ok::<(), anyhow::Error>(());
+                    }
                     IpcCommand::Key(_)
                     | IpcCommand::Mouse(_)
                     | IpcCommand::Paste(_)
@@ -239,6 +296,7 @@ mod unix {
     /// The wire form of a non-resize command.
     fn client_message(session_id: u64, command: IpcCommand) -> ClientMessage {
         match command {
+            IpcCommand::Shutdown => ClientMessage::ShutdownSession { session_id },
             IpcCommand::Key(event) => ClientMessage::Key { session_id, event },
             IpcCommand::Mouse(event) => ClientMessage::Mouse { session_id, event },
             IpcCommand::Paste(text) => ClientMessage::Paste { session_id, text },
@@ -268,13 +326,9 @@ mod unix {
         .context("send terminal resize")
     }
 
+    /// The daemon Forge started. It is deliberately **not** killed when the
+    /// GUI exits: surviving the UI is the daemon's reason to exist (§14.2).
     struct DaemonGuard(Child);
-
-    impl Drop for DaemonGuard {
-        fn drop(&mut self) {
-            let _ = self.0.start_kill();
-        }
-    }
 
     async fn connect_or_start_daemon(socket: &Path) -> Result<(UnixStream, Option<DaemonGuard>)> {
         if let Ok(stream) = UnixStream::connect(socket).await {
@@ -292,7 +346,8 @@ mod unix {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
-            .kill_on_drop(true)
+            .kill_on_drop(false)
+            .process_group(0)
             .spawn()
             .context("arrancar forge-termd automáticamente")?;
         let mut daemon = DaemonGuard(child);

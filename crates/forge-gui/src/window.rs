@@ -76,12 +76,13 @@ impl WindowFactory {
             .map(|path| path.with_file_name("session.json"))
     }
 
-    fn spec(&self, cwd: PathBuf) -> SessionSpec {
+    fn spec(&self, cwd: PathBuf, attach: Option<u64>) -> SessionSpec {
         SessionSpec {
             socket: self.socket.clone(),
             command: self.config.shell(),
             args: self.config.terminal.args.clone(),
             cwd,
+            attach,
         }
     }
 
@@ -113,11 +114,6 @@ impl WindowFactory {
                 view
             },
         )?;
-        window.update(cx, |view, _, cx| {
-            if view.factory.restore_session {
-                view.restore_session(cx);
-            }
-        })?;
         Ok(window)
     }
 }
@@ -133,6 +129,8 @@ pub struct TerminalTab {
     pub input: async_mpsc::UnboundedSender<IpcCommand>,
     /// Title, cwd and input modes reported by the daemon.
     pub info: SessionInfo,
+    /// Daemon session id once attached; persisted for reattach.
+    pub session_id: Option<u64>,
     drag_anchor: Option<CellPos>,
     /// Last `(cols, rows)` sent to the daemon; a pane resends only on change.
     viewport: Option<(u16, u16)>,
@@ -228,7 +226,14 @@ impl ForgeWindow {
             notifications: Vec::new(),
             marked_text: None,
         };
-        window.create_terminal_tab(None, cx);
+        // Tabs must exist before the first draw, which happens inside
+        // `open_window`, so the saved layout is applied here.
+        match window.load_saved_session() {
+            Some(session) => window.apply_saved_session(session, cx),
+            None => {
+                window.create_terminal_tab(None, cx);
+            }
+        }
         window
     }
 
@@ -380,6 +385,7 @@ impl ForgeWindow {
             width: f32::from(self.factory.window_size.width),
             height: f32::from(self.factory.window_size.height),
             theme: Some(self.theme_name.clone()),
+            sessions: self.tabs.iter().map(|tab| tab.session_id).collect(),
         }
     }
 
@@ -398,28 +404,33 @@ impl ForgeWindow {
         }
     }
 
-    fn restore_session(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self.factory.session_path() else {
-            return;
-        };
-        let session = match WindowSession::load(&path) {
-            Ok(Some(session)) => session,
-            Ok(None) => return,
+    fn load_saved_session(&mut self) -> Option<WindowSession> {
+        if !self.factory.restore_session {
+            return None;
+        }
+        let path = self.factory.session_path()?;
+        match WindowSession::load(&path) {
+            Ok(session) => session,
             Err(error) => {
                 self.notify_user(
                     NotificationLevel::Warning,
                     format!("Sesión guardada inválida, se ignora: {error}"),
                 );
-                return;
+                None
             }
-        };
+        }
+    }
+
+    /// Recreates the saved tabs, reattaching to the daemon sessions that
+    /// survived the previous Forge process.
+    fn apply_saved_session(&mut self, session: WindowSession, cx: &mut Context<Self>) {
         if session.cwd.is_dir() {
             self.factory.cwd = session.cwd.clone();
         }
-        for _ in 1..session.count {
-            self.create_terminal_tab(None, cx);
+        for index in 0..session.count {
+            self.open_tab(None, session.daemon_session(index), cx);
         }
-        self.active_tab = session.active;
+        self.active_tab = session.active.min(self.tabs.len().saturating_sub(1));
         self.split = session.split;
         if let Some(name) = session.theme
             && !name.eq_ignore_ascii_case(&self.theme_name)
@@ -459,6 +470,17 @@ impl ForgeWindow {
     /// Creates a tab (and its daemon session) and makes it active. Without an
     /// explicit directory the new shell starts where the active one is (OSC 7).
     pub fn create_terminal_tab(&mut self, cwd: Option<PathBuf>, cx: &mut Context<Self>) -> usize {
+        self.open_tab(cwd, None, cx)
+    }
+
+    /// Like [`Self::create_terminal_tab`], reattaching to a daemon session
+    /// from a previous run when it is still alive.
+    fn open_tab(
+        &mut self,
+        cwd: Option<PathBuf>,
+        attach: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> usize {
         let cwd = cwd.or_else(|| {
             self.tabs
                 .get(self.active_tab)
@@ -487,13 +509,19 @@ impl ForgeWindow {
             },
             input,
             info: SessionInfo::default(),
+            session_id: None,
             drag_anchor: None,
             viewport: None,
         });
         self.active_tab = self.tabs.len() - 1;
         if self.factory.start_ipc {
             let cwd = cwd.unwrap_or_else(|| self.factory.cwd.clone());
-            spawn_ipc_worker(self.factory.spec(cwd), id, self.event_tx.clone(), input_rx);
+            spawn_ipc_worker(
+                self.factory.spec(cwd, attach),
+                id,
+                self.event_tx.clone(),
+                input_rx,
+            );
         }
         cx.notify();
         self.active_tab
@@ -510,7 +538,10 @@ impl ForgeWindow {
         if self.tabs.len() <= 1 || index >= self.tabs.len() {
             return;
         }
-        self.tabs.remove(index);
+        // Closing a tab ends its shell; sessions only survive when the
+        // window itself goes away.
+        let closed = self.tabs.remove(index);
+        let _ = closed.input.send(IpcCommand::Shutdown);
         self.active_tab = if self.active_tab > index {
             self.active_tab - 1
         } else {
@@ -594,6 +625,23 @@ impl ForgeWindow {
                 let Some(tab) = self.tab_mut(tab_id) else {
                     return;
                 };
+                if let ServerMessage::ScreenPatch {
+                    revision,
+                    full,
+                    dirty_rows,
+                    viewport,
+                    ..
+                } = &message
+                {
+                    tracing::debug!(
+                        tab_id,
+                        revision,
+                        full,
+                        rows = dirty_rows.len(),
+                        ?viewport,
+                        "screen patch"
+                    );
+                }
                 let before = tab.terminal.grid.dimensions();
                 match tab.terminal.grid.apply_server_message(message) {
                     Ok(true) => {
@@ -611,6 +659,12 @@ impl ForgeWindow {
                 if let Some(tab) = self.tab_mut(tab_id) {
                     tab.status = status;
                 }
+            }
+            UiEvent::Attached { tab_id, session_id } => {
+                if let Some(tab) = self.tab_mut(tab_id) {
+                    tab.session_id = Some(session_id);
+                }
+                self.save_session();
             }
         }
     }
