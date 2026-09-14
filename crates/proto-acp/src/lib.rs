@@ -7,6 +7,15 @@ use std::{
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
+mod client;
+mod registry;
+
+pub use client::{
+    AcpClient, AcpEvent, AcpSession, AgentProcess, AgentProcessEvent, ClientError,
+    InitializeResult, PromptBlock, SessionMode,
+};
+pub use registry::{AgentDefinition, AgentRegistry, AgentRegistryError};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JsonRpcMessage {
     pub jsonrpc: String,
@@ -43,6 +52,18 @@ impl JsonRpcMessage {
             method: None,
             params: None,
             result: Some(result),
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn notification(method: impl Into<String>, params: Value) -> Self {
+        Self {
+            jsonrpc: "2.0".into(),
+            id: None,
+            method: Some(method.into()),
+            params: Some(params),
+            result: None,
             error: None,
         }
     }
