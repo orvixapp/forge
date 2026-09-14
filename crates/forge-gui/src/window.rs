@@ -2057,6 +2057,11 @@ impl ForgeWindow {
             }
             UiEvent::AgentEvent { tab_id, event } => self.handle_agent_event(tab_id, event),
             UiEvent::AgentStatus { tab_id, status } => self.set_agent_status(tab_id, status),
+            UiEvent::AgentTurnFinished { tab_id, error } => {
+                if let Some(agent) = self.tab_mut(tab_id).and_then(Tab::agent_mut) {
+                    agent.finish_turn(error);
+                }
+            }
             UiEvent::AgentRequest {
                 tab_id,
                 message,
@@ -2808,7 +2813,7 @@ impl ForgeWindow {
                 agent.apply_update(&serde_json::json!({"type": method, "params": params}));
             }
             proto_acp::AcpEvent::Disconnected => {
-                agent.status = "ACP desconectado".into();
+                agent.finish_turn(Some(tr("ACP disconnected").into()));
             }
         }
     }

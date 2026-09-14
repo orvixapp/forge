@@ -369,9 +369,17 @@ fn spanish(english: &str) -> Option<&'static str> {
         "Permission denied by the user" => "Permiso denegado por el usuario",
         "Waiting for the agent…" => "Esperando al agente…",
         "Receiving the answer…" => "Recibiendo respuesta…",
+        "Ready" => "Listo",
+        "ACP disconnected" => "ACP desconectado",
         "Thinking…" => "Pensando…",
         "● Thinking…" => "● Pensando…",
         "Reasoning" => "Razonamiento",
+        "The agent is working…" => "El agente está trabajando…",
+        "Ask about the code or request a change…" => {
+            "Pregunta sobre el código o solicita un cambio…"
+        }
+        "Esc stop" => "Esc detener",
+        "Enter send · Shift+Enter newline" => "Enter enviar · Shift+Enter nueva línea",
         "No ACP adapter found in PATH" => "No se encontró ningún adaptador ACP instalado en PATH",
         "Could not create the ACP runtime" => "No se pudo crear el runtime ACP",
         "ACP could not start: {}" => "ACP no pudo arrancar: {}",

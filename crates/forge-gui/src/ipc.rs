@@ -53,6 +53,12 @@ pub enum UiEvent {
         tab_id: u64,
         status: String,
     },
+    /// The outstanding `session/prompt` request completed. Session updates
+    /// stream independently while that request is in flight.
+    AgentTurnFinished {
+        tab_id: u64,
+        error: Option<String>,
+    },
     /// An agent-to-client ACP request that must inspect or mutate live GUI state.
     AgentRequest {
         tab_id: u64,

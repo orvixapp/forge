@@ -143,6 +143,7 @@ pub struct AgentTab {
     pub available_commands: Vec<(String, String)>,
     pub proposed_edits: Vec<ProposedEdit>,
     pub pending_permissions: Vec<PendingPermissionRequest>,
+    turn_active: bool,
     pub scroll_item: usize,
     pub visible_items: usize,
     following_tail: bool,
@@ -167,6 +168,7 @@ impl AgentTab {
             available_commands: Vec::new(),
             proposed_edits: Vec::new(),
             pending_permissions: Vec::new(),
+            turn_active: false,
             scroll_item: 0,
             visible_items: 40,
             following_tail: true,
@@ -184,6 +186,17 @@ impl AgentTab {
         if let Some(commands) = &self.commands {
             let _ = commands.send(AgentCommand::Cancel);
         }
+    }
+
+    #[must_use]
+    pub fn turn_active(&self) -> bool {
+        self.turn_active
+    }
+
+    pub fn finish_turn(&mut self, error: Option<String>) {
+        self.turn_active = false;
+        self.finish_thoughts();
+        self.status = error.unwrap_or_else(|| tr("Ready").into());
     }
 
     pub fn resolve_permission(
@@ -233,6 +246,9 @@ impl AgentTab {
     }
 
     pub fn submit_prompt(&mut self) -> Option<String> {
+        if self.turn_active {
+            return None;
+        }
         let prompt = self.prompt.trim().to_owned();
         if prompt.is_empty() {
             return None;
@@ -240,6 +256,7 @@ impl AgentTab {
         self.prompt.clear();
         self.resolve_file_mentions(&prompt);
         self.last_prompt = Some(prompt.clone());
+        self.turn_active = true;
         self.timeline.push(TimelineItem::Message {
             role: MessageRole::User,
             text: prompt.clone(),
@@ -562,7 +579,25 @@ pub fn spawn_agent_worker(
                                 loop {
                                     tokio::select! {
                                         command = commands.recv() => match command {
-                                            Some(AgentCommand::Prompt(blocks)) => { if let Err(error) = client.prompt(&session, blocks).await { let _ = events.send(UiEvent::AgentStatus { tab_id, status: error.to_string() }); } }
+                                            Some(AgentCommand::Prompt(blocks)) => {
+                                                // `session/prompt` stays pending for the whole turn.
+                                                // Run it separately so this loop can forward every
+                                                // streaming `session/update` as soon as it arrives.
+                                                let prompt_client = client.clone();
+                                                let prompt_session = session.clone();
+                                                let prompt_events = events.clone();
+                                                tokio::spawn(async move {
+                                                    let error = prompt_client
+                                                        .prompt(&prompt_session, blocks)
+                                                        .await
+                                                        .err()
+                                                        .map(|error| error.to_string());
+                                                    let _ = prompt_events.send(UiEvent::AgentTurnFinished {
+                                                        tab_id,
+                                                        error,
+                                                    });
+                                                });
+                                            }
                                             Some(AgentCommand::Cancel) => { let _ = client.cancel(&session).await; }
                                             None => return,
                                         },
@@ -671,6 +706,23 @@ mod tests {
             TimelineItem::Thought { active: false, .. }
         ));
         assert_eq!(tab.timeline.len(), 2);
+    }
+
+    #[test]
+    fn one_turn_at_a_time_tracks_live_agent_activity() {
+        let mut tab = AgentTab::new("OpenCode", PathBuf::from("."));
+        tab.prompt = "primero".into();
+        assert_eq!(tab.submit_prompt().as_deref(), Some("primero"));
+        assert!(tab.turn_active());
+
+        tab.prompt = "segundo".into();
+        assert_eq!(tab.submit_prompt(), None);
+        assert_eq!(tab.prompt, "segundo");
+
+        tab.finish_turn(None);
+        assert!(!tab.turn_active());
+        assert_eq!(tab.status, tr("Ready"));
+        assert_eq!(tab.submit_prompt().as_deref(), Some("segundo"));
     }
 
     #[test]

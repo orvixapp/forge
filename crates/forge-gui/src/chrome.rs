@@ -10,9 +10,10 @@ use crate::{
 use forge_gui::i18n::{tr, trf};
 use forge_gui::shell::{PaneTree, Rect, ShellCommand, search_commands};
 use gpui::{
-    AnyElement, Context, CursorStyle, ImageSource, MouseButton, ResizeEdge, Resource, SharedString,
-    Window, div, img, prelude::*, px, rgb,
+    Animation, AnimationExt, AnyElement, Context, CursorStyle, ImageSource, MouseButton,
+    ResizeEdge, Resource, SharedString, Window, div, img, prelude::*, px, rgb,
 };
+use std::time::Duration;
 
 pub const TOPBAR_HEIGHT: f32 = 36.0;
 pub const STATUS_HEIGHT: f32 = 20.0;
@@ -615,47 +616,78 @@ fn agent_panel(
     cx: &mut Context<ForgeWindow>,
 ) -> impl IntoElement {
     let visible = agent.visible_range();
+    let visible_start = visible.start;
+    let turn_active = agent.turn_active();
+    let session = agent
+        .session_id
+        .as_deref()
+        .map(|id| id.chars().take(12).collect::<String>());
     div()
         .size_full()
         .flex()
         .flex_col()
-        .p(px(14.0))
-        .gap(px(8.0))
         .overflow_hidden()
         .child(
             div()
-                .text_size(px(15.0))
-                .text_color(color(theme.accent))
-                .child(trf(
-                    "ACP session · {} · {}",
-                    &[
-                        &agent.agent_name,
-                        &agent.session_id.as_deref().unwrap_or(tr("no id")),
-                    ],
-                )),
+                .h(px(52.0))
+                .flex_none()
+                .px(px(18.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .border_b_1()
+                .border_color(color(theme.chrome_border))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(9.0))
+                        .child(agent_activity_dot(turn_active, tab_id, theme))
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .text_color(color(theme.foreground))
+                                .child(agent.agent_name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(color(theme.muted))
+                                .child("ACP"),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .text_size(px(10.0))
+                        .text_color(color(theme.muted))
+                        .when(!agent.route.is_empty(), |row| {
+                            row.child(agent.route.clone())
+                        })
+                        .when_some(session, |row, id| row.child(format!("#{id}"))),
+                ),
         )
-        .when(!agent.route.is_empty(), |panel| {
-            // Route: task class → provider (and worktree). `/trivial`,
-            // `/normal` or `/deep` at the start of a prompt re-route it.
+        .when(!agent.context.is_empty(), |panel| {
             panel.child(
                 div()
-                    .text_size(px(11.0))
-                    .text_color(color(theme.muted))
-                    .child(trf("Route: {}", &[&agent.route])),
+                    .px(px(18.0))
+                    .pt(px(9.0))
+                    .flex()
+                    .gap(px(6.0))
+                    .overflow_hidden()
+                    .children(agent.context.iter().map(|context| {
+                        div()
+                            .px(px(7.0))
+                            .py(px(2.0))
+                            .rounded(px(3.0))
+                            .bg(with_alpha(color(theme.chrome), 0.65))
+                            .text_color(color(theme.muted))
+                            .text_size(px(10.0))
+                            .child(format!("@{}", context.label))
+                    })),
             )
-        })
-        .when(!agent.context.is_empty(), |panel| {
-            panel.child(div().flex().gap(px(6.0)).overflow_hidden().children(
-                agent.context.iter().map(|context| {
-                    div()
-                        .px(px(7.0))
-                        .py(px(3.0))
-                        .rounded(px(4.0))
-                        .bg(color(theme.chrome))
-                        .text_size(px(11.0))
-                        .child(context.label.clone())
-                }),
-            ))
         })
         .children(
             agent
@@ -676,48 +708,105 @@ fn agent_panel(
             div()
                 .flex_1()
                 .min_h(px(0.0))
+                .px(px(18.0))
+                .py(px(16.0))
                 .overflow_hidden()
                 .flex()
                 .flex_col()
-                .gap(px(6.0))
-                .children(
-                    agent
-                        .visible_timeline(visible)
-                        .iter()
-                        .map(|item| agent_timeline_item(item, theme)),
-                ),
-        )
-        .child(
-            div()
-                .min_h(px(42.0))
-                .px(px(10.0))
-                .py(px(8.0))
-                .rounded(px(6.0))
-                .border_1()
-                .border_color(color(theme.chrome_active_border))
-                .child(if agent.prompt.is_empty() {
-                    tr("Type a prompt…  (Enter sends)").to_owned()
-                } else {
-                    agent.prompt.clone()
-                }),
-        )
-        .child(
-            div()
-                .text_size(px(10.0))
-                .text_color(color(theme.muted))
-                .child(trf(
-                    "events {}–{} of {} · wheel/PageUp/PageDown to navigate",
-                    &[
-                        &agent
-                            .visible_range()
-                            .start
-                            .saturating_add(1)
-                            .min(agent.timeline.len()),
-                        &agent.visible_range().end,
-                        &agent.timeline.len(),
-                    ],
+                .gap(px(16.0))
+                .children(agent.visible_timeline(visible).iter().enumerate().map(
+                    |(index, item)| {
+                        let last = visible_start + index + 1 == agent.timeline.len();
+                        agent_timeline_item(item, turn_active && last, tab_id, theme)
+                    },
                 )),
         )
+        .child(
+            div()
+                .flex_none()
+                .mx(px(18.0))
+                .mb(px(12.0))
+                .border_1()
+                .border_color(color(if turn_active {
+                    theme.chrome_border
+                } else {
+                    theme.chrome_active_border
+                }))
+                .rounded(px(5.0))
+                .bg(with_alpha(color(theme.chrome), 0.35))
+                .child(
+                    div()
+                        .min_h(px(44.0))
+                        .px(px(12.0))
+                        .py(px(9.0))
+                        .flex()
+                        .gap(px(9.0))
+                        .child(div().text_color(color(theme.accent)).child(if turn_active {
+                            "·"
+                        } else {
+                            ">"
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_color(color(if agent.prompt.is_empty() {
+                                    theme.muted
+                                } else {
+                                    theme.foreground
+                                }))
+                                .child(if agent.prompt.is_empty() {
+                                    if turn_active {
+                                        tr("The agent is working…").to_owned()
+                                    } else {
+                                        tr("Ask about the code or request a change…").to_owned()
+                                    }
+                                } else {
+                                    agent.prompt.clone()
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .px(px(12.0))
+                        .pb(px(7.0))
+                        .flex()
+                        .justify_between()
+                        .text_size(px(9.0))
+                        .text_color(color(theme.muted))
+                        .child(agent.status.clone())
+                        .child(if turn_active {
+                            tr("Esc stop").to_owned()
+                        } else {
+                            tr("Enter send · Shift+Enter newline").to_owned()
+                        }),
+                ),
+        )
+}
+
+fn agent_activity_dot(
+    active: bool,
+    tab_id: u64,
+    theme: forge_gui::theme::ThemeColors,
+) -> AnyElement {
+    let dot = div().size(px(7.0)).rounded(px(99.0)).bg(color(if active {
+        theme.accent
+    } else {
+        theme.muted
+    }));
+    if active {
+        let accent = color(theme.accent);
+        dot.with_animation(
+            SharedString::from(format!("agent-pulse-{tab_id}")),
+            Animation::new(Duration::from_millis(1100)).repeat(),
+            move |dot, delta| {
+                let opacity = 0.35 + 0.65 * (1.0 - (delta * 2.0 - 1.0).abs());
+                dot.bg(with_alpha(accent, opacity))
+            },
+        )
+        .into_any_element()
+    } else {
+        dot.into_any_element()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1090,7 +1179,12 @@ fn agent_proposed_edit_view(
         .into_any_element()
 }
 
-fn agent_timeline_item(item: &TimelineItem, theme: forge_gui::theme::ThemeColors) -> AnyElement {
+fn agent_timeline_item(
+    item: &TimelineItem,
+    streaming: bool,
+    tab_id: u64,
+    theme: forge_gui::theme::ThemeColors,
+) -> AnyElement {
     let (label, body, tint) = match item {
         TimelineItem::Message { role, text } => {
             let label = match role {
@@ -1133,19 +1227,68 @@ fn agent_timeline_item(item: &TimelineItem, theme: forge_gui::theme::ThemeColors
             theme.accent,
         ),
     };
+    let user = matches!(
+        item,
+        TimelineItem::Message {
+            role: MessageRole::User,
+            ..
+        }
+    );
+    let thought = matches!(item, TimelineItem::Thought { .. });
+    let rail = if user {
+        theme.accent
+    } else {
+        theme.chrome_active_border
+    };
     div()
-        .px(px(10.0))
-        .py(px(7.0))
-        .rounded(px(5.0))
-        .bg(color(theme.chrome))
+        .w_full()
+        .flex()
+        .gap(px(10.0))
         .child(
             div()
-                .text_size(px(11.0))
-                .text_color(color(tint))
-                .child(label),
+                .w(px(2.0))
+                .flex_none()
+                .rounded(px(2.0))
+                .bg(with_alpha(color(rail), if thought { 0.35 } else { 0.85 })),
         )
-        .child(div().text_size(px(13.0)).child(body))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(
+                    div()
+                        .mb(px(4.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(7.0))
+                        .text_size(px(10.0))
+                        .text_color(color(tint))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(color(if thought {
+                            theme.muted
+                        } else {
+                            theme.foreground
+                        }))
+                        .child(if streaming && !thought {
+                            format!("{body} ▋")
+                        } else {
+                            body
+                        }),
+                ),
+        )
+        .when(streaming && thought, |row| {
+            row.child(agent_activity_dot(true, tab_id.saturating_add(1), theme))
+        })
         .into_any_element()
+}
+
+fn with_alpha(mut color: gpui::Rgba, opacity: f32) -> gpui::Rgba {
+    color.a *= opacity;
+    color
 }
 
 /// Right-click menu at the pointer: command titles with their chords.
