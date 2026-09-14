@@ -12,10 +12,10 @@ use forge_gui::{
     theme::ThemeColors,
 };
 use gpui::{
-    App, BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, Font, FontId, GlobalElementId, GlyphId, Hsla, InspectorElementId, IntoElement,
-    LayoutId, Pixels, Point, Rgba, Size, Style, TextRun, Window, WindowTextSystem, black, fill,
-    outline, point, px, rgb, size,
+    App, BorderStyle, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Font, FontId, GlobalElementId, GlyphId, Hsla,
+    InspectorElementId, IntoElement, LayoutId, Pixels, Point, Rgba, Size, Style, TextRun, Window,
+    WindowTextSystem, black, fill, outline, point, px, rgb, size,
 };
 use proto_ipc::{CursorStyle, Rgb};
 use std::{collections::HashMap, ops::Range};
@@ -514,21 +514,26 @@ fn paint_grid(surface: &mut TerminalSurface, bounds: Bounds<Pixels>, window: &mu
         rows: row_range,
     };
 
-    window.paint_layer(bounds, |window| {
-        paint_backgrounds(grid, &frame, &mut scratch.colors, window);
-        if let Some(selection) = selection {
-            paint_selection(selection, &frame, palette.selection, window);
-        }
-        paint_cursor(grid, &frame, metrics, palette.cursor, window);
-        collect_glyph_cells(grid, &frame, glyphs, scratch, &palette, &text_system);
-        paint_glyphs(
-            &frame,
-            glyphs,
-            scratch,
-            px(metrics.font_size),
-            bounds,
-            window,
-        );
+    // This is a custom-painted element, so the parent's `overflow_hidden`
+    // does not automatically constrain glyph sprites. Some fonts overhang
+    // their cell; without an explicit mask row zero bleeds into the tab bar.
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        window.paint_layer(bounds, |window| {
+            paint_backgrounds(grid, &frame, &mut scratch.colors, window);
+            if let Some(selection) = selection {
+                paint_selection(selection, &frame, palette.selection, window);
+            }
+            paint_cursor(grid, &frame, metrics, palette.cursor, window);
+            collect_glyph_cells(grid, &frame, glyphs, scratch, &palette, &text_system);
+            paint_glyphs(
+                &frame,
+                glyphs,
+                scratch,
+                px(metrics.font_size),
+                bounds,
+                window,
+            );
+        });
     });
 }
 
