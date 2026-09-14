@@ -2,7 +2,7 @@
 //! keyboard/mouse plumbing that turns shell commands into state changes.
 
 use crate::{
-    agent::{AgentTab, PromptContext, spawn_agent_worker},
+    agent::{AgentTab, PromptContext, ProposedEdit, spawn_agent_worker},
     chrome,
     editor::EditorTab,
     grid_element::{CellMetrics, Palette, SearchHighlights, TerminalSurface},
@@ -269,6 +269,16 @@ pub struct TerminalTab {
     drag_anchor: Option<CellPos>,
     /// Last `(cols, rows)` sent to the daemon; a pane resends only on change.
     viewport: Option<(u16, u16)>,
+    agent_owner: Option<u64>,
+    agent_output: String,
+    agent_output_limit: usize,
+    agent_output_truncated: bool,
+    agent_exited: bool,
+    agent_exit_code: Option<u32>,
+    agent_waiters: Vec<(
+        serde_json::Value,
+        oneshot::Sender<proto_acp::JsonRpcMessage>,
+    )>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -933,6 +943,13 @@ impl ForgeWindow {
             clipboard_allowed: false,
             drag_anchor: None,
             viewport: None,
+            agent_owner: None,
+            agent_output: String::new(),
+            agent_output_limit: 1_048_576,
+            agent_output_truncated: false,
+            agent_exited: false,
+            agent_exit_code: None,
+            agent_waiters: Vec::new(),
         };
         self.push_tab(TabContent::Terminal(Box::new(terminal)), cx);
         if self.factory.start_ipc {
@@ -1328,12 +1345,34 @@ impl ForgeWindow {
 
     // ----- events from the daemon ---------------------------------------
 
+    #[allow(clippy::too_many_lines)]
     fn handle_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
         match event {
             UiEvent::Message {
                 tab_id,
                 message: ServerMessage::Exited { exit_code, .. },
             } => {
+                if self
+                    .terminal_mut(tab_id)
+                    .is_some_and(|terminal| terminal.agent_owner.is_some())
+                {
+                    if let Some(terminal) = self.terminal_mut(tab_id) {
+                        terminal.agent_exited = true;
+                        terminal.agent_exit_code = exit_code;
+                        terminal.status = exit_code.map_or_else(
+                            || "Proceso del agente terminado".into(),
+                            |code| format!("Proceso del agente terminó con código {code}"),
+                        );
+                        for (id, waiter) in terminal.agent_waiters.drain(..) {
+                            let _ = waiter.send(proto_acp::JsonRpcMessage::response(
+                                id,
+                                serde_json::json!({"exitCode": exit_code}),
+                            ));
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
                 let index = self.tabs.iter().position(|tab| tab.id == tab_id);
                 match index {
                     // A shell that exits closes its tab; the last one closes
@@ -1356,6 +1395,18 @@ impl ForgeWindow {
                 if let Some(tab) = self.terminal_mut(tab_id) {
                     tab.status = format!("Error del daemon: {message}");
                 }
+            }
+            UiEvent::Message {
+                tab_id,
+                message: ServerMessage::Output { session_id, data },
+            } => {
+                if let Some(tab) = self.terminal_mut(tab_id)
+                    && tab.agent_owner.is_some()
+                {
+                    tab.agent_output_truncated |=
+                        append_bounded_output(&mut tab.agent_output, &data, tab.agent_output_limit);
+                }
+                self.apply_screen_message(tab_id, ServerMessage::Output { session_id, data });
             }
             UiEvent::Message {
                 tab_id,
@@ -1427,7 +1478,296 @@ impl ForgeWindow {
             }
             UiEvent::AgentEvent { tab_id, event } => self.handle_agent_event(tab_id, event),
             UiEvent::AgentStatus { tab_id, status } => self.set_agent_status(tab_id, status),
+            UiEvent::AgentRequest {
+                tab_id,
+                message,
+                response,
+            } => self.handle_agent_request(tab_id, &message, response, cx),
         }
+    }
+
+    fn handle_agent_request(
+        &mut self,
+        agent_id: u64,
+        message: &proto_acp::JsonRpcMessage,
+        response: oneshot::Sender<proto_acp::JsonRpcMessage>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = message.id.clone() else { return };
+        let params = message.params.as_ref().unwrap_or(&serde_json::Value::Null);
+        let result = match message.method.as_deref() {
+            Some("fs/read_text_file") => self.acp_read_file(params),
+            Some("fs/write_text_file") => self.acp_propose_file(agent_id, &id, params),
+            Some("terminal/create") => self.acp_terminal_create(agent_id, id.clone(), params, cx),
+            Some("terminal/output") => self.acp_terminal_output(agent_id, id.clone(), params),
+            Some("terminal/kill") => self.acp_terminal_signal(agent_id, id.clone(), params),
+            Some("terminal/release") => self.acp_terminal_release(agent_id, id.clone(), params, cx),
+            Some("terminal/wait_for_exit") => {
+                let Some(terminal) = self.acp_terminal_mut(agent_id, params) else {
+                    let _ = response.send(proto_acp::JsonRpcMessage::error(
+                        Some(id),
+                        -32602,
+                        "terminalId inválido",
+                    ));
+                    return;
+                };
+                if terminal.agent_exited {
+                    let exit_code = terminal.agent_exit_code;
+                    Ok(serde_json::json!({"exitCode": exit_code}))
+                } else {
+                    terminal.agent_waiters.push((id, response));
+                    return;
+                }
+            }
+            Some(method) => Err(format!("método ACP no soportado: {method}")),
+            None => Err("solicitud ACP sin método".into()),
+        };
+        let reply = match result {
+            Ok(value) => proto_acp::JsonRpcMessage::response(id, value),
+            Err(error) => proto_acp::JsonRpcMessage::error(Some(id), -32602, error),
+        };
+        let _ = response.send(reply);
+        cx.notify();
+    }
+
+    fn acp_workspace_path(&self, params: &serde_json::Value) -> Result<PathBuf, String> {
+        let path = params
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| "se requiere path".to_owned())?;
+        if !path.is_absolute() {
+            return Err("path debe ser absoluto".into());
+        }
+        let workspace = self
+            .factory
+            .cwd
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let checked = if path.exists() {
+            path.canonicalize().map_err(|error| error.to_string())?
+        } else {
+            let parent = path
+                .parent()
+                .ok_or_else(|| "path sin directorio padre".to_owned())?
+                .canonicalize()
+                .map_err(|error| error.to_string())?;
+            parent.join(
+                path.file_name()
+                    .ok_or_else(|| "path sin nombre".to_owned())?,
+            )
+        };
+        checked
+            .starts_with(&workspace)
+            .then_some(checked)
+            .ok_or_else(|| "path está fuera del workspace".into())
+    }
+
+    fn acp_read_file(&self, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let path = self.acp_workspace_path(params)?;
+        let content = self
+            .tabs
+            .iter()
+            .filter_map(Tab::editor)
+            .find_map(|editor| {
+                editor
+                    .path()
+                    .and_then(|open| open.canonicalize().ok())
+                    .filter(|open| open == &path)
+                    .map(|_| editor.buffer.text())
+            })
+            .or_else(|| std::fs::read_to_string(&path).ok())
+            .ok_or_else(|| format!("no se pudo leer {}", path.display()))?;
+        let line = params
+            .get("line")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1);
+        let limit = params
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(u64::MAX);
+        let start = usize::try_from(line.saturating_sub(1)).unwrap_or(usize::MAX);
+        let count = usize::try_from(limit).unwrap_or(usize::MAX);
+        let selected = content
+            .lines()
+            .skip(start)
+            .take(count)
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(serde_json::json!({"content": selected}))
+    }
+
+    fn acp_propose_file(
+        &mut self,
+        agent_id: u64,
+        id: &serde_json::Value,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let path = self.acp_workspace_path(params)?;
+        let proposed = params
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "se requiere content".to_owned())?
+            .to_owned();
+        let original = self
+            .tabs
+            .iter()
+            .filter_map(Tab::editor)
+            .find_map(|editor| {
+                editor
+                    .path()
+                    .and_then(|open| open.canonicalize().ok())
+                    .filter(|open| open == &path)
+                    .map(|_| editor.buffer.text())
+            })
+            .or_else(|| std::fs::read_to_string(&path).ok())
+            .unwrap_or_default();
+        let agent = self
+            .tab_mut(agent_id)
+            .and_then(Tab::agent_mut)
+            .ok_or_else(|| "la sesión agente ya no existe".to_owned())?;
+        agent.proposed_edits.retain(|edit| edit.path != path);
+        agent.proposed_edits.push(ProposedEdit {
+            path: path.clone(),
+            original,
+            proposed,
+        });
+        agent.timeline.push(crate::agent::TimelineItem::ToolCall {
+            id: format!("fs-write-{id}"),
+            title: format!("Edición propuesta · {}", path.display()),
+            state: crate::agent::ToolState::Succeeded,
+            detail: "Pendiente de revisión; el buffer y el disco no se modificaron".into(),
+        });
+        Ok(serde_json::json!({}))
+    }
+
+    fn acp_terminal_create(
+        &mut self,
+        agent_id: u64,
+        _id: serde_json::Value,
+        params: &serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> Result<serde_json::Value, String> {
+        let command = params
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "se requiere command".to_owned())?;
+        let args = params
+            .get("args")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        let cwd = params
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .map(|cwd| self.acp_workspace_path(&serde_json::json!({"path": cwd})))
+            .transpose()?;
+        let env = params
+            .get("env")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                Some((
+                    entry.get("name")?.as_str()?.to_owned(),
+                    entry.get("value")?.as_str()?.to_owned(),
+                ))
+            })
+            .collect();
+        let profile = TerminalProfile {
+            name: format!("Agente · {command}"),
+            shell: Some(command.to_owned()),
+            args,
+            cwd,
+            env,
+        };
+        let index = self.open_tab_with(None, None, None, Some(&profile), cx);
+        let terminal_id = self.tabs[index].id;
+        let terminal = self.tabs[index]
+            .terminal_mut()
+            .expect("new ACP terminal tab");
+        terminal.agent_owner = Some(agent_id);
+        terminal.agent_output_limit = params
+            .get("outputByteLimit")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|limit| usize::try_from(limit).ok())
+            .unwrap_or(1_048_576);
+        Ok(serde_json::json!({"terminalId": terminal_id.to_string()}))
+    }
+
+    fn acp_terminal_mut(
+        &mut self,
+        agent_id: u64,
+        params: &serde_json::Value,
+    ) -> Option<&mut TerminalTab> {
+        let id = params.get("terminalId")?.as_str()?.parse::<u64>().ok()?;
+        self.terminal_mut(id)
+            .filter(|terminal| terminal.agent_owner == Some(agent_id))
+    }
+
+    fn acp_terminal_output(
+        &mut self,
+        agent_id: u64,
+        _id: serde_json::Value,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let terminal = self
+            .acp_terminal_mut(agent_id, params)
+            .ok_or_else(|| "terminalId inválido".to_owned())?;
+        let mut result = serde_json::json!({
+            "output": terminal.agent_output,
+            "truncated": terminal.agent_output_truncated,
+        });
+        if terminal.agent_exited {
+            let exit_code = terminal.agent_exit_code;
+            result["exitStatus"] = serde_json::json!({"exitCode": exit_code});
+        }
+        Ok(result)
+    }
+
+    fn acp_terminal_signal(
+        &mut self,
+        agent_id: u64,
+        _id: serde_json::Value,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let terminal = self
+            .acp_terminal_mut(agent_id, params)
+            .ok_or_else(|| "terminalId inválido".to_owned())?;
+        terminal
+            .input
+            .send(IpcCommand::Signal(ProcessSignal::Kill))
+            .map_err(|_| "terminal desconectada".to_owned())?;
+        Ok(serde_json::json!({}))
+    }
+
+    fn acp_terminal_release(
+        &mut self,
+        agent_id: u64,
+        _id: serde_json::Value,
+        params: &serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> Result<serde_json::Value, String> {
+        let terminal_id = params
+            .get("terminalId")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| id.parse::<u64>().ok())
+            .ok_or_else(|| "terminalId inválido".to_owned())?;
+        let index = self
+            .tabs
+            .iter()
+            .position(|tab| {
+                tab.id == terminal_id
+                    && tab
+                        .terminal()
+                        .is_some_and(|terminal| terminal.agent_owner == Some(agent_id))
+            })
+            .ok_or_else(|| "terminalId inválido".to_owned())?;
+        self.close_tab(index, cx);
+        Ok(serde_json::json!({}))
     }
 
     fn connect_agent(&mut self, tab_id: u64, session_id: String) {
@@ -2753,6 +3093,19 @@ fn single_line(text: &str, max_chars: usize) -> String {
     line
 }
 
+fn append_bounded_output(output: &mut String, bytes: &[u8], limit: usize) -> bool {
+    output.push_str(&String::from_utf8_lossy(bytes));
+    if output.len() <= limit {
+        return false;
+    }
+    let mut start = output.len() - limit;
+    while !output.is_char_boundary(start) {
+        start += 1;
+    }
+    output.drain(..start);
+    true
+}
+
 fn key_mods(modifiers: Modifiers) -> KeyMods {
     KeyMods {
         shift: modifiers.shift,
@@ -2805,5 +3158,13 @@ mod tests {
         assert_eq!(single_line("a\n  b\tc", 10), "a b c");
         assert_eq!(single_line("abcdefghij", 5), "abcd…");
         assert_eq!(single_line("", 5), "");
+    }
+
+    #[test]
+    fn acp_terminal_output_keeps_the_newest_complete_characters() {
+        let mut output = "old".to_owned();
+        assert!(append_bounded_output(&mut output, "·new".as_bytes(), 4));
+        assert_eq!(output, "new");
+        assert!(output.len() <= 4);
     }
 }

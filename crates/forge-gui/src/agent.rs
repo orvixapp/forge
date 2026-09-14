@@ -4,8 +4,10 @@
 
 use serde_json::Value;
 use std::{
+    future::Future,
     ops::Range,
     path::PathBuf,
+    pin::Pin,
     sync::{Arc, mpsc::Sender},
     time::Duration,
 };
@@ -13,9 +15,39 @@ use tokio::sync::mpsc as async_mpsc;
 
 use crate::ipc::UiEvent;
 use proto_acp::{
-    AcpEvent, AgentDefinition, AgentProcess, AgentRegistry, ClientSurface, PermissionChoice,
-    PromptBlock,
+    AcpEvent, AgentDefinition, AgentProcess, AgentRegistry, ClientHandler, ClientSurface,
+    JsonRpcMessage, PermissionChoice, PromptBlock,
 };
+
+struct ForgeClientBridge {
+    tab_id: u64,
+    events: Sender<UiEvent>,
+    fallback: ClientSurface,
+}
+
+impl ClientHandler for ForgeClientBridge {
+    fn handle<'a>(
+        &'a self,
+        message: &'a JsonRpcMessage,
+    ) -> Pin<Box<dyn Future<Output = Option<JsonRpcMessage>> + Send + 'a>> {
+        Box::pin(async move {
+            match message.method.as_deref() {
+                Some(method) if method.starts_with("fs/") || method.starts_with("terminal/") => {
+                    let (response, receiver) = tokio::sync::oneshot::channel();
+                    self.events
+                        .send(UiEvent::AgentRequest {
+                            tab_id: self.tab_id,
+                            message: Box::new(message.clone()),
+                            response,
+                        })
+                        .ok()?;
+                    receiver.await.ok()
+                }
+                _ => self.fallback.handle(message).await,
+            }
+        })
+    }
+}
 
 pub enum AgentCommand {
     Prompt(Vec<PromptBlock>),
@@ -62,6 +94,13 @@ pub struct PromptContext {
     pub content: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposedEdit {
+    pub path: PathBuf,
+    pub original: String,
+    pub proposed: String,
+}
+
 pub struct AgentTab {
     pub agent_name: String,
     pub session_id: Option<String>,
@@ -69,6 +108,7 @@ pub struct AgentTab {
     pub prompt: String,
     pub timeline: Vec<TimelineItem>,
     pub context: Vec<PromptContext>,
+    pub proposed_edits: Vec<ProposedEdit>,
     pub scroll_item: usize,
     pub visible_items: usize,
     following_tail: bool,
@@ -87,6 +127,7 @@ impl AgentTab {
             prompt: String::new(),
             timeline: Vec::new(),
             context: Vec::new(),
+            proposed_edits: Vec::new(),
             scroll_item: 0,
             visible_items: 40,
             following_tail: true,
@@ -335,7 +376,11 @@ pub fn spawn_agent_worker(
                 return;
             };
             runtime.block_on(async move {
-                let surface = Arc::new(ClientSurface::new(workspace.clone(), PermissionChoice::Deny));
+                let surface: Arc<dyn ClientHandler> = Arc::new(ForgeClientBridge {
+                    tab_id,
+                    events: events.clone(),
+                    fallback: ClientSurface::new(workspace.clone(), PermissionChoice::Deny),
+                });
                 let mut previous_session = None;
                 let mut attempt = 0_u32;
                 loop {

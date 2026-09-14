@@ -46,9 +46,9 @@ Fase 0 en `crates/proto-acp` (cliente ACP mínimo que habló con
 - [x] Línea de tiempo de herramientas (§17.9).
 
 ## 4.3 — fs/* y terminal/* sobre Forge
-- [ ] `fs/read_text_file`/`fs/write_text_file` sobre buffers abiertos
+- [x] `fs/read_text_file`/`fs/write_text_file` sobre buffers abiertos
   (texto vivo, no disco) con overlay de ediciones propuestas.
-- [ ] `terminal/create|output|wait_for_exit|kill|release` sobre
+- [x] `terminal/create|output|wait_for_exit|kill|release` sobre
   `forge-termd`, visibles como pestañas.
 
 ## 4.4 — Permisos y diff review

@@ -1,5 +1,5 @@
 use crate::{
-    AgentDefinition, ClientSurface, JsonRpcMessage, TransportError, read_jsonl, write_jsonl,
+    AgentDefinition, ClientHandler, JsonRpcMessage, TransportError, read_jsonl, write_jsonl,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -268,7 +268,7 @@ impl AgentProcess {
     /// Returns process-spawn and missing-pipe errors.
     pub fn spawn(
         definition: &AgentDefinition,
-        surface: Arc<ClientSurface>,
+        surface: Arc<dyn ClientHandler>,
     ) -> Result<Self, ClientError> {
         let mut command = Command::new(&definition.command);
         command
@@ -306,7 +306,7 @@ impl AgentProcess {
             let mut stdout = BufReader::new(stdout);
             loop {
                 if let Ok(message) = read_jsonl(&mut stdout).await {
-                    dispatch(message, &reader_shared, &surface).await;
+                    dispatch(message, &reader_shared, surface.as_ref()).await;
                 } else {
                     let _ = reader_shared.events.send(AcpEvent::Disconnected);
                     break;
@@ -345,7 +345,7 @@ impl Drop for AgentProcess {
     }
 }
 
-async fn dispatch(message: JsonRpcMessage, shared: &Shared, surface: &ClientSurface) {
+async fn dispatch(message: JsonRpcMessage, shared: &Shared, surface: &dyn ClientHandler) {
     if let Some(id) = message.id.as_ref().and_then(Value::as_u64)
         && message.method.is_none()
         && let Some(sender) = shared.pending.lock().await.remove(&id)
@@ -365,7 +365,7 @@ async fn dispatch(message: JsonRpcMessage, shared: &Shared, surface: &ClientSurf
         return;
     }
     if message.id.is_some() {
-        if let Some(response) = surface.handle_request(&message) {
+        if let Some(response) = surface.handle(&message).await {
             let _ = write_jsonl(&mut *shared.writer.lock().await, &response).await;
         }
         return;

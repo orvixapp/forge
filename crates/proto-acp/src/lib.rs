@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
 };
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
@@ -95,6 +97,14 @@ pub struct ClientSurface {
 pub enum PermissionChoice {
     Allow,
     Deny,
+}
+
+/// Handles requests sent by an ACP agent to its editor client.
+pub trait ClientHandler: Send + Sync {
+    fn handle<'a>(
+        &'a self,
+        message: &'a JsonRpcMessage,
+    ) -> Pin<Box<dyn Future<Output = Option<JsonRpcMessage>> + Send + 'a>>;
 }
 
 impl ClientSurface {
@@ -206,6 +216,15 @@ impl ClientSurface {
         let workspace = self.workspace.canonicalize().map_err(|_| ())?;
         let path = requested.canonicalize().map_err(|_| ())?;
         path.starts_with(&workspace).then_some(path).ok_or(())
+    }
+}
+
+impl ClientHandler for ClientSurface {
+    fn handle<'a>(
+        &'a self,
+        message: &'a JsonRpcMessage,
+    ) -> Pin<Box<dyn Future<Output = Option<JsonRpcMessage>> + Send + 'a>> {
+        Box::pin(std::future::ready(self.handle_request(message)))
     }
 }
 

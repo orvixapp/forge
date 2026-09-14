@@ -52,6 +52,12 @@ pub enum UiEvent {
         tab_id: u64,
         status: String,
     },
+    /// An agent-to-client ACP request that must inspect or mutate live GUI state.
+    AgentRequest {
+        tab_id: u64,
+        message: Box<proto_acp::JsonRpcMessage>,
+        response: tokio::sync::oneshot::Sender<proto_acp::JsonRpcMessage>,
+    },
 }
 
 pub struct GitDiffResult {
