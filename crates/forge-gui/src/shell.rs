@@ -316,15 +316,37 @@ pub struct ShellKeymap {
 impl Default for ShellKeymap {
     fn default() -> Self {
         use ShellCommand::{
-            CloseWindow, CycleTheme, FocusNextPane, FocusPreviousPane, MoveTabLeft, MoveTabRight,
-            NewTerminalTab, NextPrompt, PreviousPrompt, RenameTab, SearchNext, SearchPrevious,
+            CloseWindow, CycleTheme, EditorAddCursorAbove, EditorAddCursorBelow, EditorCopy,
+            EditorCut, EditorFind, EditorPaste, EditorRedo, EditorReplace, EditorSelectAll,
+            EditorSelectNextMatch, EditorUndo, FocusNextPane, FocusPreviousPane, MoveTabLeft,
+            MoveTabRight, NewFile, NewTerminalTab, NextPrompt, OpenFile, OpenProjectFile,
+            PreviousPrompt, RenameTab, SaveFile, SearchNext, SearchPrevious, SearchProject,
             SearchScrollback, ShowCommandPalette, SplitHorizontal, SplitVertical, ZoomIn, ZoomOut,
             ZoomPane, ZoomReset,
         };
-        use ShellContext::{Terminal, Window};
+        use ShellContext::{Editor, Terminal, Window};
         Self {
             bindings: vec![
-                binding("t", true, false, false, Terminal, NewTerminalTab),
+                binding("t", true, false, false, Window, NewTerminalTab),
+                // Editor chords follow VS Code; they only apply in editors so
+                // Ctrl+C/Ctrl+F keep their meaning inside terminals.
+                binding("o", true, false, false, Window, OpenFile),
+                binding("n", true, false, false, Window, NewFile),
+                binding("p", true, false, false, Window, OpenProjectFile),
+                binding("f", true, false, true, Window, SearchProject),
+                binding("s", true, false, false, Editor, SaveFile),
+                binding("z", true, false, false, Editor, EditorUndo),
+                binding("z", true, false, true, Editor, EditorRedo),
+                binding("y", true, false, false, Editor, EditorRedo),
+                binding("a", true, false, false, Editor, EditorSelectAll),
+                binding("c", true, false, false, Editor, EditorCopy),
+                binding("x", true, false, false, Editor, EditorCut),
+                binding("v", true, false, false, Editor, EditorPaste),
+                binding("d", true, false, false, Editor, EditorSelectNextMatch),
+                binding("f", true, false, false, Editor, EditorFind),
+                binding("h", true, false, false, Editor, EditorReplace),
+                binding("up", true, true, false, Editor, EditorAddCursorAbove),
+                binding("down", true, true, false, Editor, EditorAddCursorBelow),
                 binding("p", true, false, true, Window, ShowCommandPalette),
                 binding("w", true, false, false, Window, CloseWindow),
                 binding("\\", true, false, false, Window, SplitVertical),
@@ -875,6 +897,62 @@ mod tests {
                 .as_deref(),
             Some("Ctrl+Shift+P")
         );
+    }
+
+    #[test]
+    fn editor_chords_resolve_only_in_editors() {
+        let keymap = ShellKeymap::default();
+        let ctrl = |key: &str| ShellKeystroke::new(key, true, false, false);
+        assert_eq!(
+            keymap.resolve(&ctrl("s"), ShellContext::Editor),
+            Some(ShellCommand::SaveFile)
+        );
+        assert_eq!(
+            keymap.resolve(&ctrl("z"), ShellContext::Editor),
+            Some(ShellCommand::EditorUndo)
+        );
+        assert_eq!(
+            keymap.resolve(&ctrl("f"), ShellContext::Editor),
+            Some(ShellCommand::EditorFind)
+        );
+        assert_eq!(
+            keymap.resolve(&ctrl("p"), ShellContext::Editor),
+            Some(ShellCommand::OpenProjectFile)
+        );
+        // Terminals keep Ctrl+C/Ctrl+S/Ctrl+F for the running program.
+        assert_eq!(keymap.resolve(&ctrl("s"), ShellContext::Terminal), None);
+        assert_eq!(keymap.resolve(&ctrl("c"), ShellContext::Terminal), None);
+        assert_eq!(keymap.resolve(&ctrl("f"), ShellContext::Terminal), None);
+        assert_eq!(
+            keymap.resolve(
+                &ShellKeystroke::new("f", true, false, true),
+                ShellContext::Terminal
+            ),
+            Some(ShellCommand::SearchScrollback)
+        );
+        assert_eq!(
+            keymap.resolve(
+                &ShellKeystroke::new("f", true, false, true),
+                ShellContext::Editor
+            ),
+            Some(ShellCommand::SearchProject)
+        );
+        // Every command that names a chord in the docs has one.
+        for command in [
+            ShellCommand::OpenFile,
+            ShellCommand::NewFile,
+            ShellCommand::SaveFile,
+            ShellCommand::EditorFind,
+            ShellCommand::EditorReplace,
+            ShellCommand::OpenProjectFile,
+            ShellCommand::SearchProject,
+        ] {
+            assert!(
+                keymap.chord_for(command).is_some(),
+                "{} unbound",
+                command.id()
+            );
+        }
     }
 
     #[test]
