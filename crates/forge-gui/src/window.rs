@@ -3265,6 +3265,8 @@ impl ForgeWindow {
         }
     }
 
+    // Exhaustive on purpose: a new command must be routed here.
+    #[allow(clippy::too_many_lines)]
     pub fn run_shell_command(
         &mut self,
         command: ShellCommand,
@@ -3282,7 +3284,11 @@ impl ForgeWindow {
             }
             ShellCommand::NewAgentSession
             | ShellCommand::AgentAcceptAllHunks
-            | ShellCommand::AgentRejectAllHunks => {
+            | ShellCommand::AgentRejectAllHunks
+            | ShellCommand::AgentAsk
+            | ShellCommand::AgentInvestigate
+            | ShellCommand::AgentForward
+            | ShellCommand::OpenSettings => {
                 self.run_agent_shell_command(command, cx);
             }
             ShellCommand::NewTerminalTabInDirectory => Self::prompt_for_directory(cx),
@@ -3368,7 +3374,18 @@ impl ForgeWindow {
                 self.paste(cx.read_from_clipboard());
                 cx.notify();
             }
-            other => self.run_layout_command(other, cx),
+            // Listed one by one so that a new command fails to compile
+            // here instead of silently doing nothing.
+            ShellCommand::RenameTab
+            | ShellCommand::MoveTabLeft
+            | ShellCommand::MoveTabRight
+            | ShellCommand::ZoomIn
+            | ShellCommand::ZoomOut
+            | ShellCommand::ZoomReset
+            | ShellCommand::FocusPreviousPane
+            | ShellCommand::ZoomPane
+            | ShellCommand::Unsplit
+            | ShellCommand::NewTabWithProfile => self.run_layout_command(command, cx),
         }
     }
 
@@ -3434,7 +3451,7 @@ impl ForgeWindow {
                 }
                 cx.notify();
             }
-            _ => {}
+            other => tracing::warn!(command = other.id(), "not a layout command"),
         }
     }
 
