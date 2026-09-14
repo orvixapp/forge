@@ -13,6 +13,7 @@ forge-search = { path = "../forge-search" }
 forge-syntax = { path = "../forge-syntax" }
 gpui.workspace = true
 proto-ipc = { path = "../proto-ipc" }
+proto-acp = { path = "../proto-acp" }
 schemars = "1"
 serde.workspace = true
 serde_json.workspace = true

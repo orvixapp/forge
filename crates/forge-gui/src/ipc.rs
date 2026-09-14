@@ -40,6 +40,18 @@ pub enum UiEvent {
         /// Repository, `HEAD` text (`None` when untracked) and the diff.
         state: Box<GitDiffResult>,
     },
+    AgentConnected {
+        tab_id: u64,
+        session_id: String,
+    },
+    AgentEvent {
+        tab_id: u64,
+        event: proto_acp::AcpEvent,
+    },
+    AgentStatus {
+        tab_id: u64,
+        status: String,
+    },
 }
 
 pub struct GitDiffResult {

@@ -63,10 +63,11 @@ pub enum ShellCommand {
     ShowContextMenu,
     TerminalCopy,
     TerminalPaste,
+    NewAgentSession,
 }
 
 impl ShellCommand {
-    pub const ALL: [Self; 51] = [
+    pub const ALL: [Self; 52] = [
         Self::NewTerminalTab,
         Self::NewTerminalTabInDirectory,
         Self::CloseWindow,
@@ -118,6 +119,7 @@ impl ShellCommand {
         Self::ShowContextMenu,
         Self::TerminalCopy,
         Self::TerminalPaste,
+        Self::NewAgentSession,
     ];
 
     #[must_use]
@@ -174,6 +176,7 @@ impl ShellCommand {
             Self::ShowContextMenu => "view.contextMenu",
             Self::TerminalCopy => "terminal.copy",
             Self::TerminalPaste => "terminal.paste",
+            Self::NewAgentSession => "agent.newSession",
         }
     }
 
@@ -231,6 +234,7 @@ impl ShellCommand {
             Self::ShowContextMenu => "Show context menu",
             Self::TerminalCopy => "Copy selection",
             Self::TerminalPaste => "Paste clipboard",
+            Self::NewAgentSession => "New agent session",
         }
     }
 
@@ -297,6 +301,7 @@ pub enum ShellContext {
     Window,
     Terminal,
     Editor,
+    Agent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -339,15 +344,16 @@ impl Default for ShellKeymap {
             CloseWindow, CycleTheme, EditorAddCursorAbove, EditorAddCursorBelow, EditorCopy,
             EditorCut, EditorFind, EditorPaste, EditorRedo, EditorReplace, EditorSelectAll,
             EditorSelectNextMatch, EditorUndo, FocusNextPane, FocusPreviousPane, MoveTabLeft,
-            MoveTabRight, NewFile, NewTerminalTab, NextPrompt, OpenFile, OpenProjectFile,
-            PreviousPrompt, RenameTab, SaveFile, SearchNext, SearchPrevious, SearchProject,
-            SearchScrollback, ShowCommandPalette, ShowContextMenu, SplitHorizontal, SplitVertical,
-            ToggleWordWrap, ZoomIn, ZoomOut, ZoomPane, ZoomReset,
+            MoveTabRight, NewAgentSession, NewFile, NewTerminalTab, NextPrompt, OpenFile,
+            OpenProjectFile, PreviousPrompt, RenameTab, SaveFile, SearchNext, SearchPrevious,
+            SearchProject, SearchScrollback, ShowCommandPalette, ShowContextMenu, SplitHorizontal,
+            SplitVertical, ToggleWordWrap, ZoomIn, ZoomOut, ZoomPane, ZoomReset,
         };
         use ShellContext::{Editor, Terminal, Window};
         Self {
             bindings: vec![
                 binding("t", true, false, false, Window, NewTerminalTab),
+                binding("a", true, false, true, Window, NewAgentSession),
                 // Editor chords follow VS Code; they only apply in editors so
                 // Ctrl+C/Ctrl+F keep their meaning inside terminals.
                 binding("o", true, false, false, Window, OpenFile),

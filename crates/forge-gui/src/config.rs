@@ -31,8 +31,12 @@ pub enum ConfigError {
 
 /// Keys the workspace layer may not set: a repository must not be able to
 /// pick the program Forge executes on the user's machine.
-pub const WORKSPACE_FORBIDDEN_KEYS: &[&[&str]] =
-    &[&["terminal", "shell"], &["terminal", "args"], &["profiles"]];
+pub const WORKSPACE_FORBIDDEN_KEYS: &[&[&str]] = &[
+    &["terminal", "shell"],
+    &["terminal", "args"],
+    &["profiles"],
+    &["agents"],
+];
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -47,6 +51,33 @@ pub struct Config {
     /// Named terminal setups for `terminal.newTabWithProfile`. Ignored in
     /// the workspace layer, like `terminal.shell`.
     pub profiles: Vec<TerminalProfile>,
+    /// ACP adapters available to `agent.newSession`. Ignored in workspace
+    /// configuration because repositories must not choose executables.
+    pub agents: Vec<AgentConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentConfig {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: std::collections::BTreeMap<String, String>,
+    pub auth_method: Option<String>,
+    pub enabled: bool,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            command: String::new(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            auth_method: None,
+            enabled: true,
+        }
+    }
 }
 
 // Configuration flags are a struct of booleans by nature.

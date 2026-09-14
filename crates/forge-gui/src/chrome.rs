@@ -3,6 +3,7 @@
 //! command palette and the process explorer.
 
 use crate::{
+    agent::{MessageRole, TimelineItem, ToolState},
     grid_element::{TerminalGridElement, color},
     window::{ConfirmationKind, ForgeWindow, NotificationLevel, TabContent},
 };
@@ -379,6 +380,11 @@ fn pane_leaf(
                 (total > viewport.len).then(|| scrollbar(viewport, rect, theme).into_any_element()),
             )
         }
+        TabContent::Agent(agent) => (
+            agent_panel(agent, theme).into_any_element(),
+            agent.status.clone(),
+            None,
+        ),
     };
     div()
         .id(("pane", index))
@@ -587,11 +593,113 @@ fn process_explorer(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> impl I
                     format!("{cols}×{rows}")
                 }
                 TabContent::Editor(editor) => format!("{} líneas", editor.buffer.len_lines()),
+                TabContent::Agent(agent) => format!("{} eventos", agent.timeline.len()),
             };
             div()
                 .mt(px(4.0))
                 .child(format!("{} · {size} · {}", tab.title(), tab.status()))
         }))
+}
+
+fn agent_panel(
+    agent: &crate::agent::AgentTab,
+    theme: forge_gui::theme::ThemeColors,
+) -> impl IntoElement {
+    let start = agent.timeline.len().saturating_sub(200);
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .p(px(14.0))
+        .gap(px(8.0))
+        .overflow_hidden()
+        .child(
+            div()
+                .text_size(px(15.0))
+                .text_color(color(theme.accent))
+                .child(format!(
+                    "Sesión ACP · {} · {}",
+                    agent.agent_name,
+                    agent.session_id.as_deref().unwrap_or("sin id")
+                )),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .children(
+                    agent
+                        .visible_timeline(start..agent.timeline.len())
+                        .iter()
+                        .map(|item| {
+                            let (label, body, tint) = match item {
+                                TimelineItem::Message { role, text } => {
+                                    let label = match role {
+                                        MessageRole::User => "Tú",
+                                        MessageRole::Agent => "Agente",
+                                        MessageRole::System => "Sistema",
+                                    };
+                                    (label, text.clone(), theme.foreground)
+                                }
+                                TimelineItem::ToolCall {
+                                    title,
+                                    state,
+                                    detail,
+                                    ..
+                                } => {
+                                    let state = match state {
+                                        ToolState::Pending => "pendiente",
+                                        ToolState::Running => "en curso",
+                                        ToolState::Succeeded => "completada",
+                                        ToolState::Failed => "falló",
+                                        ToolState::WaitingPermission => "espera permiso",
+                                    };
+                                    (
+                                        "Herramienta",
+                                        format!("{title} · {state}\n{detail}"),
+                                        theme.accent,
+                                    )
+                                }
+                                TimelineItem::Plan { title, entries } => (
+                                    "Plan",
+                                    format!("{title}\n{}", entries.join("\n")),
+                                    theme.accent,
+                                ),
+                            };
+                            div()
+                                .px(px(10.0))
+                                .py(px(7.0))
+                                .rounded(px(5.0))
+                                .bg(color(theme.chrome))
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(color(tint))
+                                        .child(label),
+                                )
+                                .child(div().text_size(px(13.0)).child(body))
+                                .into_any_element()
+                        }),
+                ),
+        )
+        .child(
+            div()
+                .min_h(px(42.0))
+                .px(px(10.0))
+                .py(px(8.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(color(theme.chrome_active_border))
+                .child(if agent.prompt.is_empty() {
+                    "Escribe un prompt…  (Enter para enviar)".to_owned()
+                } else {
+                    agent.prompt.clone()
+                }),
+        )
 }
 
 /// Right-click menu at the pointer: command titles with their chords.

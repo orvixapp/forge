@@ -31,6 +31,13 @@
       "items": {
         "$ref": "#/$defs/TerminalProfile"
       }
+    },
+    "agents": {
+      "description": "ACP adapters available to `agent.newSession`. Ignored in workspace\nconfiguration because repositories must not choose executables.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentConfig"
+      }
     }
   },
   "additionalProperties": false,
@@ -322,6 +329,45 @@
       "required": [
         "name"
       ]
+    },
+    "AgentConfig": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "default": ""
+        },
+        "command": {
+          "type": "string",
+          "default": ""
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "auth_method": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

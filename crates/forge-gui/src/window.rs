@@ -2,6 +2,7 @@
 //! keyboard/mouse plumbing that turns shell commands into state changes.
 
 use crate::{
+    agent::{AgentTab, spawn_agent_worker},
     chrome,
     editor::EditorTab,
     grid_element::{CellMetrics, Palette, SearchHighlights, TerminalSurface},
@@ -183,6 +184,7 @@ pub struct Tab {
 pub enum TabContent {
     Terminal(Box<TerminalTab>),
     Editor(Box<EditorTab>),
+    Agent(Box<AgentTab>),
 }
 
 impl Tab {
@@ -193,6 +195,7 @@ impl Tab {
         match &self.content {
             TabContent::Terminal(terminal) => terminal.title(),
             TabContent::Editor(editor) => editor.title(),
+            TabContent::Agent(agent) => Cow::Owned(format!("Agente · {}", agent.agent_name)),
         }
     }
 
@@ -200,34 +203,42 @@ impl Tab {
         match &self.content {
             TabContent::Terminal(terminal) => terminal.status.clone(),
             TabContent::Editor(editor) => editor.status(),
+            TabContent::Agent(agent) => agent.status.clone(),
         }
     }
 
     pub fn terminal(&self) -> Option<&TerminalTab> {
         match &self.content {
             TabContent::Terminal(terminal) => Some(terminal),
-            TabContent::Editor(_) => None,
+            TabContent::Editor(_) | TabContent::Agent(_) => None,
         }
     }
 
     pub fn terminal_mut(&mut self) -> Option<&mut TerminalTab> {
         match &mut self.content {
             TabContent::Terminal(terminal) => Some(terminal),
-            TabContent::Editor(_) => None,
+            TabContent::Editor(_) | TabContent::Agent(_) => None,
         }
     }
 
     pub fn editor(&self) -> Option<&EditorTab> {
         match &self.content {
             TabContent::Editor(editor) => Some(editor),
-            TabContent::Terminal(_) => None,
+            TabContent::Terminal(_) | TabContent::Agent(_) => None,
         }
     }
 
     pub fn editor_mut(&mut self) -> Option<&mut EditorTab> {
         match &mut self.content {
             TabContent::Editor(editor) => Some(editor),
-            TabContent::Terminal(_) => None,
+            TabContent::Terminal(_) | TabContent::Agent(_) => None,
+        }
+    }
+
+    fn agent_mut(&mut self) -> Option<&mut AgentTab> {
+        match &mut self.content {
+            TabContent::Agent(agent) => Some(agent),
+            TabContent::Terminal(_) | TabContent::Editor(_) => None,
         }
     }
 
@@ -236,6 +247,7 @@ impl Tab {
         match &self.content {
             TabContent::Terminal(terminal) => terminal.terminal.contains(position),
             TabContent::Editor(editor) => editor.contains(position),
+            TabContent::Agent(_) => true,
         }
     }
 }
@@ -697,6 +709,13 @@ impl ForgeWindow {
         self.active_tab_mut().terminal_mut()
     }
 
+    fn active_agent_mut(&mut self) -> Option<&mut AgentTab> {
+        match &mut self.active_tab_mut().content {
+            TabContent::Agent(agent) => Some(agent),
+            TabContent::Terminal(_) | TabContent::Editor(_) => None,
+        }
+    }
+
     pub(crate) fn tab_mut(&mut self, id: u64) -> Option<&mut Tab> {
         self.tabs.iter_mut().find(|tab| tab.id == id)
     }
@@ -742,6 +761,46 @@ impl ForgeWindow {
     /// explicit directory the new shell starts where the active one is (OSC 7).
     pub fn create_terminal_tab(&mut self, cwd: Option<PathBuf>, cx: &mut Context<Self>) -> usize {
         self.open_tab(cwd, None, None, cx)
+    }
+
+    fn create_agent_tab(&mut self, cx: &mut Context<Self>) -> usize {
+        let configured = self
+            .config
+            .agents
+            .iter()
+            .find(|agent| agent.enabled)
+            .cloned();
+        let name = configured
+            .as_ref()
+            .map_or_else(|| "ACP".to_owned(), |agent| agent.name.clone());
+        let index = self.push_tab(TabContent::Agent(Box::new(AgentTab::new(name))), cx);
+        if let Some(configured) = configured {
+            let definition = proto_acp::AgentDefinition {
+                name: configured.name,
+                command: configured.command,
+                args: configured.args,
+                env: configured.env,
+                cwd: Some(self.factory.cwd.clone()),
+                auth_method: configured.auth_method,
+                enabled: configured.enabled,
+            };
+            let (commands, command_rx) = async_mpsc::unbounded_channel();
+            self.tabs[index]
+                .agent_mut()
+                .expect("new agent tab")
+                .connect(commands);
+            spawn_agent_worker(
+                definition,
+                self.factory.cwd.clone(),
+                self.tabs[index].id,
+                self.event_tx.clone(),
+                command_rx,
+            );
+        } else {
+            self.tabs[index].agent_mut().expect("new agent tab").status =
+                "Configura [[agents]] para conectar un adaptador ACP".into();
+        }
+        index
     }
 
     /// Like [`Self::create_terminal_tab`], reattaching to a daemon session
@@ -1298,6 +1357,42 @@ impl ForgeWindow {
                 }
                 self.save_session();
             }
+            UiEvent::AgentConnected { tab_id, session_id } => {
+                self.connect_agent(tab_id, session_id);
+            }
+            UiEvent::AgentEvent { tab_id, event } => self.handle_agent_event(tab_id, event),
+            UiEvent::AgentStatus { tab_id, status } => self.set_agent_status(tab_id, status),
+        }
+    }
+
+    fn connect_agent(&mut self, tab_id: u64, session_id: String) {
+        if let Some(agent) = self.tab_mut(tab_id).and_then(Tab::agent_mut) {
+            agent.session_id = Some(session_id);
+            agent.status = "Sesión activa".into();
+        }
+    }
+
+    fn set_agent_status(&mut self, tab_id: u64, status: String) {
+        if let Some(agent) = self.tab_mut(tab_id).and_then(Tab::agent_mut) {
+            agent.status = status;
+        }
+    }
+
+    fn handle_agent_event(&mut self, tab_id: u64, event: proto_acp::AcpEvent) {
+        let Some(agent) = self.tab_mut(tab_id).and_then(Tab::agent_mut) else {
+            return;
+        };
+        match event {
+            proto_acp::AcpEvent::SessionUpdate { update, .. } => {
+                agent.apply_update(&update);
+            }
+            proto_acp::AcpEvent::Stderr(line) => agent.status = line,
+            proto_acp::AcpEvent::Notification { method, params } => {
+                agent.apply_update(&serde_json::json!({"type": method, "params": params}));
+            }
+            proto_acp::AcpEvent::Disconnected => {
+                agent.status = "ACP desconectado".into();
+            }
         }
     }
 
@@ -1381,6 +1476,8 @@ impl ForgeWindow {
         );
         let context = if self.active_tab().editor().is_some() {
             ShellContext::Editor
+        } else if matches!(self.active_tab().content, TabContent::Agent(_)) {
+            ShellContext::Agent
         } else {
             ShellContext::Terminal
         };
@@ -1390,6 +1487,15 @@ impl ForgeWindow {
         }
         if context == ShellContext::Editor {
             self.editor_key(
+                keystroke.key.as_str(),
+                keystroke.key_char.as_deref(),
+                modifiers,
+                cx,
+            );
+            return;
+        }
+        if context == ShellContext::Agent {
+            self.agent_key(
                 keystroke.key.as_str(),
                 keystroke.key_char.as_deref(),
                 modifiers,
@@ -1450,6 +1556,38 @@ impl ForgeWindow {
             let _ = tab.input.send(IpcCommand::Key(event));
             cx.notify();
         }
+    }
+
+    fn agent_key(
+        &mut self,
+        key: &str,
+        key_char: Option<&str>,
+        modifiers: KeyMods,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent) = self.active_agent_mut() else {
+            return;
+        };
+        match key {
+            "escape" => {
+                agent.cancel();
+                agent.status = "Cancelación solicitada".into();
+            }
+            "enter" if !modifiers.shift => {
+                let _ = agent.submit_prompt();
+            }
+            "enter" => agent.prompt.push('\n'),
+            "backspace" => {
+                agent.prompt.pop();
+            }
+            _ if !modifiers.control && !modifiers.alt => {
+                if let Some(text) = key_char {
+                    agent.prompt.push_str(text);
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
     }
 
     /// Routes a key to whichever overlay is open (confirmation, rename,
@@ -1635,6 +1773,9 @@ impl ForgeWindow {
         match command {
             ShellCommand::NewTerminalTab => {
                 self.create_terminal_tab(None, cx);
+            }
+            ShellCommand::NewAgentSession => {
+                self.create_agent_tab(cx);
             }
             ShellCommand::NewTerminalTabInDirectory => Self::prompt_for_directory(cx),
             ShellCommand::CloseWindow if self.tabs.len() > 1 => {
@@ -2420,6 +2561,7 @@ impl EntityInputHandler for ForgeWindow {
         match &self.active_tab().content {
             TabContent::Terminal(terminal) => terminal.terminal.cursor_bounds(),
             TabContent::Editor(_) => self.editor_cursor_bounds(window),
+            TabContent::Agent(_) => None,
         }
     }
 
