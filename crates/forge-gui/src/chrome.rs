@@ -85,6 +85,7 @@ fn topbar(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> impl IntoElement
     div()
         .h(px(TOPBAR_HEIGHT))
         .w_full()
+        .overflow_hidden()
         .flex()
         .items_center()
         .px(px(10.0))
@@ -165,6 +166,8 @@ fn tab_button(
         .h(px(28.0))
         .min_w(px(120.0))
         .max_w(px(210.0))
+        .overflow_hidden()
+        .whitespace_nowrap()
         .px(px(10.0))
         .flex()
         .items_center()
@@ -190,7 +193,14 @@ fn tab_button(
         .cursor_pointer()
         .hover(move |style| style.bg(color(theme.chrome_active)))
         .on_click(cx.listener(move |view, _, _, cx| view.activate_tab(index, cx)))
-        .child(div().flex_1().overflow_hidden().child(title.to_string()))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(title.to_string()),
+        )
         .when(active, |tab| {
             tab.child(
                 div()

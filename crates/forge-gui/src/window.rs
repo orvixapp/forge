@@ -27,6 +27,7 @@ use proto_ipc::{
     ServerMessage, TerminalKey,
 };
 use std::{
+    borrow::Cow,
     ops::Range,
     path::{Path, PathBuf},
     sync::{
@@ -150,11 +151,16 @@ pub struct SessionInfo {
 }
 
 impl TerminalTab {
-    pub fn title(&self) -> &str {
+    pub fn title(&self) -> Cow<'_, str> {
+        if let Some(pwd) = &self.info.pwd {
+            return pwd
+                .file_name()
+                .map_or_else(|| pwd.to_string_lossy(), |name| name.to_string_lossy());
+        }
         if self.info.title.is_empty() {
-            &self.default_title
+            Cow::Borrowed(&self.default_title)
         } else {
-            &self.info.title
+            Cow::Borrowed(&self.info.title)
         }
     }
 
