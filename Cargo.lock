@@ -1920,6 +1920,7 @@ name = "forge-buffer"
 version = "0.0.1"
 dependencies = [
  "encoding_rs",
+ "imara-diff",
  "memmap2",
  "proptest",
  "ropey",

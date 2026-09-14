@@ -11,6 +11,7 @@ pub mod file;
 pub mod journal;
 pub mod large;
 pub mod motion;
+pub mod proposed;
 pub mod selection;
 pub mod transaction;
 
@@ -18,6 +19,7 @@ pub use file::{LineEnding, LoadedFile};
 pub use journal::Journal;
 pub use large::LargeFile;
 pub use motion::{Cursor, Motion};
+pub use proposed::{HunkStatus, ProposedEdit, ProposedHunk};
 pub use selection::{Position, Selection, Selections};
 pub use transaction::{Edit, Transaction};
 
@@ -108,6 +110,25 @@ impl Buffer {
     #[must_use]
     pub const fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Returns transactions applied between `version` and current version,
+    /// or `None` if `version` is not in history.
+    #[must_use]
+    pub fn transactions_since(&self, version: u64) -> Option<Vec<&Transaction>> {
+        if version > self.version {
+            return None;
+        }
+        if version == self.version {
+            return Some(Vec::new());
+        }
+        let mut result = Vec::new();
+        for entry in &self.undo {
+            if entry.forward.version_before >= version {
+                result.push(&entry.forward);
+            }
+        }
+        Some(result)
     }
 
     /// The edits that took the buffer from `version() - 1` to `version()`,
