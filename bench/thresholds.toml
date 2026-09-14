@@ -44,3 +44,16 @@ p95_ms = 10.0
 
 [search_project_literal]
 p95_ms = 400.0
+
+# Phase 4 agent budgets (ARCHITECTURE.md §29): one `session/update` on the
+# UI thread; streaming 10k tokens/min into the visible panel without a
+# dropped 60 Hz frame; typing with four sessions streaming in the
+# background, same budget as `editor_typing`.
+[agent_update_overhead]
+p95_ms = 0.2
+
+[agent_stream]
+p95_ms = 16.6
+
+[agent_parallel_typing]
+p95_ms = 3.0

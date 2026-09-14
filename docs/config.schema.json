@@ -38,6 +38,24 @@
       "items": {
         "$ref": "#/$defs/AgentConfig"
       }
+    },
+    "providers": {
+      "description": "Model providers Forge injects into agents (§17.7). User layer only.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ProviderConfig"
+      }
+    },
+    "router": {
+      "description": "Which provider serves each task class (§17.7).",
+      "$ref": "#/$defs/RouterConfig"
+    },
+    "mcp_servers": {
+      "description": "MCP servers handed to agents in `session/new` (§18). User layer only:\na repository must not make Forge start executables.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/McpServerConfig"
+      }
     }
   },
   "additionalProperties": false,
@@ -365,6 +383,146 @@
         "enabled": {
           "type": "boolean",
           "default": true
+        },
+        "provider": {
+          "description": "Provider used when the router has nothing for the task class;\nempty keeps the agent's own login/model.",
+          "type": "string",
+          "default": ""
+        },
+        "worktree": {
+          "description": "Run each session in its own git worktree (`<config>/worktrees/…`)\nso agents never edit the checkout you are working in.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProviderConfig": {
+      "description": "A model provider: how an agent should reach a model, expressed as the\nenvironment the agent's CLI already understands. Keys are never written\nin the config: `api_key_env` names the variable that holds one.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "default": ""
+        },
+        "kind": {
+          "$ref": "#/$defs/ProviderKind"
+        },
+        "model": {
+          "description": "Model id passed to the agent (`gpt-5`, `claude-opus-5`, …); empty\nkeeps the agent's default.",
+          "type": "string",
+          "default": ""
+        },
+        "base_url": {
+          "description": "OpenAI-compatible or custom endpoint; empty keeps the default.",
+          "type": "string",
+          "default": ""
+        },
+        "api_key_env": {
+          "description": "Environment variable holding the API key; empty relies on the\nagent's own login (Codex with the `ChatGPT` subscription, Claude Code\nwith `claude login`).",
+          "type": "string",
+          "default": ""
+        },
+        "free": {
+          "description": "Whether requests are free of charge (local models, free tiers);\nthe router prefers these for `trivial` tasks.",
+          "type": "boolean",
+          "default": false
+        },
+        "env": {
+          "description": "Extra environment for this provider, verbatim.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProviderKind": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "openai",
+            "anthropic",
+            "google"
+          ]
+        },
+        {
+          "description": "Any server speaking the `OpenAI` API (Ollama, LM Studio, vLLM…).",
+          "type": "string",
+          "const": "openai-compatible"
+        }
+      ]
+    },
+    "RouterConfig": {
+      "description": "Provider name per task class; an empty entry means \"the agent's own\ndefault\". `/trivial`, `/normal` or `/deep` at the start of a prompt\npicks the class; `default_class` applies otherwise.",
+      "type": "object",
+      "properties": {
+        "trivial": {
+          "type": "string",
+          "default": ""
+        },
+        "normal": {
+          "type": "string",
+          "default": ""
+        },
+        "deep": {
+          "type": "string",
+          "default": ""
+        },
+        "default_class": {
+          "$ref": "#/$defs/TaskClass"
+        }
+      },
+      "additionalProperties": false
+    },
+    "TaskClass": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "normal"
+          ]
+        },
+        {
+          "description": "Renames, one-liners, questions: cheap/free models are enough.",
+          "type": "string",
+          "const": "trivial"
+        },
+        {
+          "description": "Architecture, debugging across files: the strongest model.",
+          "type": "string",
+          "const": "deep"
+        }
+      ]
+    },
+    "McpServerConfig": {
+      "description": "An MCP server the agent connects to directly (ACP `session/new`).",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "default": ""
+        },
+        "command": {
+          "type": "string",
+          "default": ""
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
         }
       },
       "additionalProperties": false

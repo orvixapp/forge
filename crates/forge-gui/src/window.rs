@@ -13,7 +13,7 @@ use crate::{
 use forge_gui::{
     CellPos, Selection, TerminalGrid,
     config::{
-        ClipboardPolicy, Config, ConfigSources, ProviderConfig, TerminalProfile,
+        AgentConfig, ClipboardPolicy, Config, ConfigSources, ProviderConfig, TerminalProfile,
         resolve_font_family,
     },
     key_event,
@@ -443,6 +443,9 @@ pub struct ForgeWindow {
     pub marked_text: Option<String>,
     daemon_instance: Option<u64>,
     pub permission_broker: proto_acp::PermissionBroker,
+    /// Socket where `forge-gui mcp-server` processes reach this window;
+    /// dropped (and unlinked) with it.
+    mcp_bridge: Option<forge_mcp::bridge::BridgeListener>,
 }
 
 impl ForgeWindow {
@@ -460,6 +463,7 @@ impl ForgeWindow {
             .map(Path::to_path_buf);
         let permission_broker =
             proto_acp::PermissionBroker::new(&factory.cwd, permission_store.as_deref());
+        let mcp_bridge = Self::spawn_mcp_bridge(event_tx.clone());
         let mut window = Self {
             tabs: Vec::new(),
             active_tab: 0,
@@ -492,6 +496,7 @@ impl ForgeWindow {
             marked_text: None,
             daemon_instance: None,
             permission_broker,
+            mcp_bridge,
         };
         // Tabs must exist before the first draw, which happens inside
         // `open_window`, so the saved layout is applied here.
@@ -828,12 +833,35 @@ impl ForgeWindow {
 
     fn create_agent_tab(&mut self, cx: &mut Context<Self>) -> usize {
         let context = self.agent_prompt_context();
-        self.create_agent_tab_with(AgentLaunch {
-            class: self.config.router.default_class,
-            provider: None,
-            context,
-            prompt: None,
-        }, cx)
+        self.create_agent_tab_with(
+            AgentLaunch {
+                class: self.config.router.default_class,
+                provider: None,
+                context,
+                prompt: None,
+            },
+            cx,
+        )
+    }
+
+    /// Agent tab with no adapter process behind it, for benchmarks: updates
+    /// are fed with [`Self::feed_agent_update`].
+    pub fn open_offline_agent_tab(&mut self, name: &str, cx: &mut Context<Self>) -> u64 {
+        let mut agent_tab = AgentTab::new(name.to_owned(), self.factory.cwd.clone());
+        agent_tab.route = "benchmark → sin proveedor".into();
+        let index = self.push_tab(TabContent::Agent(Box::new(agent_tab)), cx);
+        self.tabs[index].id
+    }
+
+    /// Applies one `session/update` as if it came from the adapter.
+    pub fn feed_agent_update(&mut self, tab_id: u64, update: serde_json::Value) {
+        self.handle_agent_event(
+            tab_id,
+            proto_acp::AcpEvent::SessionUpdate {
+                session_id: None,
+                update,
+            },
+        );
     }
 
     /// Opens an agent tab routed to a provider: the explicit one, else the
@@ -851,36 +879,7 @@ impl ForgeWindow {
         let name = configured
             .as_ref()
             .map_or_else(|| "ACP".to_owned(), |agent| agent.name.clone());
-        let provider_name = launch
-            .provider
-            .clone()
-            .or_else(|| {
-                self.config
-                    .router
-                    .provider_for(launch.class)
-                    .map(str::to_owned)
-            })
-            .or_else(|| {
-                configured
-                    .as_ref()
-                    .map(|agent| agent.provider.clone())
-                    .filter(|name| !name.is_empty())
-            });
-        let provider = provider_name.as_ref().and_then(|wanted| {
-            self.config
-                .providers
-                .iter()
-                .find(|provider| &provider.name == wanted)
-                .cloned()
-        });
-        if let Some(wanted) = &provider_name
-            && provider.is_none()
-        {
-            self.notify_user(
-                NotificationLevel::Warning,
-                format!("Proveedor {wanted:?} no definido en [[providers]]; se usa el del agente"),
-            );
-        }
+        let provider = self.resolve_provider(&launch, configured.as_ref());
         let workspace = configured
             .as_ref()
             .filter(|agent| agent.worktree)
@@ -889,9 +888,10 @@ impl ForgeWindow {
         let route = format!(
             "{} → {}{}",
             launch.class.label(),
-            provider
-                .as_ref()
-                .map_or_else(|| "proveedor del agente".to_owned(), ProviderConfig::describe),
+            provider.as_ref().map_or_else(
+                || "proveedor del agente".to_owned(),
+                ProviderConfig::describe
+            ),
             if workspace == self.factory.cwd {
                 String::new()
             } else {
@@ -906,11 +906,14 @@ impl ForgeWindow {
             agent_tab.prompt = prompt;
         }
         let index = self.push_tab(TabContent::Agent(Box::new(agent_tab)), cx);
+        let tab_id = self.tabs[index].id;
+        let mcp_env = self.mcp_environment(tab_id, &workspace);
         let definition = configured.map(|configured| {
             let mut env = configured.env;
             if let Some(provider) = &provider {
                 env.extend(provider.environment());
             }
+            env.extend(mcp_env.iter().cloned());
             env.insert("FORGE_TASK_CLASS".into(), launch.class.label().to_owned());
             env.insert("TERM_PROGRAM".into(), "forge".into());
             proto_acp::AgentDefinition {
@@ -932,25 +935,8 @@ impl ForgeWindow {
                 || std::env::temp_dir().join("forge-acp-registry.json"),
                 |directory| directory.join("acp-registry.json"),
             );
-        let mcp_servers = self
-            .config
-            .mcp_servers
-            .iter()
-            .map(|server| {
-                serde_json::json!({
-                    "name": server.name,
-                    "command": server.command,
-                    "args": server.args,
-                    "env": server
-                        .env
-                        .iter()
-                        .map(|(name, value)| serde_json::json!({"name": name, "value": value}))
-                        .collect::<Vec<_>>(),
-                })
-            })
-            .collect();
+        let mcp_servers = self.mcp_server_entries(&mcp_env);
         let (commands, command_rx) = async_mpsc::unbounded_channel();
-        let tab_id = self.tabs[index].id;
         let send_now = self.tabs[index]
             .agent()
             .is_some_and(|agent| !agent.prompt.trim().is_empty());
@@ -974,17 +960,99 @@ impl ForgeWindow {
         index
     }
 
+    /// Explicit provider, else the router's for the class, else the
+    /// agent's own; `None` leaves the adapter with its own login.
+    fn resolve_provider(
+        &mut self,
+        launch: &AgentLaunch,
+        configured: Option<&AgentConfig>,
+    ) -> Option<ProviderConfig> {
+        let wanted = launch
+            .provider
+            .clone()
+            .or_else(|| {
+                self.config
+                    .router
+                    .provider_for(launch.class)
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                configured
+                    .map(|agent| agent.provider.clone())
+                    .filter(|name| !name.is_empty())
+            })?;
+        let provider = self
+            .config
+            .providers
+            .iter()
+            .find(|provider| provider.name == wanted)
+            .cloned();
+        if provider.is_none() {
+            self.notify_user(
+                NotificationLevel::Warning,
+                format!("Proveedor {wanted:?} no definido en [[providers]]; se usa el del agente"),
+            );
+        }
+        provider
+    }
+
+    /// `session/new.mcpServers`: Forge itself first (§18), then the user's
+    /// servers. The agent connects to them directly; Forge does not proxy.
+    fn mcp_server_entries(&self, mcp_env: &[(String, String)]) -> Vec<serde_json::Value> {
+        let env_entries = |env: &[(String, String)]| {
+            env.iter()
+                .map(|(name, value)| serde_json::json!({"name": name, "value": value}))
+                .collect::<Vec<_>>()
+        };
+        let mut servers = Vec::new();
+        if !mcp_env.is_empty()
+            && let Ok(exe) = std::env::current_exe()
+        {
+            servers.push(serde_json::json!({
+                "name": "forge",
+                "command": exe,
+                "args": ["mcp-server"],
+                "env": env_entries(mcp_env),
+            }));
+        }
+        servers.extend(self.config.mcp_servers.iter().map(|server| {
+            let env: Vec<(String, String)> = server
+                .env
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            serde_json::json!({
+                "name": server.name,
+                "command": server.command,
+                "args": server.args,
+                "env": env_entries(&env),
+            })
+        }));
+        servers
+    }
+
     /// `git worktree add` under the config directory, on a branch named
     /// after the agent and the moment; `None` (with a notice) when the
     /// workspace is not a git checkout or git is unavailable.
     fn session_worktree(&mut self, agent_name: &str) -> Option<PathBuf> {
-        let base = self.factory.config_path.as_deref()?.parent()?.join("worktrees");
+        let base = self
+            .factory
+            .config_path
+            .as_deref()?
+            .parent()?
+            .join("worktrees");
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let slug: String = agent_name
             .chars()
-            .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+            .map(|c| {
+                if c.is_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
             .collect();
         let directory = base.join(format!("{slug}-{stamp}"));
         let branch = format!("forge/{slug}-{stamp}");
@@ -1015,7 +1083,9 @@ impl ForgeWindow {
             Err(error) => {
                 self.notify_user(
                     NotificationLevel::Warning,
-                    format!("git no disponible para worktrees ({error}); se usa el directorio actual"),
+                    format!(
+                        "git no disponible para worktrees ({error}); se usa el directorio actual"
+                    ),
                 );
                 None
             }
@@ -1045,19 +1115,25 @@ impl ForgeWindow {
     fn agent_ask_submit(&mut self, question: &str, cx: &mut Context<Self>) {
         let (class, rest) = forge_gui::config::TaskClass::split_prefix(question);
         let context = self.agent_prompt_context();
-        self.create_agent_tab_with(AgentLaunch {
-            class: class.unwrap_or(self.config.router.default_class),
-            provider: None,
-            context,
-            prompt: Some(rest.to_owned()),
-        }, cx);
+        self.create_agent_tab_with(
+            AgentLaunch {
+                class: class.unwrap_or(self.config.router.default_class),
+                provider: None,
+                context,
+                prompt: Some(rest.to_owned()),
+            },
+            cx,
+        );
     }
 
     /// From a terminal: hands the last command, its output and the cwd to
     /// an agent. Command boundaries come from the OSC 133 prompt marks.
     fn agent_investigate(&mut self, cx: &mut Context<Self>) {
         let Some(terminal) = self.active_terminal() else {
-            self.notify_user(NotificationLevel::Info, "agent.investigate se usa desde una terminal");
+            self.notify_user(
+                NotificationLevel::Info,
+                "agent.investigate se usa desde una terminal",
+            );
             return;
         };
         let session_label = terminal
@@ -1066,8 +1142,12 @@ impl ForgeWindow {
         let fallback_cwd = self.factory.cwd.clone();
         let grid = &terminal.terminal.grid;
         let (_, rows) = grid.dimensions();
-        let cursor_row = grid.cursor().map_or(rows.saturating_sub(1), |cursor| cursor.y);
-        let prompts: Vec<u16> = (0..=cursor_row).filter(|row| grid.prompt_mark(*row) == 1).collect();
+        let cursor_row = grid
+            .cursor()
+            .map_or(rows.saturating_sub(1), |cursor| cursor.y);
+        let prompts: Vec<u16> = (0..=cursor_row)
+            .filter(|row| grid.prompt_mark(*row) == 1)
+            .collect();
         let (from, to) = match prompts.as_slice() {
             [.., previous, last] => (*previous, *last),
             [only] => (*only, cursor_row + 1),
@@ -1096,27 +1176,39 @@ impl ForgeWindow {
             label: format!("terminal://{session_label}"),
             content: output,
         }];
-        self.create_agent_tab_with(AgentLaunch {
-            class: forge_gui::config::TaskClass::Normal,
-            provider: None,
-            context,
-            prompt: Some(prompt),
-        }, cx);
+        self.create_agent_tab_with(
+            AgentLaunch {
+                class: forge_gui::config::TaskClass::Normal,
+                provider: None,
+                context,
+                prompt: Some(prompt),
+            },
+            cx,
+        );
     }
 
     /// `agent.forward`: re-send the active session's last prompt through
     /// another provider, in a new session.
     fn agent_forward(&mut self, cx: &mut Context<Self>) {
         let Some(agent) = self.active_tab().agent() else {
-            self.notify_user(NotificationLevel::Info, "agent.forward se usa desde una sesión de agente");
+            self.notify_user(
+                NotificationLevel::Info,
+                "agent.forward se usa desde una sesión de agente",
+            );
             return;
         };
         let Some(prompt) = agent.last_prompt.clone() else {
-            self.notify_user(NotificationLevel::Info, "Todavía no hay un prompt que reenviar");
+            self.notify_user(
+                NotificationLevel::Info,
+                "Todavía no hay un prompt que reenviar",
+            );
             return;
         };
         if self.config.providers.is_empty() {
-            self.notify_user(NotificationLevel::Info, "Sin [[providers]] configurados para reenviar");
+            self.notify_user(
+                NotificationLevel::Info,
+                "Sin [[providers]] configurados para reenviar",
+            );
             return;
         }
         self.forward_prompt = Some((prompt, agent.context.clone()));
@@ -1132,6 +1224,88 @@ impl ForgeWindow {
             kind: PickerKind::Provider,
         });
         cx.notify();
+    }
+
+    /// Listens for `forge mcp-server` processes (§18). Every request is
+    /// answered on the UI thread through the same path as ACP client
+    /// requests, so permissions and proposed edits land in the agent tab
+    /// that spawned the server (or the first agent tab for a server started
+    /// by hand in a terminal).
+    fn spawn_mcp_bridge(events: Sender<UiEvent>) -> Option<forge_mcp::bridge::BridgeListener> {
+        let socket = forge_mcp::bridge::default_socket_path(std::process::id());
+        let listener = forge_mcp::bridge::listen(&socket, move |request| {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let message = proto_acp::JsonRpcMessage {
+                jsonrpc: "2.0".into(),
+                id: Some(serde_json::Value::from(request.id)),
+                method: Some(request.method),
+                params: Some(request.params),
+                result: None,
+                error: None,
+            };
+            events
+                .send(UiEvent::AgentRequest {
+                    tab_id: request.tab,
+                    message: Box::new(message),
+                    response: reply_tx,
+                })
+                .map_err(|_| "la ventana ya no existe".to_owned())?;
+            let reply = reply_rx
+                .blocking_recv()
+                .map_err(|_| "petición sin respuesta (¿sin sesión de agente?)".to_owned())?;
+            match (reply.result, reply.error) {
+                (_, Some(error)) => Err(error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or_else(|| error.to_string(), str::to_owned)),
+                (result, None) => Ok(result.unwrap_or(serde_json::Value::Null)),
+            }
+        });
+        match listener {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                tracing::warn!(%error, "no se pudo abrir el socket MCP");
+                None
+            }
+        }
+    }
+
+    /// Environment that lets a child (agent or shell) reach this window's
+    /// MCP bridge.
+    fn mcp_environment(&self, tab_id: u64, workspace: &Path) -> Vec<(String, String)> {
+        let Some(bridge) = &self.mcp_bridge else {
+            return Vec::new();
+        };
+        vec![
+            (
+                "FORGE_GUI_SOCKET".to_owned(),
+                bridge.path().to_string_lossy().into_owned(),
+            ),
+            ("FORGE_AGENT_TAB".to_owned(), tab_id.to_string()),
+            (
+                "FORGE_WORKSPACE".to_owned(),
+                workspace.to_string_lossy().into_owned(),
+            ),
+        ]
+    }
+
+    /// `forge/list_open_files` for the MCP server.
+    fn mcp_list_open_files(&self) -> serde_json::Value {
+        let files: Vec<serde_json::Value> = self
+            .tabs
+            .iter()
+            .filter_map(Tab::editor)
+            .filter_map(|editor| {
+                let path = editor.path()?;
+                Some(serde_json::json!({
+                    "path": path,
+                    "dirty": editor.buffer.is_dirty(),
+                    "language": editor.syntax.as_ref().map(forge_syntax::SyntaxState::language_name),
+                    "lines": editor.buffer.len_lines(),
+                }))
+            })
+            .collect();
+        serde_json::json!({"files": files, "workspace": self.factory.cwd})
     }
 
     fn agent_prompt_context(&self) -> Vec<PromptContext> {
@@ -1267,12 +1441,17 @@ impl ForgeWindow {
         self.push_tab(TabContent::Terminal(Box::new(terminal)), cx);
         if self.factory.start_ipc {
             let cwd = cwd.unwrap_or_else(|| self.factory.cwd.clone());
-            spawn_ipc_worker(
-                self.factory.spec(cwd, attach, daemon_instance, profile),
-                id,
-                self.event_tx.clone(),
-                input_rx,
+            let mut spec = self
+                .factory
+                .spec(cwd.clone(), attach, daemon_instance, profile);
+            // Any agent run by hand in this shell can use Forge as its
+            // MCP server (`forge-gui mcp-server`); tab 0 = first agent tab.
+            spec.env.extend(
+                self.mcp_environment(0, &cwd)
+                    .into_iter()
+                    .filter(|(key, _)| key != "FORGE_AGENT_TAB"),
             );
+            spawn_ipc_worker(spec, id, self.event_tx.clone(), input_rx);
         }
         cx.notify();
         self.active_tab
@@ -1839,7 +2018,18 @@ impl ForgeWindow {
     ) {
         let Some(id) = message.id.clone() else { return };
         let params = message.params.as_ref().unwrap_or(&serde_json::Value::Null);
+        // A `forge mcp-server` started by hand carries no tab: its cards go
+        // to the first agent session.
+        let agent_id = if self.tab(agent_id).and_then(Tab::agent).is_some() {
+            agent_id
+        } else {
+            self.tabs
+                .iter()
+                .find(|tab| tab.agent().is_some())
+                .map_or(agent_id, |tab| tab.id)
+        };
         let result = match message.method.as_deref() {
+            Some("forge/list_open_files") => Ok(self.mcp_list_open_files()),
             Some("session/request_permission") => {
                 self.acp_request_permission(agent_id, id, params, response, cx);
                 return;
@@ -2773,7 +2963,7 @@ impl ForgeWindow {
                     return;
                 }
                 if class.is_some() {
-                    agent.prompt = rest.to_owned();
+                    rest.clone_into(&mut agent.prompt);
                 }
                 let _ = agent.submit_prompt();
             }
@@ -3221,6 +3411,7 @@ impl ForgeWindow {
                 ShellCommand::NewTerminalTab,
                 ShellCommand::SplitVertical,
                 ShellCommand::SplitHorizontal,
+                ShellCommand::AgentInvestigate,
                 ShellCommand::RenameTab,
             ]
         };

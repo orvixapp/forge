@@ -360,13 +360,13 @@ pub struct ShellKeymap {
 impl Default for ShellKeymap {
     fn default() -> Self {
         use ShellCommand::{
-            CloseWindow, CycleTheme, EditorAddCursorAbove, EditorAddCursorBelow, EditorCopy,
-            EditorCut, EditorFind, EditorPaste, EditorRedo, EditorReplace, EditorSelectAll,
-            EditorSelectNextMatch, EditorUndo, FocusNextPane, FocusPreviousPane, MoveTabLeft,
-            MoveTabRight, NewAgentSession, NewFile, NewTerminalTab, NextPrompt, OpenFile, AgentAsk, AgentInvestigate,
-            OpenProjectFile, PreviousPrompt, RenameTab, SaveFile, SearchNext, SearchPrevious,
-            SearchProject, SearchScrollback, ShowCommandPalette, ShowContextMenu, SplitHorizontal,
-            SplitVertical, ToggleWordWrap, ZoomIn, ZoomOut, ZoomPane, ZoomReset,
+            AgentAsk, AgentInvestigate, CloseWindow, CycleTheme, EditorAddCursorAbove,
+            EditorAddCursorBelow, EditorCopy, EditorCut, EditorFind, EditorPaste, EditorRedo,
+            EditorReplace, EditorSelectAll, EditorSelectNextMatch, EditorUndo, FocusNextPane,
+            FocusPreviousPane, MoveTabLeft, MoveTabRight, NewAgentSession, NewFile, NewTerminalTab,
+            NextPrompt, OpenFile, OpenProjectFile, PreviousPrompt, RenameTab, SaveFile, SearchNext,
+            SearchPrevious, SearchProject, SearchScrollback, ShowCommandPalette, ShowContextMenu,
+            SplitHorizontal, SplitVertical, ToggleWordWrap, ZoomIn, ZoomOut, ZoomPane, ZoomReset,
         };
         use ShellContext::{Editor, Terminal, Window};
         Self {

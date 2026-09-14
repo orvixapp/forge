@@ -64,17 +64,51 @@ Pruebas manuales de las entregas ya utilizables: [`PHASE_4_TESTING.md`](PHASE_4_
   sobre ediciones concurrentes (§17.5) aplicadas como `forge-buffer::Transaction`.
 
 ## 4.5 — Proveedores, router y acciones contextuales
-- [ ] Perfiles de proveedor inyectados a Codex/OpenCode/Claude Code y
+- [x] Perfiles de proveedor inyectados a Codex/OpenCode/Claude Code y
   router por clase de tarea con ruta visible y reenvío (§17.7).
-- [ ] `agent.ask` (`Ctrl+K`) sobre la selección y `agent.investigate`
-  desde un comando fallido en la terminal (§17.8).
+  - `[[providers]]` (`kind` openai/anthropic/google/openai-compatible,
+    `model`, `base_url`, `api_key_env`, `free`) → variables de entorno del
+    adaptador (`OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`, `FORGE_PROVIDER*`,
+    `FORGE_TASK_CLASS`); la clave se lee del entorno, nunca se guarda.
+  - `[router]` `trivial|normal|deep` → proveedor; `agents[].provider` como
+    respaldo; sin proveedor el adaptador conserva su propio login.
+  - Ruta visible en el panel («Ruta: normal → gpt: gpt-5 · worktree …»);
+    prefijos `/trivial|/normal|/deep` en el prompt; si otro proveedor
+    atiende la clase se abre una sesión nueva y ambas lo indican;
+    `agent.forward` reenvía el último prompt al proveedor elegido.
+- [x] `agent.ask` (`Ctrl+K`) sobre la selección y `agent.investigate`
+  (`Ctrl+Shift+I` y menú contextual de la terminal) desde el último comando,
+  delimitado por las marcas OSC 133 del grid visible, con salida y cwd.
 
 ## 4.6 — MCP y cierre
-- [ ] Cliente MCP (config + passthrough) y `forge mcp-server` con las
+- [x] Cliente MCP (config + passthrough) y `forge mcp-server` con las
   tools iniciales (§18); worktree por sesión.
-- [ ] Benchmarks: overhead por `session/update` ≤ 0,2 ms; 10k tokens/min
-  sin frames perdidos; 4 sesiones paralelas sin degradar el tecleo.
+  - `[[mcp_servers]]` → `session/new.mcpServers` (`{name, command, args,
+    env:[{name,value}]}`); el agente conecta directamente, Forge no proxya.
+  - `crates/forge-mcp`: `forge-gui mcp-server` (stdio, JSON-RPC por
+    líneas, `initialize`/`tools/list`/`tools/call`/`resources/*`) y puente
+    por socket Unix (`FORGE_GUI_SOCKET`, `FORGE_AGENT_TAB`,
+    `FORGE_WORKSPACE`) hacia la ventana, reutilizando los handlers ACP
+    (`fs/*`, `session/request_permission`). Tools: `forge_list_open_files`,
+    `forge_read_buffer`, `forge_git_status`, `forge_run_in_terminal` (con
+    tarjeta de permiso), `forge_propose_edit` (overlay §17.5); recursos
+    `forge://buffer/<path>`. Los nombres usan `_` porque MCP restringe los
+    nombres a `[A-Za-z0-9_-]`. Forge se añade como primer servidor de cada
+    sesión y exporta el socket a las terminales.
+  - `agents[].worktree = true`: `git worktree add -b forge/<agente>-<ts>
+    <config>/worktrees/<agente>-<ts> HEAD`; la sesión, sus `fs/*`, MCP y
+    terminales usan ese directorio.
+  - Pendiente: `forge/diagnostics` y `forge/workspace_symbols` (requieren
+    LSP, fase 5); endpoint HTTP local con token; MCP Streamable HTTP como
+    cliente.
+- [x] Benchmarks (`bench/results/2026-09-14-agent.md`): `agent_update_overhead`
+  p95 0,001 ms (≤ 0,2); `agent_stream` p95 2,4 ms por frame a 10k
+  tokens/min (sin frames > 16,6 ms); `agent_parallel_typing` 3,5 ms
+  mediana / 4,8 ms p95 frente a `editor_typing` 3,4 / 4,5 ms en la misma
+  máquina y momento (dentro del ruido; ambos por encima del umbral de 3 ms
+  con la máquina cargada, como ya se anotó en Fase 3).
 - [ ] Aceptación (§29): flujo completo «pedir cambio → ver diff → aceptar
   por hunk → tests en terminal creada por el agente» con los 4 agentes;
   Codex con login de ChatGPT sin configuración extra; tarea `trivial`
-  atendida por un proveedor `free`.
+  atendida por un proveedor `free`. Guion en `PHASE_4_TESTING.md`; requiere
+  ejecutar los agentes reales (validación manual del usuario).

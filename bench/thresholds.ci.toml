@@ -33,3 +33,12 @@ p95_ms = 100.0
 
 [search_project_literal]
 p95_ms = 4000.0
+
+[agent_update_overhead]
+p95_ms = 2.0
+
+[agent_stream]
+p95_ms = 60.0
+
+[agent_parallel_typing]
+p95_ms = 30.0

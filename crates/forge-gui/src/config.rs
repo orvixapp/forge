@@ -80,7 +80,7 @@ pub struct ProviderConfig {
     /// OpenAI-compatible or custom endpoint; empty keeps the default.
     pub base_url: String,
     /// Environment variable holding the API key; empty relies on the
-    /// agent's own login (Codex with the ChatGPT subscription, Claude Code
+    /// agent's own login (Codex with the `ChatGPT` subscription, Claude Code
     /// with `claude login`).
     pub api_key_env: String,
     /// Whether requests are free of charge (local models, free tiers);
@@ -97,7 +97,7 @@ pub enum ProviderKind {
     Openai,
     Anthropic,
     Google,
-    /// Any server speaking the OpenAI API (Ollama, LM Studio, vLLM…).
+    /// Any server speaking the `OpenAI` API (Ollama, LM Studio, vLLM…).
     OpenaiCompatible,
 }
 
@@ -824,7 +824,10 @@ mod tests {
         let env = provider.environment();
         assert!(env.contains(&("OPENAI_BASE_URL".into(), "http://localhost:11434/v1".into())));
         assert!(env.contains(&("OPENAI_MODEL".into(), "qwen".into())));
-        assert!(!env.iter().any(|(k, _)| k == "OPENAI_API_KEY"), "no key env, no key");
+        assert!(
+            !env.iter().any(|(k, _)| k == "OPENAI_API_KEY"),
+            "no key env, no key"
+        );
         assert_eq!(provider.describe(), "local: openai-compatible:qwen (free)");
     }
 

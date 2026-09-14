@@ -11,6 +11,7 @@ members = [
     "crates/forge-project",
     "crates/forge-search",
     "crates/forge-git",
+    "crates/forge-mcp",
     "crates/forge-gui",
 ]
 resolver = "3"

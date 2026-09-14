@@ -182,6 +182,67 @@ memory-mapped and read-only (`editor.materialize` loads them for editing).
 `editor.autosave_ms` saves dirty files after a quiet period; `editor.modal`
 enables a small Helix-like Normal/Insert keymap.
 
+Agents (ACP): `Ctrl+Shift+A` opens a session with the first enabled
+`[[agents]]` entry (see `docs/PHASE_4_TESTING.md` for OpenCode, Codex and
+Claude Code). Providers and routing:
+
+```toml
+[[providers]]
+name = "free-local"
+kind = "openai-compatible"      # openai | anthropic | google | openai-compatible
+model = "qwen2.5-coder"
+base_url = "http://localhost:11434/v1"
+free = true
+
+[[providers]]
+name = "gpt"
+kind = "openai"
+model = "gpt-5"
+api_key_env = "OPENAI_API_KEY"  # the key is read from the environment, never stored
+
+[router]
+trivial = "free-local"          # task class → provider name
+normal = "gpt"
+deep = "gpt"
+default_class = "normal"
+
+[[agents]]
+name = "opencode"
+command = "opencode"
+args = ["acp"]
+provider = "gpt"                # used when the router has nothing for the class
+worktree = true                 # each session works in its own git worktree
+
+[[mcp_servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+```
+
+A provider is injected into the adapter as environment (`OPENAI_API_KEY`,
+`OPENAI_BASE_URL`, `OPENAI_MODEL`, `ANTHROPIC_*`, `GEMINI_*`, plus
+`FORGE_PROVIDER*`/`FORGE_TASK_CLASS`), so Codex, OpenCode and Claude Code
+pick it up without extra flags; with no provider the adapter keeps its own
+login (Codex with ChatGPT). The panel shows the route (`normal → gpt:
+gpt-5`). Starting a prompt with `/trivial`, `/normal` or `/deep` picks the
+class: if another provider serves it, the prompt goes to a new session and
+both panels say so. `agent.forward` re-sends the last prompt through a
+provider you pick. `Ctrl+K` in the editor (`agent.ask`) asks about the
+selection; `Ctrl+Shift+I` in a terminal (`agent.investigate`, also in the
+context menu) hands the last command, its output (from the OSC 133 marks)
+and the cwd to an agent. With `worktree = true` the session runs in
+`<config dir>/worktrees/<agent>-<time>` on branch `forge/<agent>-<time>`.
+
+MCP: the entries in `[[mcp_servers]]` are passed to the agent in
+`session/new.mcpServers` (the agent connects to them; Forge does not proxy),
+and Forge itself is always the first server: `forge-gui mcp-server` speaks
+MCP over stdio and reaches the running window through the Unix socket in
+`FORGE_GUI_SOCKET` (also exported to every Forge terminal, so an agent run
+by hand can use it). Tools: `forge_list_open_files`, `forge_read_buffer`
+(unsaved content included), `forge_git_status`, `forge_run_in_terminal`
+(asks in the agent panel before running) and `forge_propose_edit` (goes to
+the hunk review, nothing is written); resources `forge://buffer/<path>`.
+
 Diagnostics: `FORGE_LOG=debug` prints tracing/GPUI logs; `FORGE_TRACE_FILE=trace.json`
 writes a Chrome trace of the startup spans that Perfetto can open.
 

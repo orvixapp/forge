@@ -186,6 +186,141 @@ pub fn spawn_typing_benchmark(iterations: usize, window: WindowHandle<ForgeWindo
     );
 }
 
+/// One streamed chunk of `tokens` pseudo-tokens (≈ 4 characters each).
+#[must_use]
+pub fn synthetic_agent_chunk(sequence: usize, tokens: usize) -> serde_json::Value {
+    const WORDS: [&str; 8] = [
+        "let ", "value ", "= ", "compute(", "input, ", "42); ", "// ", "ok\n",
+    ];
+    let text: String = (0..tokens)
+        .map(|token| WORDS[(sequence + token) % WORDS.len()])
+        .collect();
+    serde_json::json!({
+        "sessionUpdate": "agent_message_chunk",
+        "content": {"type": "text", "text": text},
+    })
+}
+
+/// Tokens per frame at the §29 rate (10k tokens/min at 60 Hz ≈ 2.8);
+/// rounded up so the benchmark streams slightly faster than the target.
+const TOKENS_PER_FRAME: usize = 3;
+
+/// Cost of one `session/update` on the UI thread, without rendering: an
+/// agent tab receives `iterations` chunks (every 25th one a tool-call
+/// update) and each `handle_agent_event` is timed on its own.
+pub fn spawn_agent_updates_benchmark(
+    iterations: usize,
+    window: WindowHandle<ForgeWindow>,
+    cx: &mut App,
+) {
+    cx.spawn(async move |cx| {
+        Timer::after(Duration::from_secs(1)).await;
+        let samples = window.update(cx, |view, _, cx| {
+            let tab = view.open_offline_agent_tab("bench", cx);
+            let mut samples_ms = Vec::with_capacity(iterations);
+            for sequence in 0..iterations {
+                let update = if sequence % 25 == 24 {
+                    serde_json::json!({
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": format!("call-{}", sequence / 25),
+                        "title": "cargo test",
+                        "status": if sequence % 50 == 49 { "completed" } else { "in_progress" },
+                        "content": [{"type": "content", "content": {"type": "text", "text": "running…"}}],
+                    })
+                } else {
+                    synthetic_agent_chunk(sequence, 5)
+                };
+                let started = Instant::now();
+                view.feed_agent_update(tab, update);
+                samples_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+            }
+            samples_ms
+        });
+        let Ok(samples_ms) = samples else { return };
+        emit_metrics(&GuiMetrics {
+            scenario: "agent_update_overhead",
+            elapsed_ms: samples_ms.iter().sum(),
+            samples_ms: Some(samples_ms),
+            frames: u64::try_from(iterations).unwrap_or(u64::MAX),
+            pss_kib: process_pss_kib(),
+            painted_cells: None,
+        });
+        let _ = cx.update(|cx| cx.quit());
+    })
+    .detach();
+}
+
+/// The visible agent panel receives 10k tokens/min for `iterations`
+/// frames; every sample is chunk → present, and a sample above one 60 Hz
+/// frame is a dropped frame.
+pub fn spawn_agent_stream_benchmark(
+    iterations: usize,
+    window: WindowHandle<ForgeWindow>,
+    cx: &mut App,
+) {
+    let Ok(tab) = window.update(cx, |view, _, cx| view.open_offline_agent_tab("stream", cx)) else {
+        return;
+    };
+    spawn_frame_benchmark(
+        "agent_stream",
+        iterations,
+        window,
+        move |view, frame| {
+            view.feed_agent_update(tab, synthetic_agent_chunk(frame, TOKENS_PER_FRAME));
+        },
+        cx,
+    );
+}
+
+/// Four background agent sessions stream at 10k tokens/min each while the
+/// user types in the editor (the caller opened the typing file last, so it
+/// is the active tab); samples are keystroke → present, comparable with
+/// `editor_typing`.
+pub fn spawn_agent_parallel_benchmark(
+    iterations: usize,
+    window: WindowHandle<ForgeWindow>,
+    cx: &mut App,
+) {
+    const TYPED: &str = "let value = compute(input, 42);\n";
+    let Ok(tabs) = window.update(cx, |view, _, cx| {
+        (0..4)
+            .map(|index| view.open_offline_agent_tab(&format!("agent-{index}"), cx))
+            .collect::<Vec<_>>()
+    }) else {
+        return;
+    };
+    let path = std::env::temp_dir().join("forge-bench-parallel.rs");
+    std::fs::write(&path, synthetic_rust_source(10_000)).expect("write the synthetic source");
+    if window
+        .update(cx, |view, _, cx| {
+            view.open_file(&path, Some(5_000), Some(5), cx);
+        })
+        .is_err()
+    {
+        return;
+    }
+    spawn_frame_benchmark(
+        "agent_parallel_typing",
+        iterations,
+        window,
+        move |view, frame| {
+            for (index, tab) in tabs.iter().enumerate() {
+                view.feed_agent_update(
+                    *tab,
+                    synthetic_agent_chunk(frame + index, TOKENS_PER_FRAME),
+                );
+            }
+            let text = TYPED
+                .chars()
+                .nth((frame - 1) % TYPED.chars().count())
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            view.editor_type(&text);
+        },
+        cx,
+    );
+}
+
 /// A synthetic Rust file of `lines` lines for the typing benchmark.
 #[must_use]
 pub fn synthetic_rust_source(lines: usize) -> String {

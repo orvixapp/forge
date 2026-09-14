@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 forge-buffer = { path = "../forge-buffer" }
 forge-git = { path = "../forge-git" }
+forge-mcp = { path = "../forge-mcp" }
 forge-project = { path = "../forge-project" }
 forge-search = { path = "../forge-search" }
 forge-syntax = { path = "../forge-syntax" }

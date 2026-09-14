@@ -59,7 +59,10 @@ fn prepare_startup(options: &RunOptions) -> Startup {
     let _span = tracing::info_span!("startup").entered();
     let benchmark = options.benchmark_grid_frames.is_some()
         || options.benchmark_panes.is_some()
-        || options.benchmark_typing.is_some();
+        || options.benchmark_typing.is_some()
+        || options.benchmark_agent_updates.is_some()
+        || options.benchmark_agent_stream.is_some()
+        || options.benchmark_agent_parallel.is_some();
     let headless =
         benchmark || options.benchmark_idle_ms.is_some() || options.exit_after_first_frame;
     // Benchmarks stay comparable across machines by ignoring user config.
@@ -102,6 +105,15 @@ fn prepare_startup(options: &RunOptions) -> Startup {
 
 fn main() {
     let started = Instant::now();
+    // `forge-gui mcp-server`: Forge as an MCP server over stdio for the
+    // agent that spawned us (ARCHITECTURE.md §18). No window, no GPUI.
+    if std::env::args().nth(1).as_deref() == Some("mcp-server") {
+        if let Err(error) = forge_mcp::serve_stdio(forge_mcp::ServerConfig::from_env()) {
+            eprintln!("forge mcp-server: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let options = run_options();
     if options.print_config_schema {
         println!("{}", Config::json_schema());
@@ -220,6 +232,15 @@ fn spawn_benchmarks(
             .expect("open the benchmark file");
         spawn_typing_benchmark(keystrokes, window, cx);
     }
+    if let Some(updates) = options.benchmark_agent_updates {
+        bench::spawn_agent_updates_benchmark(updates, window, cx);
+    }
+    if let Some(frames) = options.benchmark_agent_stream {
+        bench::spawn_agent_stream_benchmark(frames, window, cx);
+    }
+    if let Some(keystrokes) = options.benchmark_agent_parallel {
+        bench::spawn_agent_parallel_benchmark(keystrokes, window, cx);
+    }
 }
 
 /// `FORGE_LOG` filters `tracing` output on stderr; `FORGE_TRACE_FILE` writes
@@ -302,6 +323,12 @@ struct RunOptions {
     benchmark_frames: usize,
     /// Keystrokes to type into a synthetic 10k-line Rust file.
     benchmark_typing: Option<usize>,
+    /// `session/update`s to apply to an offline agent tab (UI-thread cost).
+    benchmark_agent_updates: Option<usize>,
+    /// Frames of 10k tokens/min streaming into the visible agent panel.
+    benchmark_agent_stream: Option<usize>,
+    /// Keystrokes typed while four agent sessions stream in the background.
+    benchmark_agent_parallel: Option<usize>,
     /// Files to open in editor tabs, as `path` or `path:line[:col]`.
     files: Vec<String>,
 }
@@ -318,6 +345,9 @@ fn run_options() -> RunOptions {
         benchmark_panes: None,
         benchmark_frames: 120,
         benchmark_typing: None,
+        benchmark_agent_updates: None,
+        benchmark_agent_stream: None,
+        benchmark_agent_parallel: None,
         files: Vec::new(),
     };
     while let Some(arg) = args.next() {
@@ -341,6 +371,15 @@ fn run_options() -> RunOptions {
             }
             "--benchmark-typing" => {
                 options.benchmark_typing = args.next().and_then(|value| value.parse().ok());
+            }
+            "--benchmark-agent-updates" => {
+                options.benchmark_agent_updates = args.next().and_then(|value| value.parse().ok());
+            }
+            "--benchmark-agent-stream" => {
+                options.benchmark_agent_stream = args.next().and_then(|value| value.parse().ok());
+            }
+            "--benchmark-agent-parallel" => {
+                options.benchmark_agent_parallel = args.next().and_then(|value| value.parse().ok());
             }
             "--benchmark-frames" => {
                 if let Some(frames) = args.next().and_then(|value| value.parse().ok()) {

@@ -53,11 +53,29 @@ async fn main() -> Result<()> {
             1,
             &["--benchmark-typing", &options.iterations.to_string()],
         )?,
+        "agent_update_overhead" => gui_scenario(
+            "agent_update_overhead",
+            1,
+            &["--benchmark-agent-updates", &options.iterations.to_string()],
+        )?,
+        "agent_stream" => gui_scenario(
+            "agent_stream",
+            1,
+            &["--benchmark-agent-stream", &options.iterations.to_string()],
+        )?,
+        "agent_parallel_typing" => gui_scenario(
+            "agent_parallel_typing",
+            1,
+            &[
+                "--benchmark-agent-parallel",
+                &options.iterations.to_string(),
+            ],
+        )?,
         "open_large_log" => editor::open_large_log(options.iterations)?,
         "fuzzy_1m_paths" => editor::fuzzy_1m_paths(options.iterations),
         "search_project_literal" => editor::search_project_literal(options.iterations)?,
         _ => bail!(
-            "unknown scenario {scenario}; use ipc_round_trip, startup_empty, idle, grid_full, panes_20, key_echo, flood_input, termd_idle, editor_typing, open_large_log, fuzzy_1m_paths, or search_project_literal"
+            "unknown scenario {scenario}; use ipc_round_trip, startup_empty, idle, grid_full, panes_20, key_echo, flood_input, termd_idle, editor_typing, open_large_log, fuzzy_1m_paths, search_project_literal, agent_update_overhead, agent_stream, or agent_parallel_typing"
         ),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);

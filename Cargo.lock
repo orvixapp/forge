@@ -1944,6 +1944,7 @@ dependencies = [
  "anyhow",
  "forge-buffer",
  "forge-git",
+ "forge-mcp",
  "forge-project",
  "forge-search",
  "forge-syntax",
@@ -1959,6 +1960,14 @@ dependencies = [
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "forge-mcp"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

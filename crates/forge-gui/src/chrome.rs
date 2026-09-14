@@ -625,6 +625,16 @@ fn agent_panel(
                     agent.session_id.as_deref().unwrap_or("sin id")
                 )),
         )
+        .when(!agent.route.is_empty(), |panel| {
+            // Route: task class → provider (and worktree). `/trivial`,
+            // `/normal` or `/deep` at the start of a prompt re-route it.
+            panel.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(color(theme.muted))
+                    .child(format!("Ruta: {}", agent.route)),
+            )
+        })
         .when(!agent.context.is_empty(), |panel| {
             panel.child(div().flex().gap(px(6.0)).overflow_hidden().children(
                 agent.context.iter().map(|context| {

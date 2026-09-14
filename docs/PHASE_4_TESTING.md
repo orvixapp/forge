@@ -87,3 +87,73 @@ El registro oficial incluye, entre otros, Codex, Claude Agent, Gemini CLI y
 OpenCode. Forge detecta ejecutables ya instalados en `PATH`; no descarga agentes
 automáticamente. También se puede declarar cualquier adaptador explícitamente
 con `[[agents]]`, indicando su comando ACP y sus argumentos.
+
+## Proveedores, router y reenvío (4.5)
+
+1. Declara dos proveedores y un router en `~/.config/forge/config.toml`
+   (ejemplo en el README: uno `free = true` para `trivial`, otro para
+   `normal`/`deep`) y exporta la clave que nombra `api_key_env`.
+2. `Ctrl+Shift+A`: el panel muestra «Ruta: normal → <proveedor>: <modelo>».
+   En el adaptador (`opencode acp` con `FORGE_LOG=debug`) deben verse
+   `OPENAI_BASE_URL`/`OPENAI_MODEL` (o `ANTHROPIC_*`/`GEMINI_*`) del
+   proveedor; sin `[router]` ni `agents[].provider` no se inyecta nada y el
+   agente usa su login (Codex con ChatGPT).
+3. Escribe `/trivial resume este archivo` y Enter: se abre una sesión nueva
+   con la ruta `trivial → <proveedor free>` y el prompt ya enviado; la
+   sesión original registra «Reenviado a …». Con `/normal` en una sesión
+   que ya usa ese proveedor el prompt se envía en la misma sesión sin el
+   prefijo.
+4. Paleta → «Forward the last prompt to another provider…» (`agent.forward`):
+   elige un proveedor y comprueba la nueva sesión.
+5. `agents[].worktree = true`: la ruta termina en «· worktree
+   <config>/worktrees/<agente>-<ts>» y `git worktree list` en el repo lo
+   muestra con la rama `forge/<agente>-<ts>`; los archivos que el agente
+   propone se resuelven contra ese directorio. Sin git en el cwd aparece
+   un aviso y la sesión usa el directorio actual.
+
+## `agent.ask` y `agent.investigate`
+
+1. En un editor selecciona unas líneas y pulsa `Ctrl+K`: aparece el
+   cuadro «Pregunta al agente sobre <archivo>»; escribe la pregunta (admite
+   prefijo `/deep`) y Enter. La sesión nueva lleva la selección como chip
+   de contexto y el prompt ya enviado. Sin archivo abierto avisa.
+2. En una terminal ejecuta un comando que falle (`cargo build` con un error,
+   `ls /nope`) y pulsa `Ctrl+Shift+I` (o botón derecho → «Investigate the
+   last failed command…»). El prompt contiene el directorio y el comando;
+   el chip `terminal://<sesión>` lleva la salida entre la última marca de
+   prompt y el cursor. Sin integración de shell avisa y envía la pantalla
+   visible.
+
+## MCP (4.6)
+
+1. Con Forge abierto, en una terminal de Forge: `echo $FORGE_GUI_SOCKET`
+   apunta a `$XDG_RUNTIME_DIR/forge-gui-<pid>.sock`.
+2. Servidor a mano: `printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"forge_list_open_files"}}' | forge-gui mcp-server`
+   responde `protocolVersion`, las cinco tools y los archivos abiertos
+   (con `dirty` verdadero si tienen cambios sin guardar).
+3. `forge_read_buffer` de un archivo abierto con cambios sin guardar
+   devuelve el texto vivo, no el del disco.
+4. `forge_run_in_terminal` con `{"command":"echo hola"}`: aparece una
+   tarjeta de permiso en la sesión de agente (la primera si el servidor se
+   lanzó a mano); «Permitir» devuelve `exit: 0` y la salida; «Rechazar»
+   devuelve `isError`. Sin sesión de agente abierta responde error, no
+   se ejecuta nada.
+5. `forge_propose_edit` sobre un archivo abierto crea la propuesta en el
+   panel del agente para revisar por hunk; el archivo no cambia hasta
+   aceptar.
+6. Con un agente ACP: en `session/new` (log del adaptador) `mcpServers`
+   lleva `forge` primero y después los `[[mcp_servers]]` de la config; el
+   agente lista las tools `forge_*` (`/mcp` en Claude Code, `mcp list` en
+   OpenCode).
+
+## Benchmarks (4.6)
+
+```bash
+cargo build --release -p forge-gui -p forge-bench
+cargo run --release -p forge-bench -- agent_update_overhead --iterations 5000 --check
+cargo run --release -p forge-bench -- agent_stream --iterations 300 --check
+cargo run --release -p forge-bench -- agent_parallel_typing --iterations 300 --check
+cargo run --release -p forge-bench -- editor_typing --iterations 300   # referencia
+```
+
+Resultados de referencia en `bench/results/2026-09-14-agent.md`.
