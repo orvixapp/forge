@@ -54,7 +54,15 @@ sin snippets, sin emulación Vim completa.
   borra, `Ctrl+L` selecciona la línea, `Ctrl+Delete`, línea actual
   resaltada, rueda de 3 líneas; el clic sólo alcanza paneles visibles
   (antes un panel oculto con bounds viejos «robaba» el clic al editor).
-- [ ] Wrap opcional y scroll horizontal.
+- [x] Scroll horizontal (rueda horizontal o `Shift`+rueda, sigue al
+  cursor con margen) y wrap por palabras con indentación heredada
+  (`Alt+Z` por editor o `editor.word_wrap`); el pintado, el hit-testing
+  del ratón y el seguimiento del cursor trabajan sobre «filas visuales».
+- [x] Minimapa (`editor.minimap`, `editor.toggleMinimap`): 2 px por línea,
+  colores de tokens con una consulta gruesa refrescada ≤ 1/s, slider de la
+  zona visible con clic y arrastre.
+- [x] Menú contextual con el botón derecho (o `Shift+F10`/tecla Menú) en
+  editores y terminales, con los comandos y sus atajos; teclado ↑↓/Enter.
 - [ ] «Recuperar N archivos» al arrancar para archivos que no se vuelven a
   abrir (hoy sólo al abrirlos).
 

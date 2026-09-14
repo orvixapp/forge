@@ -75,6 +75,9 @@ pub fn render_window(
         .when(view.finder.is_some(), |root| {
             root.child(finder_overlay(view))
         })
+        .when_some(view.context_menu.as_ref(), |root, menu| {
+            root.child(context_menu(view, menu, cx))
+        })
         .when_some(view.confirmation.as_ref(), |root, confirmation| {
             root.child(confirmation_dialog(view, confirmation))
         })
@@ -588,6 +591,52 @@ fn process_explorer(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> impl I
             div()
                 .mt(px(4.0))
                 .child(format!("{} · {size} · {}", tab.title(), tab.status()))
+        }))
+}
+
+/// Right-click menu at the pointer: command titles with their chords.
+fn context_menu(
+    view: &ForgeWindow,
+    menu: &crate::window::ContextMenu,
+    cx: &mut Context<ForgeWindow>,
+) -> impl IntoElement {
+    let theme = view.theme;
+    div()
+        .id("context-menu")
+        .absolute()
+        .left(menu.position.x)
+        .top(menu.position.y)
+        .w(px(260.0))
+        .py(px(4.0))
+        .rounded(px(6.0))
+        .bg(color(theme.chrome))
+        .border_1()
+        .border_color(color(theme.chrome_active_border))
+        .text_size(px(12.0))
+        .children(menu.items.iter().enumerate().map(|(index, command)| {
+            let selected = index == menu.index;
+            div()
+                .id(("context-menu-item", index))
+                .px(px(10.0))
+                .py(px(4.0))
+                .flex()
+                .justify_between()
+                .cursor_pointer()
+                .bg(color(if selected {
+                    theme.highlight
+                } else {
+                    theme.chrome
+                }))
+                .hover(move |style| style.bg(color(theme.highlight)))
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    view.context_menu_pick(index, window, cx);
+                }))
+                .child(command.title())
+                .child(
+                    div()
+                        .text_color(color(theme.muted))
+                        .child(view.keymap.chord_for(*command).unwrap_or_default()),
+                )
         }))
 }
 

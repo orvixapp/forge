@@ -58,10 +58,15 @@ pub enum ShellCommand {
     EditorFind,
     EditorReplace,
     EditorMaterialize,
+    ToggleWordWrap,
+    ToggleMinimap,
+    ShowContextMenu,
+    TerminalCopy,
+    TerminalPaste,
 }
 
 impl ShellCommand {
-    pub const ALL: [Self; 46] = [
+    pub const ALL: [Self; 51] = [
         Self::NewTerminalTab,
         Self::NewTerminalTabInDirectory,
         Self::CloseWindow,
@@ -108,6 +113,11 @@ impl ShellCommand {
         Self::EditorFind,
         Self::EditorReplace,
         Self::EditorMaterialize,
+        Self::ToggleWordWrap,
+        Self::ToggleMinimap,
+        Self::ShowContextMenu,
+        Self::TerminalCopy,
+        Self::TerminalPaste,
     ];
 
     #[must_use]
@@ -159,6 +169,11 @@ impl ShellCommand {
             Self::EditorFind => "editor.find",
             Self::EditorReplace => "editor.replace",
             Self::EditorMaterialize => "editor.materialize",
+            Self::ToggleWordWrap => "editor.toggleWordWrap",
+            Self::ToggleMinimap => "editor.toggleMinimap",
+            Self::ShowContextMenu => "view.contextMenu",
+            Self::TerminalCopy => "terminal.copy",
+            Self::TerminalPaste => "terminal.paste",
         }
     }
 
@@ -211,6 +226,11 @@ impl ShellCommand {
             Self::EditorFind => "Find in file",
             Self::EditorReplace => "Find and replace in file",
             Self::EditorMaterialize => "Load large file into memory for editing",
+            Self::ToggleWordWrap => "Toggle word wrap",
+            Self::ToggleMinimap => "Toggle minimap",
+            Self::ShowContextMenu => "Show context menu",
+            Self::TerminalCopy => "Copy selection",
+            Self::TerminalPaste => "Paste clipboard",
         }
     }
 
@@ -321,8 +341,8 @@ impl Default for ShellKeymap {
             EditorSelectNextMatch, EditorUndo, FocusNextPane, FocusPreviousPane, MoveTabLeft,
             MoveTabRight, NewFile, NewTerminalTab, NextPrompt, OpenFile, OpenProjectFile,
             PreviousPrompt, RenameTab, SaveFile, SearchNext, SearchPrevious, SearchProject,
-            SearchScrollback, ShowCommandPalette, SplitHorizontal, SplitVertical, ZoomIn, ZoomOut,
-            ZoomPane, ZoomReset,
+            SearchScrollback, ShowCommandPalette, ShowContextMenu, SplitHorizontal, SplitVertical,
+            ToggleWordWrap, ZoomIn, ZoomOut, ZoomPane, ZoomReset,
         };
         use ShellContext::{Editor, Terminal, Window};
         Self {
@@ -347,6 +367,9 @@ impl Default for ShellKeymap {
                 binding("h", true, false, false, Editor, EditorReplace),
                 binding("up", true, true, false, Editor, EditorAddCursorAbove),
                 binding("down", true, true, false, Editor, EditorAddCursorBelow),
+                binding("z", false, true, false, Editor, ToggleWordWrap),
+                binding("f10", false, false, true, Window, ShowContextMenu),
+                binding("contextmenu", false, false, false, Window, ShowContextMenu),
                 binding("p", true, false, true, Window, ShowCommandPalette),
                 binding("w", true, false, false, Window, CloseWindow),
                 binding("\\", true, false, false, Window, SplitVertical),

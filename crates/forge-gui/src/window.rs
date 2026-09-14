@@ -20,6 +20,7 @@ use forge_gui::{
     },
     theme::{self, ThemeColors},
 };
+use gpui::point;
 use gpui::{
     App, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle, KeyDownEvent, Modifiers,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point,
@@ -327,6 +328,14 @@ pub struct PaletteState {
     pub index: usize,
 }
 
+/// Right-click menu: commands listed at the pointer, run on click or
+/// Enter; any other click, or Esc, dismisses it.
+pub struct ContextMenu {
+    pub position: Point<Pixels>,
+    pub items: Vec<ShellCommand>,
+    pub index: usize,
+}
+
 /// Single-line text prompt inside the window (tab rename).
 pub struct TextPrompt {
     pub title: String,
@@ -359,6 +368,9 @@ pub struct ForgeWindow {
     pub project: ProjectState,
     pub find: EditorFind,
     pub confirmation: Option<Confirmation>,
+    pub context_menu: Option<ContextMenu>,
+    /// `editor.toggleMinimap` for this window; `None` follows the config.
+    pub minimap_override: Option<bool>,
     pub rename: Option<TextPrompt>,
     pub picker: Option<Picker>,
     /// Font zoom steps (each ±10 %) on top of `font.size`.
@@ -398,6 +410,8 @@ impl ForgeWindow {
             project: ProjectState::default(),
             find: EditorFind::default(),
             confirmation: None,
+            context_menu: None,
+            minimap_override: None,
             rename: None,
             picker: None,
             zoom: 0,
@@ -1442,7 +1456,9 @@ impl ForgeWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.confirmation.is_some() {
+        if self.context_menu.is_some() {
+            self.context_menu_key(key, window, cx);
+        } else if self.confirmation.is_some() {
             self.confirmation_key(key, cx);
         } else if self.rename.is_some() {
             self.rename_key(key, key_char, modifiers, cx);
@@ -1498,11 +1514,28 @@ impl ForgeWindow {
             ScrollDelta::Lines(delta) => delta.y,
             ScrollDelta::Pixels(delta) => f32::from(delta.y) / self.factory.metrics.height,
         };
-        if let Some(editor) = self.tabs[index].editor_mut() {
-            // Editors scroll three lines per notch, like VS Code.
+        if self.tabs[index].editor().is_some() {
+            // Editors scroll three lines per notch, like VS Code; a
+            // horizontal wheel (or Shift+wheel) pans long lines.
+            let horizontal = match event.delta {
+                ScrollDelta::Lines(delta) => delta.x * self.factory.metrics.width * 3.0,
+                ScrollDelta::Pixels(delta) => f32::from(delta.x),
+            };
+            if event.modifiers.shift || (horizontal.abs() > 0.0 && lines.abs() == 0.0) {
+                let delta = if event.modifiers.shift {
+                    lines * self.factory.metrics.width * 3.0
+                } else {
+                    horizontal
+                };
+                self.activate_tab(index, cx);
+                self.editor_scroll_x(-delta, cx);
+                return;
+            }
             #[allow(clippy::cast_possible_truncation)]
             let rows = (lines * 3.0).round() as isize;
-            if rows != 0 {
+            if rows != 0
+                && let Some(editor) = self.tabs[index].editor_mut()
+            {
                 editor.scroll_by(-rows);
                 cx.notify();
             }
@@ -1662,6 +1695,24 @@ impl ForgeWindow {
             ShellCommand::EditorFind => self.open_find(false, cx),
             ShellCommand::EditorReplace => self.open_find(true, cx),
             ShellCommand::EditorMaterialize => self.materialize_active(cx),
+            ShellCommand::ToggleWordWrap => self.toggle_word_wrap(cx),
+            ShellCommand::ToggleMinimap => self.toggle_minimap(cx),
+            ShellCommand::ShowContextMenu => {
+                let position = self
+                    .active_tab()
+                    .editor()
+                    .and_then(|_| self.editor_cursor_bounds(window))
+                    .map_or_else(
+                        || point(px(120.0), px(120.0)),
+                        |bounds| bounds.bottom_left(),
+                    );
+                self.open_context_menu(position, cx);
+            }
+            ShellCommand::TerminalCopy => self.copy_selection(cx),
+            ShellCommand::TerminalPaste => {
+                self.paste(cx.read_from_clipboard());
+                cx.notify();
+            }
             other => self.run_layout_command(other, cx),
         }
     }
@@ -1741,6 +1792,73 @@ impl ForgeWindow {
             NotificationLevel::Info,
             format!("Señal enviada: {signal:?}"),
         );
+    }
+
+    // ----- context menu ---------------------------------------------------
+
+    /// Opens the right-click menu for the active tab at `position`.
+    fn open_context_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let items = if self.active_tab().editor().is_some() {
+            vec![
+                ShellCommand::EditorCut,
+                ShellCommand::EditorCopy,
+                ShellCommand::EditorPaste,
+                ShellCommand::EditorSelectAll,
+                ShellCommand::EditorFind,
+                ShellCommand::EditorReplace,
+                ShellCommand::ToggleWordWrap,
+                ShellCommand::ToggleMinimap,
+                ShellCommand::SaveFile,
+            ]
+        } else {
+            vec![
+                ShellCommand::TerminalCopy,
+                ShellCommand::TerminalPaste,
+                ShellCommand::SearchScrollback,
+                ShellCommand::NewTerminalTab,
+                ShellCommand::SplitVertical,
+                ShellCommand::SplitHorizontal,
+                ShellCommand::RenameTab,
+            ]
+        };
+        self.context_menu = Some(ContextMenu {
+            position,
+            items,
+            index: 0,
+        });
+        cx.notify();
+    }
+
+    fn context_menu_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = &mut self.context_menu else {
+            return;
+        };
+        match key {
+            "escape" => self.context_menu = None,
+            "up" => menu.index = menu.index.saturating_sub(1),
+            "down" => menu.index = (menu.index + 1).min(menu.items.len().saturating_sub(1)),
+            "enter" => {
+                let command = menu.items.get(menu.index).copied();
+                self.context_menu = None;
+                if let Some(command) = command {
+                    self.run_shell_command(command, window, cx);
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// A menu row was clicked.
+    pub fn context_menu_pick(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let command = self
+            .context_menu
+            .take()
+            .and_then(|menu| menu.items.get(index).copied());
+        if let Some(command) = command {
+            self.run_shell_command(command, window, cx);
+        }
+        cx.notify();
     }
 
     // ----- confirmations: paste protection and OSC 52 ---------------------
@@ -1996,10 +2114,24 @@ impl ForgeWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.context_menu.take().is_some() {
+            cx.notify();
+            if event.button == MouseButton::Left {
+                // The click that dismissed the menu is not an edit click.
+                return;
+            }
+        }
         let Some(index) = self.pane_at(event.position) else {
             return;
         };
         self.activate_tab(index, cx);
+        let app_wants_mouse = self
+            .active_terminal()
+            .is_some_and(|tab| tab.app_wants_mouse(event.modifiers));
+        if event.button == MouseButton::Right && !app_wants_mouse {
+            self.open_context_menu(event.position, cx);
+            return;
+        }
         if self.active_tab().editor().is_some() {
             if event.button == MouseButton::Left {
                 self.editor_mouse_down(event, window, cx);

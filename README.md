@@ -156,7 +156,12 @@ and `Ctrl+]`/`Ctrl+[` indent lines, `Ctrl+/` toggles line comments,
 `Alt+↑/↓` moves lines, `Shift+Alt+↑/↓` duplicates them, `Ctrl+Shift+K`
 deletes them, `Ctrl+L` selects the line, `Ctrl+Delete`/`Ctrl+Backspace`
 delete words, the cursor's line is highlighted and the wheel scrolls three
-lines per notch. Unsaved buffers are journaled
+lines per notch. Long lines scroll horizontally (horizontal wheel or
+`Shift`+wheel; the view follows the cursor) or wrap at word boundaries with
+`Alt+Z` / `editor.word_wrap`; a minimap on the right (`editor.minimap`,
+`editor.toggleMinimap`) shows the file with the visible region as a slider
+you can click or drag; the right mouse button (or `Shift+F10`) opens a
+context menu with the usual commands in editors and terminals. Unsaved buffers are journaled
 under `<config dir>/journal/` and recovered on the next open. `[editor]`
 config: `tab_size`, `indent_with_tabs`, `line_numbers`. Syntax highlighting
 via tree-sitter for Rust, TOML, JSON, Bash, Python, JavaScript, Markdown and
@@ -197,3 +202,4 @@ writes a Chrome trace of the startup spans that Perfetto can open.
   ACP capability flow and benchmark history persistence. The Open VSX scanner
   is implemented; its first registry run remains an evidence-gathering task,
   not a claim of extension compatibility.
+

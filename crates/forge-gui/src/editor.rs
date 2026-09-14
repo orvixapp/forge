@@ -35,6 +35,7 @@ pub enum EditorMode {
 /// Space between the gutter text and the code, and around the gutter.
 const GUTTER_PADDING: f32 = 12.0;
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct EditorTab {
     pub buffer: Buffer,
     /// `None` for an untitled buffer.
@@ -62,7 +63,52 @@ pub struct EditorTab {
     pub extending: bool,
     /// When the buffer last changed, for autosave.
     pub last_edit: Instant,
+    /// `Alt+Z` toggles wrapping per editor; `None` follows the config.
+    pub word_wrap: Option<bool>,
+    /// Columns per visual row when wrapping, from the last paint.
+    wrap_columns: Option<usize>,
+    /// Tab width used by the last paint, for row maths outside painting.
+    tab_size: usize,
+    /// Horizontal scroll in pixels (no-wrap mode).
+    pub scroll_x: f32,
+    /// Bring the cursor's column into view on the next paint.
+    reveal_x: bool,
+    /// Minimap geometry from the last paint: bounds and its first line.
+    minimap_bounds: Option<Bounds<Pixels>>,
+    minimap_top: usize,
+    /// The mouse is dragging the minimap slider.
+    pub dragging_minimap: bool,
+    /// Coarse highlights for the minimap, refreshed at most twice a second.
+    minimap_cache: Option<MinimapCache>,
 }
+
+struct MinimapCache {
+    at: Instant,
+    version: u64,
+    lines: Range<usize>,
+    spans: Vec<Vec<Span>>,
+}
+
+/// One painted row: columns `cols` (chars of the line) of buffer `line`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VisualRow {
+    line: usize,
+    cols: Range<usize>,
+    /// First row of its line (gets the line number).
+    first: bool,
+    /// Last row of its line (owns the newline and the end-of-line cursor).
+    last: bool,
+    /// Display column the row starts at (continuations keep the indent).
+    start_column: usize,
+}
+
+/// Width of the minimap strip, and the smallest text area that keeps it.
+const MINIMAP_WIDTH: f32 = 90.0;
+const MINIMAP_MIN_TEXT_WIDTH: f32 = 320.0;
+/// Pixels per line in the minimap (1 px of ink, 1 px of gap).
+const MINIMAP_ROW: f32 = 2.0;
+const MINIMAP_REFRESH: Duration = Duration::from_millis(1000);
+const MINIMAP_MARGIN_LINES: usize = 40;
 
 /// Bracket and quote pairs closed automatically while typing.
 const AUTO_PAIRS: &[(char, char)] = &[('(', ')'), ('[', ']'), ('{', '}'), ('"', '"'), ('\'', '\'')];
@@ -98,6 +144,92 @@ impl EditorTab {
             mode: EditorMode::Insert,
             extending: false,
             last_edit: Instant::now(),
+            word_wrap: None,
+            wrap_columns: None,
+            tab_size: 4,
+            scroll_x: 0.0,
+            reveal_x: false,
+            minimap_bounds: None,
+            minimap_top: 0,
+            dragging_minimap: false,
+            minimap_cache: None,
+        }
+    }
+
+    /// Whether a window position is over the minimap strip.
+    pub fn on_minimap(&self, position: Point<Pixels>) -> bool {
+        self.minimap_bounds
+            .is_some_and(|bounds| bounds.contains(&position))
+    }
+
+    /// Scrolls so the minimap row under `y` sits in the middle of the view.
+    pub fn scroll_to_minimap(&mut self, y: Pixels) {
+        let Some(bounds) = self.minimap_bounds else {
+            return;
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let row = (f32::from(y - bounds.origin.y) / MINIMAP_ROW).max(0.0) as usize;
+        let line = self.minimap_top + row;
+        self.scroll_line = line
+            .saturating_sub(self.visible_rows / 2)
+            .min(self.total_lines().saturating_sub(1));
+    }
+
+    /// Visual rows starting at buffer line `first_line`, at most `max_rows`.
+    fn visual_rows(&self, first_line: usize, max_rows: usize, tab_size: usize) -> Vec<VisualRow> {
+        let mut rows = Vec::with_capacity(max_rows);
+        let total = self.total_lines();
+        let mut line = first_line;
+        while rows.len() < max_rows && line < total {
+            let text = self.buffer.line(line).unwrap_or_default();
+            match self.wrap_columns {
+                Some(columns) => {
+                    let indent = text
+                        .chars()
+                        .take_while(|c| *c == ' ' || *c == '\t')
+                        .count()
+                        .min(columns / 2);
+                    let pieces = wrap_line(&text, columns, indent, tab_size);
+                    let count = pieces.len();
+                    for (index, cols) in pieces.into_iter().enumerate() {
+                        if rows.len() == max_rows {
+                            break;
+                        }
+                        rows.push(VisualRow {
+                            line,
+                            cols,
+                            first: index == 0,
+                            last: index + 1 == count,
+                            start_column: if index == 0 { 0 } else { indent },
+                        });
+                    }
+                }
+                None => rows.push(VisualRow {
+                    line,
+                    cols: 0..text.chars().count(),
+                    first: true,
+                    last: true,
+                    start_column: 0,
+                }),
+            }
+            line += 1;
+        }
+        rows
+    }
+
+    /// Visual rows a buffer line occupies with the current wrap width.
+    fn rows_of_line(&self, line: usize, tab_size: usize) -> usize {
+        match self.wrap_columns {
+            Some(columns) => {
+                let text = self.buffer.line(line).unwrap_or_default();
+                let indent = text
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .count()
+                    .min(columns / 2);
+                wrap_line(&text, columns, indent, tab_size).len()
+            }
+            None => 1,
         }
     }
 
@@ -271,17 +403,40 @@ impl EditorTab {
             .is_some_and(|bounds| bounds.contains(&position))
     }
 
-    /// Keeps the primary cursor inside the visible rows.
+    /// Keeps the primary cursor inside the visible rows (and, without
+    /// wrapping, inside the visible columns on the next paint).
     pub fn follow_cursor(&mut self) {
         let line = self
             .buffer
             .position_of(self.buffer.selections().primary().head)
             .line;
         let rows = self.visible_rows.max(1);
+        self.reveal_x = true;
         if line < self.scroll_line {
             self.scroll_line = line;
-        } else if line >= self.scroll_line + rows {
-            self.scroll_line = line + 1 - rows;
+            return;
+        }
+        if self.wrap_columns.is_none() {
+            if line >= self.scroll_line + rows {
+                self.scroll_line = line + 1 - rows;
+            }
+            return;
+        }
+        // Wrapped: count visual rows from the top until the cursor's line
+        // (including all of its rows) fits.
+        let tab_size = self.tab_size;
+        loop {
+            let mut used = 0;
+            for candidate in self.scroll_line..=line {
+                used += self.rows_of_line(candidate, tab_size);
+                if used > rows {
+                    break;
+                }
+            }
+            if used <= rows || self.scroll_line >= line {
+                break;
+            }
+            self.scroll_line += 1;
         }
     }
 
@@ -347,9 +502,15 @@ impl EditorTab {
 /// char index (chars + 1 entries), so cursor x positions come from the
 /// shaped display text.
 fn display_line(text: &str, tab_size: usize) -> (String, Vec<usize>) {
+    display_line_from(text, tab_size, 0)
+}
+
+/// [`display_line`] for a slice that starts at display column `column`, so
+/// tab stops keep their positions on wrapped continuation rows.
+fn display_line_from(text: &str, tab_size: usize, column: usize) -> (String, Vec<usize>) {
     let mut display = String::with_capacity(text.len());
     let mut offsets = Vec::with_capacity(text.len() + 1);
-    let mut column = 0;
+    let mut column = column;
     for c in text.chars() {
         offsets.push(display.len());
         if c == '\t' {
@@ -363,6 +524,56 @@ fn display_line(text: &str, tab_size: usize) -> (String, Vec<usize>) {
     }
     offsets.push(display.len());
     (display, offsets)
+}
+
+/// Splits a line into char ranges that fit `columns` display columns,
+/// breaking after whitespace when possible (VS Code's `wordWrap`);
+/// continuation rows are indented by `indent` columns like the first.
+fn wrap_line(text: &str, columns: usize, indent: usize, tab_size: usize) -> Vec<Range<usize>> {
+    let columns = columns.max(4);
+    let chars: Vec<char> = text.chars().collect();
+    let mut rows = Vec::new();
+    if chars.is_empty() {
+        rows.push(0..0);
+        return rows;
+    }
+    let mut start = 0;
+    while start < chars.len() {
+        let capacity = if start == 0 {
+            columns
+        } else {
+            columns.saturating_sub(indent).max(4)
+        };
+        let mut column = if start == 0 { 0 } else { indent };
+        let mut end = start;
+        let mut last_break = None;
+        while end < chars.len() {
+            let width = if chars[end] == '\t' {
+                tab_size - column % tab_size
+            } else {
+                1
+            };
+            if column + width > capacity + if start == 0 { 0 } else { indent } {
+                break;
+            }
+            column += width;
+            end += 1;
+            if chars[end - 1].is_whitespace() {
+                last_break = Some(end);
+            }
+        }
+        if end == chars.len() {
+            rows.push(start..end);
+            break;
+        }
+        let cut = match last_break {
+            Some(at) if at > start => at,
+            _ => end.max(start + 1),
+        };
+        rows.push(start..cut);
+        start = cut;
+    }
+    rows
 }
 
 /// Direct-paint element for editor tab `index` of the window.
@@ -462,6 +673,13 @@ impl Element for EditorElement {
             let tab_size = view.config.editor.tab_size;
             let line_numbers = view.config.editor.line_numbers;
             let font = window.text_style().font();
+            let word_wrap = view
+                .tabs
+                .get(index)
+                .and_then(Tab::editor)
+                .and_then(|editor| editor.word_wrap)
+                .unwrap_or(view.config.editor.word_wrap);
+            let minimap = view.minimap_override.unwrap_or(view.config.editor.minimap);
             let paint = EditorPaint {
                 metrics,
                 font,
@@ -489,6 +707,18 @@ impl Element for EditorElement {
                     line.a = 0.6;
                     line
                 },
+                word_wrap,
+                minimap,
+                slider: {
+                    let mut slider: Hsla = color(theme.muted).into();
+                    slider.a = 0.25;
+                    slider
+                },
+                ink: {
+                    let mut ink: Hsla = color(theme.muted).into();
+                    ink.a = 0.7;
+                    ink
+                },
             };
             let Some(editor) = view.tabs.get_mut(index).and_then(Tab::editor_mut) else {
                 return;
@@ -515,6 +745,11 @@ struct EditorPaint {
     find_current: Option<usize>,
     /// Background of the cursor's line.
     current_line: Hsla,
+    word_wrap: bool,
+    minimap: bool,
+    /// Minimap slider and ink colours.
+    slider: Hsla,
+    ink: Hsla,
 }
 
 impl EditorPaint {
@@ -616,19 +851,31 @@ fn paint_editor(
     } else {
         px(GUTTER_PADDING)
     };
+    let full_width = (bounds.size.width - gutter).max(px(0.0));
+    let minimap_width = if paint.minimap
+        && editor.large.is_none()
+        && f32::from(full_width) > MINIMAP_MIN_TEXT_WIDTH
+    {
+        px(MINIMAP_WIDTH)
+    } else {
+        px(0.0)
+    };
     let text_bounds = Bounds::new(
         bounds.origin + point(gutter, px(0.0)),
-        size(
-            (bounds.size.width - gutter).max(px(0.0)),
-            bounds.size.height,
-        ),
+        size(full_width - minimap_width, bounds.size.height),
     );
     editor.last_text_bounds = Some(text_bounds);
+    editor.minimap_bounds = (minimap_width > px(0.0)).then(|| {
+        Bounds::new(
+            point(text_bounds.right(), bounds.origin.y),
+            size(minimap_width, bounds.size.height),
+        )
+    });
     let first = editor.scroll_line;
-    let last = (first + rows).min(total_lines);
     let text_system = window.text_system().clone();
     if let Some(file) = &editor.large {
         // Read-only view: lines straight from the map, no cursor.
+        let last = (first + rows).min(total_lines);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             window.paint_layer(bounds, |window| {
                 for line in first..last {
@@ -657,8 +904,48 @@ fn paint_editor(
         });
         return;
     }
+    // Wrap width in columns comes from the text area; a change of width
+    // or mode re-lays the rows out on the fly.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let columns =
+        ((f32::from(text_bounds.size.width) / paint.metrics.width).floor() as usize).max(4);
+    editor.wrap_columns = paint.word_wrap.then_some(columns);
+    editor.tab_size = paint.tab_size;
+    editor.scroll_x = if paint.word_wrap {
+        0.0
+    } else {
+        editor.scroll_x.max(0.0)
+    };
+    let visual = editor.visual_rows(first, rows, paint.tab_size);
+    let last_line = visual.last().map_or(first, |row| row.line + 1);
     let selections = editor.buffer.selections().clone();
-    let primary_line = editor.buffer.position_of(selections.primary().head).line;
+    let primary_head = selections.primary().head;
+    let primary_line = editor.buffer.position_of(primary_head).line;
+    // Horizontal reveal: shape the cursor's line and slide the viewport
+    // so the cursor stays a few columns inside either edge.
+    if editor.reveal_x && !paint.word_wrap {
+        editor.reveal_x = false;
+        let text = editor.buffer.line(primary_line).unwrap_or_default();
+        let (display, offsets) = display_line(&text, paint.tab_size);
+        let runs = paint.runs(&text, &[], display.len(), &[]);
+        let shaped = text_system.shape_line(SharedString::from(display), font_size, &runs, None);
+        let column = primary_head
+            - editor.buffer.char_at(Position {
+                line: primary_line,
+                column: 0,
+            });
+        let x = f32::from(shaped.x_for_index(offsets[column.min(offsets.len() - 1)]));
+        let margin = paint.metrics.width * 4.0;
+        let width = f32::from(text_bounds.size.width);
+        if x < editor.scroll_x + margin {
+            editor.scroll_x = (x - margin).max(0.0);
+        } else if x > editor.scroll_x + width - margin {
+            editor.scroll_x = x - width + margin;
+        }
+    } else if paint.word_wrap {
+        editor.reveal_x = false;
+    }
+    let scroll_x = px(editor.scroll_x);
     // Highlights come from the tree as of the last successful parse (one
     // query for the visible range, cached until the next edit); a parse
     // that ran out of budget keeps the previous tree, so a stale frame is
@@ -667,42 +954,69 @@ fn paint_editor(
     let highlights: Vec<Vec<Span>> = editor
         .syntax
         .as_mut()
-        .map_or_else(Vec::new, |state| state.highlights(&rope, first..last));
+        .map_or_else(Vec::new, |state| state.highlights(&rope, first..last_line));
     let spans_for =
         |line: usize| -> &[Span] { highlights.get(line - first).map_or(&[][..], Vec::as_slice) };
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         window.paint_layer(bounds, |window| {
-            for line in first..last {
-                let y = bounds.origin.y + line_height * ((line - first) as f32);
+            for (row_index, row) in visual.iter().enumerate() {
+                let y = bounds.origin.y + line_height * (row_index as f32);
+                let line = row.line;
                 if line == primary_line {
                     window.paint_quad(fill(
                         Bounds::new(
                             point(bounds.origin.x, y),
-                            size(bounds.size.width, line_height),
+                            size(bounds.size.width - minimap_width, line_height),
                         ),
                         paint.current_line,
                     ));
                 }
                 let text = editor.buffer.line(line).unwrap_or_default();
-                let (display, offsets) = display_line(&text, paint.tab_size);
-                let runs = paint.runs(&text, &offsets, display.len(), spans_for(line));
+                let slice: String = text
+                    .chars()
+                    .skip(row.cols.start)
+                    .take(row.cols.len())
+                    .collect();
+                let (display, offsets) =
+                    display_line_from(&slice, paint.tab_size, row.start_column);
+                // Spans are byte ranges of the whole line: shift them onto
+                // the slice.
+                let slice_byte_start = text
+                    .char_indices()
+                    .nth(row.cols.start)
+                    .map_or(text.len(), |(byte, _)| byte);
+                let row_spans: Vec<Span> = spans_for(line)
+                    .iter()
+                    .filter_map(|span| {
+                        let start = span.range.start.max(slice_byte_start);
+                        let end = span.range.end.min(slice_byte_start + slice.len());
+                        (start < end).then(|| Span {
+                            range: start - slice_byte_start..end - slice_byte_start,
+                            token: span.token,
+                        })
+                    })
+                    .collect();
+                let runs = paint.runs(&slice, &offsets, display.len(), &row_spans);
                 let shaped =
                     text_system.shape_line(SharedString::from(display), font_size, &runs, None);
+                let x_origin = text_bounds.origin.x - scroll_x
+                    + px(paint.metrics.width * row.start_column as f32);
                 let line_start = editor.buffer.char_at(Position { line, column: 0 });
-                let line_end = line_start + editor.buffer.line_len_chars(line);
-                // Find-bar matches on this line, under the selection overlay.
-                let first_match = paint.find.partition_point(|range| range.end <= line_start);
+                let row_start = line_start + row.cols.start;
+                let row_end = line_start + row.cols.end;
+                let x_of = |col: usize| shaped.x_for_index(offsets[col.min(offsets.len() - 1)]);
+                // Find-bar matches on this row, under the selection overlay.
+                let first_match = paint.find.partition_point(|range| range.end <= row_start);
                 for (index, range) in paint.find.iter().enumerate().skip(first_match) {
-                    if range.start > line_end {
+                    if range.start > row_end {
                         break;
                     }
-                    let from = range.start.max(line_start) - line_start;
-                    let to = range.end.min(line_end) - line_start;
-                    let x0 = shaped.x_for_index(offsets[from]);
-                    let x1 = shaped.x_for_index(offsets[to]);
+                    let from = range.start.max(row_start) - row_start;
+                    let to = range.end.min(row_end) - row_start;
+                    let (x0, x1) = (x_of(from), x_of(to));
                     window.paint_quad(fill(
                         Bounds::new(
-                            point(text_bounds.origin.x + x0, y),
+                            point(x_origin + x0, y),
                             size((x1 - x0).max(px(2.0)), line_height),
                         ),
                         if paint.find_current == Some(index) {
@@ -712,44 +1026,45 @@ fn paint_editor(
                         },
                     ));
                 }
-                // Selections covering this line, as x ranges of the display text.
+                // Selections covering this row.
                 for selection in selections.iter() {
                     let range = selection.range();
-                    if range.is_empty() || range.end <= line_start || range.start > line_end {
+                    if range.is_empty() || range.end <= row_start || range.start > row_end {
                         continue;
                     }
-                    let from = range.start.max(line_start) - line_start;
-                    let to = range.end.min(line_end) - line_start;
-                    let x0 = shaped.x_for_index(offsets[from]);
-                    let mut x1 = shaped.x_for_index(offsets[to]);
-                    if range.end > line_end {
+                    let from = range.start.max(row_start) - row_start;
+                    let to = range.end.min(row_end) - row_start;
+                    let x0 = x_of(from);
+                    let mut x1 = x_of(to);
+                    if row.last && range.end > row_end {
                         // The newline is selected too: extend to show it.
                         x1 += px(paint.metrics.width * 0.5);
                     }
                     window.paint_quad(fill(
                         Bounds::new(
-                            point(text_bounds.origin.x + x0, y),
+                            point(x_origin + x0, y),
                             size((x1 - x0).max(px(2.0)), line_height),
                         ),
                         paint.selection,
                     ));
                 }
-                let _ = shaped.paint(point(text_bounds.origin.x, y), line_height, window, cx);
+                let _ = shaped.paint(point(x_origin, y), line_height, window, cx);
                 for selection in selections.iter() {
                     let head = selection.head;
-                    if head < line_start || head > line_end {
+                    let on_row =
+                        head >= row_start && (head < row_end || (row.last && head == row_end));
+                    if !on_row {
                         continue;
                     }
-                    let x = shaped.x_for_index(offsets[head - line_start]);
                     window.paint_quad(fill(
                         Bounds::new(
-                            point(text_bounds.origin.x + x, y),
+                            point(x_origin + x_of(head - row_start), y),
                             size(px(2.0), line_height),
                         ),
                         paint.cursor,
                     ));
                 }
-                if paint.line_numbers {
+                if paint.line_numbers && row.first {
                     paint_line_number(
                         line,
                         digits,
@@ -762,6 +1077,134 @@ fn paint_editor(
                         cx,
                     );
                 }
+            }
+        });
+    });
+    if let Some(minimap) = editor.minimap_bounds {
+        paint_minimap(editor, minimap, visual.len(), paint, window);
+    }
+}
+
+/// The minimap: one 2 px row per buffer line, token colours from a coarse
+/// highlight query refreshed at most twice a second, and a slider over
+/// the visible lines. Clicking or dragging it scrolls.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines
+)]
+fn paint_minimap(
+    editor: &mut EditorTab,
+    bounds: Bounds<Pixels>,
+    visible_rows: usize,
+    paint: &EditorPaint,
+    window: &mut Window,
+) {
+    let total = editor.buffer.len_lines();
+    let capacity = ((f32::from(bounds.size.height) / MINIMAP_ROW) as usize).max(1);
+    // Keep the slider inside the strip: the strip's window slides in
+    // proportion to the text's scroll position.
+    let top = if total <= capacity {
+        0
+    } else {
+        let hidden = (total - capacity) as f32;
+        let scrollable = total.saturating_sub(visible_rows).max(1) as f32;
+        ((editor.scroll_line as f32 / scrollable) * hidden).round() as usize
+    };
+    editor.minimap_top = top;
+    let end = (top + capacity).min(total);
+    let version = editor.buffer.version();
+    let fresh = editor.minimap_cache.as_ref().is_some_and(|cache| {
+        cache.lines.start <= top
+            && cache.lines.end >= end
+            && (cache.version == version || cache.at.elapsed() < MINIMAP_REFRESH)
+    });
+    if !fresh {
+        let range =
+            top.saturating_sub(MINIMAP_MARGIN_LINES)..(end + MINIMAP_MARGIN_LINES).min(total);
+        let rope = editor.buffer.rope();
+        let spans = editor
+            .syntax
+            .as_mut()
+            .map_or_else(Vec::new, |state| state.highlights(&rope, range.clone()));
+        editor.minimap_cache = Some(MinimapCache {
+            at: Instant::now(),
+            version,
+            lines: range,
+            spans,
+        });
+    }
+    let cache = editor.minimap_cache.as_ref();
+    let max_chars = (f32::from(bounds.size.width) as usize).saturating_sub(2);
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        window.paint_layer(bounds, |window| {
+            for line in top..end {
+                let y = bounds.origin.y + px((line - top) as f32 * MINIMAP_ROW);
+                let text = editor.buffer.line(line).unwrap_or_default();
+                let spans = cache
+                    .filter(|cache| cache.lines.contains(&line))
+                    .and_then(|cache| cache.spans.get(line - cache.lines.start));
+                let mut painted = false;
+                if let Some(spans) = spans {
+                    for span in spans {
+                        // Byte offsets to columns: ASCII-dominant code makes
+                        // this exact enough for a 1 px per char strip.
+                        let col0 = text[..span.range.start.min(text.len())].chars().count();
+                        let col1 = text[..span.range.end.min(text.len())].chars().count();
+                        if col0 >= max_chars {
+                            break;
+                        }
+                        let width = (col1.min(max_chars) - col0).max(1);
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(bounds.origin.x + px(1.0 + col0 as f32), y),
+                                size(px(width as f32), px(1.0)),
+                            ),
+                            paint.token_color(span.token),
+                        ));
+                        painted = true;
+                    }
+                }
+                if !painted {
+                    // No highlights: ink every non-blank run.
+                    let mut run_start = None;
+                    for (col, c) in text
+                        .chars()
+                        .chain(std::iter::once(' '))
+                        .take(max_chars + 1)
+                        .enumerate()
+                    {
+                        if c.is_whitespace() {
+                            if let Some(start) = run_start.take() {
+                                window.paint_quad(fill(
+                                    Bounds::new(
+                                        point(bounds.origin.x + px(1.0 + start as f32), y),
+                                        size(px((col - start) as f32), px(1.0)),
+                                    ),
+                                    paint.ink,
+                                ));
+                            }
+                        } else if run_start.is_none() {
+                            run_start = Some(col);
+                        }
+                    }
+                }
+            }
+            // Slider over the visible lines.
+            let slider_top = editor.scroll_line.saturating_sub(top);
+            let slider_rows = visible_rows.min(end.saturating_sub(editor.scroll_line));
+            if editor.scroll_line >= top && slider_rows > 0 {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(
+                            bounds.origin.x,
+                            bounds.origin.y + px(slider_top as f32 * MINIMAP_ROW),
+                        ),
+                        size(bounds.size.width, px(slider_rows as f32 * MINIMAP_ROW)),
+                    ),
+                    paint.slider,
+                ));
             }
         });
     });
@@ -1960,7 +2403,11 @@ impl ForgeWindow {
     // ----- mouse --------------------------------------------------------
 
     /// Char index under a window position in the active editor.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     fn editor_char_at(&self, position: Point<Pixels>, window: &Window) -> Option<usize> {
         let editor = self
             .active_tab()
@@ -1968,12 +2415,19 @@ impl ForgeWindow {
             .filter(|editor| !editor.is_large())?;
         let bounds = editor.last_text_bounds?;
         let metrics = self.factory.metrics;
-        let row = ((f32::from(position.y - bounds.origin.y)) / metrics.height)
+        let tab_size = self.config.editor.tab_size;
+        let row_index = ((f32::from(position.y - bounds.origin.y)) / metrics.height)
             .floor()
             .max(0.0) as usize;
-        let line = (editor.scroll_line + row).min(editor.buffer.len_lines().saturating_sub(1));
-        let text = editor.buffer.line(line).unwrap_or_default();
-        let (display, offsets) = display_line(&text, self.config.editor.tab_size);
+        let rows = editor.visual_rows(editor.scroll_line, row_index + 1, tab_size);
+        let row = rows.last()?.clone();
+        let text = editor.buffer.line(row.line).unwrap_or_default();
+        let slice: String = text
+            .chars()
+            .skip(row.cols.start)
+            .take(row.cols.len())
+            .collect();
+        let (display, offsets) = display_line_from(&slice, tab_size, row.start_column);
         let run = TextRun {
             len: display.len(),
             font: window.text_style().font(),
@@ -1988,17 +2442,23 @@ impl ForgeWindow {
             std::slice::from_ref(&run),
             None,
         );
-        let x = (position.x - bounds.origin.x).max(px(0.0));
+        let x_origin =
+            bounds.origin.x - px(editor.scroll_x) + px(metrics.width * row.start_column as f32);
+        let x = (position.x - x_origin).max(px(0.0));
         let byte = shaped.closest_index_for_x(x);
         let column = offsets
             .partition_point(|offset| *offset < byte)
-            .min(text.chars().count());
+            .min(slice.chars().count());
         let column = if column > 0 && offsets[column] > byte {
             column - 1
         } else {
             column
         };
-        Some(editor.buffer.char_at(Position { line, column }))
+        let line_start = editor.buffer.char_at(Position {
+            line: row.line,
+            column: 0,
+        });
+        Some(line_start + row.cols.start + column)
     }
 
     pub fn editor_mouse_down(
@@ -2007,6 +2467,18 @@ impl ForgeWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .active_tab()
+            .editor()
+            .is_some_and(|editor| editor.on_minimap(event.position))
+        {
+            if let Some(editor) = self.active_tab_mut().editor_mut() {
+                editor.scroll_to_minimap(event.position.y);
+                editor.dragging_minimap = true;
+            }
+            cx.notify();
+            return;
+        }
         let Some(at) = self.editor_char_at(event.position, window) else {
             return;
         };
@@ -2044,6 +2516,17 @@ impl ForgeWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .active_tab()
+            .editor()
+            .is_some_and(|editor| editor.dragging_minimap)
+        {
+            if let Some(editor) = self.active_tab_mut().editor_mut() {
+                editor.scroll_to_minimap(position.y);
+            }
+            cx.notify();
+            return;
+        }
         let Some(anchor) = self
             .active_tab()
             .editor()
@@ -2070,7 +2553,35 @@ impl ForgeWindow {
     pub fn editor_mouse_up(&mut self) {
         if let Some(editor) = self.active_tab_mut().editor_mut() {
             editor.drag_anchor = None;
+            editor.dragging_minimap = false;
         }
+    }
+
+    /// Horizontal wheel (or Shift+wheel) in no-wrap mode.
+    pub fn editor_scroll_x(&mut self, delta: f32, cx: &mut Context<Self>) {
+        if let Some(editor) = self.active_tab_mut().editor_mut()
+            && editor.wrap_columns.is_none()
+        {
+            editor.scroll_x = (editor.scroll_x + delta).max(0.0);
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_word_wrap(&mut self, cx: &mut Context<Self>) {
+        let default = self.config.editor.word_wrap;
+        if let Some(editor) = self.active_tab_mut().editor_mut() {
+            let current = editor.word_wrap.unwrap_or(default);
+            editor.word_wrap = Some(!current);
+            editor.scroll_x = 0.0;
+            editor.follow_cursor();
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_minimap(&mut self, cx: &mut Context<Self>) {
+        let current = self.minimap_override.unwrap_or(self.config.editor.minimap);
+        self.minimap_override = Some(!current);
+        cx.notify();
     }
 
     /// Cursor rectangle for IME candidate windows.
@@ -2103,7 +2614,8 @@ impl ForgeWindow {
             std::slice::from_ref(&run),
             None,
         );
-        let x = shaped.x_for_index(offsets[position.column.min(offsets.len() - 1)]);
+        let x = shaped.x_for_index(offsets[position.column.min(offsets.len() - 1)])
+            - px(editor.scroll_x);
         let y = px(metrics.height * (position.line - editor.scroll_line) as f32);
         Some(Bounds::new(
             bounds.origin + point(x, y),
@@ -2202,6 +2714,23 @@ mod tests {
             toggle_comment(&mut tab, None).is_ok(),
             "no comment syntax is a no-op"
         );
+    }
+
+    #[test]
+    fn lines_wrap_at_word_boundaries_and_keep_the_indent() {
+        assert_eq!(wrap_line("", 10, 0, 4), vec![0..0]);
+        assert_eq!(wrap_line("short", 10, 0, 4), vec![0..5]);
+        let rows = wrap_line("one two three four", 9, 0, 4);
+        assert_eq!(rows, vec![0..8, 8..14, 14..18], "breaks after spaces");
+        let rows = wrap_line("abcdefghijkl", 5, 0, 4);
+        assert_eq!(
+            rows,
+            vec![0..5, 5..10, 10..12],
+            "hard breaks without spaces"
+        );
+        // Continuations keep two columns of indent, so they hold fewer chars.
+        let rows = wrap_line("  aaaa bbbb cccc", 8, 2, 4);
+        assert_eq!(rows, vec![0..7, 7..12, 12..16]);
     }
 
     #[test]

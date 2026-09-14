@@ -49,6 +49,8 @@ pub struct Config {
     pub profiles: Vec<TerminalProfile>,
 }
 
+// Configuration flags are a struct of booleans by nature.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct EditorConfig {
@@ -59,6 +61,10 @@ pub struct EditorConfig {
     pub line_numbers: bool,
     /// Save dirty files this long after the last edit; 0 disables.
     pub autosave_ms: u64,
+    /// Wrap long lines at the pane width (`Alt+Z` toggles per editor).
+    pub word_wrap: bool,
+    /// Show the minimap strip at the right of editors.
+    pub minimap: bool,
     /// Helix-like modal editing: files open in Normal mode (`i` inserts,
     /// `Esc` returns, `hjkl`/`w`/`b`/`0`/`$`/`G` move, `x`/`d` delete,
     /// `u`/`U` undo/redo, `v` extends, `y`/`p` copy/paste, `/` finds).
@@ -72,6 +78,8 @@ impl Default for EditorConfig {
             indent_with_tabs: false,
             line_numbers: true,
             autosave_ms: 0,
+            word_wrap: false,
+            minimap: true,
             modal: false,
         }
     }

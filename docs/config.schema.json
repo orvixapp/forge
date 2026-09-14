@@ -243,6 +243,16 @@
           "minimum": 0,
           "default": 0
         },
+        "word_wrap": {
+          "description": "Wrap long lines at the pane width (`Alt+Z` toggles per editor).",
+          "type": "boolean",
+          "default": false
+        },
+        "minimap": {
+          "description": "Show the minimap strip at the right of editors.",
+          "type": "boolean",
+          "default": true
+        },
         "modal": {
           "description": "Helix-like modal editing: files open in Normal mode (`i` inserts,\n`Esc` returns, `hjkl`/`w`/`b`/`0`/`$`/`G` move, `x`/`d` delete,\n`u`/`U` undo/redo, `v` extends, `y`/`p` copy/paste, `/` finds).",
           "type": "boolean",
