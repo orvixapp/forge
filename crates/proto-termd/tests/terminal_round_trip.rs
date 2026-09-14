@@ -139,12 +139,9 @@ async fn collect_output(
                     .iter()
                     .flat_map(|row| &row.cells)
                     .any(|cell| !cell.text.is_empty() && cell.foreground.is_some());
-                styled |= dirty_rows
-                    .iter()
-                    .flat_map(|row| &row.cells)
-                    .any(|cell| {
-                        !cell.text.is_empty() && cell.style.bold && cell.style.underline == 1
-                    });
+                styled |= dirty_rows.iter().flat_map(|row| &row.cells).any(|cell| {
+                    !cell.text.is_empty() && cell.style.bold && cell.style.underline == 1
+                });
                 screen = dirty_rows
                     .into_iter()
                     .flat_map(|row| row.cells)
