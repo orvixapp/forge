@@ -17,16 +17,7 @@ async fn command_output_crosses_the_daemon_boundary() {
         return;
     };
     let socket = unique_socket();
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_proto-termd"))
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--ghostty-lib")
-        .arg(ghostty_lib)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn daemon");
+    let mut daemon = spawn_daemon(&socket, &ghostty_lib);
 
     let stream = timeout(Duration::from_secs(5), connect_when_ready(&socket))
         .await
@@ -178,6 +169,30 @@ async fn connect_when_ready(socket: &PathBuf) -> std::io::Result<UnixStream> {
     }
 }
 
+/// Starts a daemon for one test. `FORGE_TEST_ENGINE=alacritty` exercises the
+/// alternative `VtEngine` (needs `--features alacritty`).
+fn spawn_daemon(socket: &PathBuf, ghostty_lib: &PathBuf) -> tokio::process::Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_proto-termd"));
+    command
+        .arg("--socket")
+        .arg(socket)
+        .arg("--ghostty-lib")
+        .arg(ghostty_lib);
+    if let Ok(engine) = std::env::var("FORGE_TEST_ENGINE") {
+        command.arg("--engine").arg(engine);
+    }
+    command
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn daemon")
+}
+
+fn ghostty_only() -> bool {
+    std::env::var("FORGE_TEST_ENGINE").is_ok_and(|engine| engine != "ghostty")
+}
+
 /// Tests run in parallel inside one process, so the pid alone is not unique.
 fn unique_socket() -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -195,16 +210,7 @@ async fn scrollback_keys_and_session_info_cross_the_daemon_boundary() {
     };
     let socket =
         std::env::temp_dir().join(format!("forge-termd-scroll-{}.sock", std::process::id()));
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_proto-termd"))
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--ghostty-lib")
-        .arg(ghostty_lib)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn daemon");
+    let mut daemon = spawn_daemon(&socket, &ghostty_lib);
     let stream = timeout(Duration::from_secs(5), connect_when_ready(&socket))
         .await
         .expect("daemon startup timed out")
@@ -466,16 +472,7 @@ async fn reattach_recovers_screen_and_ten_thousand_lines() {
     };
     let socket =
         std::env::temp_dir().join(format!("forge-termd-attach-{}.sock", std::process::id()));
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_proto-termd"))
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--ghostty-lib")
-        .arg(ghostty_lib)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn daemon");
+    let mut daemon = spawn_daemon(&socket, &ghostty_lib);
     let stream = timeout(Duration::from_secs(5), connect_when_ready(&socket))
         .await
         .expect("daemon startup timed out")
@@ -626,16 +623,7 @@ async fn search_finds_scrollback_rows_and_reports_bad_patterns() {
         return;
     };
     let socket = unique_socket();
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_proto-termd"))
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--ghostty-lib")
-        .arg(ghostty_lib)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn daemon");
+    let mut daemon = spawn_daemon(&socket, &ghostty_lib);
     let stream = timeout(Duration::from_secs(5), connect_when_ready(&socket))
         .await
         .expect("daemon startup timed out")
@@ -811,17 +799,12 @@ async fn osc_marks_hyperlinks_and_clipboard_cross_the_daemon_boundary() {
         eprintln!("skipping Ghostty integration test; set FORGE_GHOSTTY_LIB");
         return;
     };
+    if ghostty_only() {
+        eprintln!("skipping: OSC 133 marks are Ghostty-only");
+        return;
+    }
     let socket = unique_socket();
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_proto-termd"))
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--ghostty-lib")
-        .arg(ghostty_lib)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn daemon");
+    let mut daemon = spawn_daemon(&socket, &ghostty_lib);
     let stream = timeout(Duration::from_secs(5), connect_when_ready(&socket))
         .await
         .expect("daemon startup timed out")

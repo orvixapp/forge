@@ -1033,11 +1033,20 @@ mod daemon {
                         Some("ghostty") => EngineKind::Ghostty,
                         #[cfg(feature = "alacritty")]
                         Some("alacritty") => EngineKind::Alacritty,
-                        Some(other) => bail!("unknown --engine {other:?} (built engines: ghostty{})", if cfg!(feature = "alacritty") { ", alacritty" } else { "" }),
+                        Some(other) => bail!(
+                            "unknown --engine {other:?} (built engines: ghostty{})",
+                            if cfg!(feature = "alacritty") {
+                                ", alacritty"
+                            } else {
+                                ""
+                            }
+                        ),
                         None => bail!("--engine requires a name"),
                     };
                 }
-                _ => bail!("usage: proto-termd [--socket PATH] [--ghostty-lib PATH] [--engine ghostty|alacritty]"),
+                _ => bail!(
+                    "usage: proto-termd [--socket PATH] [--ghostty-lib PATH] [--engine ghostty|alacritty]"
+                ),
             }
         }
         Ok(Options {

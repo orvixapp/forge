@@ -7,7 +7,11 @@ use alacritty_terminal::{
     event::{Event, EventListener},
     grid::{Dimensions, Scroll},
     index::{Column, Line},
-    term::{ClipboardType, Config, Term, TermDamage, TermMode, cell::Flags, test::TermSize},
+    term::{
+        ClipboardType, Config, Term, TermDamage, TermMode,
+        cell::{Flags, LineLength},
+        test::TermSize,
+    },
     vte::ansi::{Color, CursorShape, NamedColor, Processor, Rgb as AlacrittyRgb},
 };
 use anyhow::Result;
@@ -48,13 +52,16 @@ impl EventListener for Listener {
     }
 }
 
+type WritePty = Box<dyn Fn(&[u8]) + Send>;
+type ClipboardWrite = Box<dyn Fn(ClipboardTarget, String) + Send>;
+
 pub struct AlacrittyEngine {
     term: Term<Listener>,
     parser: Processor,
     listener: Listener,
     title: String,
-    write_pty: Box<dyn Fn(&[u8]) + Send>,
-    clipboard: Box<dyn Fn(ClipboardTarget, String) + Send>,
+    write_pty: WritePty,
+    clipboard: ClipboardWrite,
     /// Rows the client has not seen since the last full frame.
     full_pending: bool,
 }
@@ -107,9 +114,16 @@ impl AlacrittyEngine {
 
     fn row(&self, y: usize) -> RenderRow {
         let grid = self.term.grid();
-        let line = Line(i32::try_from(y).unwrap_or(i32::MAX) - i32::try_from(self.display_offset()).unwrap_or(0));
+        let line = Line(
+            i32::try_from(y).unwrap_or(i32::MAX)
+                - i32::try_from(self.display_offset()).unwrap_or(0),
+        );
         let row = &grid[line];
         let colors = self.term.colors();
+        // Alacritty has no "empty" cell: blanks are spaces. Cells past the
+        // last non-blank one are reported empty, like Ghostty's, so text
+        // joins and selections do not drag a row of trailing spaces along.
+        let written = row.line_length().0;
         let cells = (0..grid.columns())
             .map(|x| {
                 let cell = &row[Column(x)];
@@ -117,18 +131,18 @@ impl AlacrittyEngine {
                     .flags
                     .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
                 let mut text = String::new();
-                if !spacer && cell.c != ' ' {
+                if !spacer && x < written {
                     text.push(cell.c);
                     if let Some(zerowidth) = cell.zerowidth() {
                         text.extend(zerowidth);
                     }
                 }
-                let default_fg = matches!(cell.fg, Color::Named(NamedColor::Foreground));
-                let default_bg = matches!(cell.bg, Color::Named(NamedColor::Background));
+                let themed_foreground = matches!(cell.fg, Color::Named(NamedColor::Foreground));
+                let themed_background = matches!(cell.bg, Color::Named(NamedColor::Background));
                 RenderCell {
                     text,
-                    foreground: (!default_fg).then(|| resolve_color(cell.fg, colors)),
-                    background: (!default_bg).then(|| resolve_color(cell.bg, colors)),
+                    foreground: (!themed_foreground).then(|| resolve_color(cell.fg, colors)),
+                    background: (!themed_background).then(|| resolve_color(cell.bg, colors)),
                     styled: !cell.flags.is_empty(),
                     style: CellStyle {
                         bold: cell.flags.contains(Flags::BOLD),
@@ -185,7 +199,10 @@ impl AlacrittyEngine {
             match self.term.damage() {
                 TermDamage::Full => (DirtyState::Full, (0..rows).collect()),
                 TermDamage::Partial(damage) => {
-                    let lines: Vec<usize> = damage.map(|bounds| bounds.line).filter(|line| *line < rows).collect();
+                    let lines: Vec<usize> = damage
+                        .map(|bounds| bounds.line)
+                        .filter(|line| *line < rows)
+                        .collect();
                     if lines.is_empty() {
                         (DirtyState::Clean, lines)
                     } else {
@@ -214,8 +231,10 @@ impl crate::daemon::VtEngine for AlacrittyEngine {
     }
 
     fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
-        self.term
-            .resize(TermSize::new(usize::from(cols.max(1)), usize::from(rows.max(1))));
+        self.term.resize(TermSize::new(
+            usize::from(cols.max(1)),
+            usize::from(rows.max(1)),
+        ));
         self.full_pending = true;
         Ok(())
     }
@@ -256,14 +275,20 @@ impl crate::daemon::VtEngine for AlacrittyEngine {
             ScrollViewport::Top => Scroll::Top,
             ScrollViewport::Bottom => Scroll::Bottom,
             ScrollViewport::Delta(delta) => {
-                Scroll::Delta(i32::try_from(-delta).unwrap_or(if delta < 0 { i32::MAX } else { i32::MIN }))
+                Scroll::Delta(i32::try_from(-delta).unwrap_or(if delta < 0 {
+                    i32::MAX
+                } else {
+                    i32::MIN
+                }))
             }
             ScrollViewport::Row(row) => {
                 let screen = self.term.screen_lines() as u64;
                 let total = self.term.grid().total_lines() as u64;
                 let target = total.saturating_sub(screen).saturating_sub(row);
                 let current = self.display_offset() as u64;
-                Scroll::Delta(i32::try_from(target as i64 - current as i64).unwrap_or(0))
+                let delta = i64::try_from(target).unwrap_or(i64::MAX)
+                    - i64::try_from(current).unwrap_or(i64::MAX);
+                Scroll::Delta(i32::try_from(delta).unwrap_or(0))
             }
         };
         let before = self.display_offset();
@@ -274,11 +299,14 @@ impl crate::daemon::VtEngine for AlacrittyEngine {
     }
 
     fn encode_key(&mut self, event: &KeyEvent) -> Result<Vec<u8>> {
-        Ok(encode_key(event, self.term.mode().contains(TermMode::APP_CURSOR)))
+        Ok(encode_key(
+            event,
+            self.term.mode().contains(TermMode::APP_CURSOR),
+        ))
     }
 
     fn encode_mouse(&mut self, _cols: u16, _rows: u16, event: MouseEvent) -> Result<Vec<u8>> {
-        Ok(encode_mouse(event, self.term.mode()))
+        Ok(encode_mouse(event, *self.term.mode()))
     }
 
     fn encode_paste(&mut self, text: &str) -> Result<Vec<u8>> {
@@ -334,7 +362,9 @@ fn resolve_color(color: Color, colors: &alacritty_terminal::term::color::Colors)
     match color {
         Color::Spec(c) => rgb(c),
         Color::Named(named) => colors[named].map_or_else(|| indexed(named as usize), rgb),
-        Color::Indexed(index) => colors[usize::from(index)].map_or_else(|| indexed(usize::from(index)), rgb),
+        Color::Indexed(index) => {
+            colors[usize::from(index)].map_or_else(|| indexed(usize::from(index)), rgb)
+        }
     }
 }
 
@@ -361,7 +391,13 @@ fn indexed(index: usize) -> Rgb {
         0..=15 => BASE[index],
         16..=231 => {
             let i = index - 16;
-            let level = |v: usize| if v == 0 { 0 } else { u8::try_from(55 + v * 40).unwrap_or(255) };
+            let level = |v: usize| {
+                if v == 0 {
+                    0
+                } else {
+                    u8::try_from(55 + v * 40).unwrap_or(255)
+                }
+            };
             (level(i / 36), level((i / 6) % 6), level(i % 6))
         }
         232..=255 => {
@@ -384,10 +420,7 @@ fn encode_key(event: &KeyEvent, app_cursor: bool) -> Vec<u8> {
     if mods.alt {
         out.push(0x1b);
     }
-    let modifier = 1
-        + u8::from(mods.shift)
-        + 2 * u8::from(mods.alt)
-        + 4 * u8::from(mods.control);
+    let modifier = 1 + u8::from(mods.shift) + 2 * u8::from(mods.alt) + 4 * u8::from(mods.control);
     let csi = |code: &str, tilde: bool| -> Vec<u8> {
         if modifier > 1 {
             if tilde {
@@ -432,16 +465,19 @@ fn encode_key(event: &KeyEvent, app_cursor: bool) -> Vec<u8> {
         TerminalKey::F11 => csi("23", true),
         TerminalKey::F12 => csi("24", true),
         _ => {
-            if mods.control
-                && let Some(text) = &event.text
-                && let Some(c) = text.chars().next()
-                && c.is_ascii_alphabetic()
-            {
-                vec![c.to_ascii_uppercase() as u8 & 0x1f]
-            } else if mods.control && event.unshifted_codepoint == u32::from(' ') {
-                vec![0]
-            } else {
-                event.text.clone().unwrap_or_default().into_bytes()
+            let base = event
+                .text
+                .as_deref()
+                .and_then(|text| text.chars().next())
+                .or_else(|| char::from_u32(event.unshifted_codepoint));
+            match base {
+                Some(c) if mods.control && c.is_ascii_alphabetic() => {
+                    vec![c.to_ascii_uppercase() as u8 & 0x1f]
+                }
+                Some(c) if mods.control && "@[\\]^_ ".contains(c) => {
+                    vec![if c == ' ' { 0 } else { c as u8 & 0x1f }]
+                }
+                _ => event.text.clone().unwrap_or_default().into_bytes(),
             }
         }
     };
@@ -449,8 +485,9 @@ fn encode_key(event: &KeyEvent, app_cursor: bool) -> Vec<u8> {
     out
 }
 
-/// SGR (1006) mouse reports when the application asked for any mouse mode.
-fn encode_mouse(event: MouseEvent, mode: &TermMode) -> Vec<u8> {
+/// Mouse reports when the application asked for any mouse mode: SGR (1006)
+/// when enabled, else the legacy `ESC [ M` encoding.
+fn encode_mouse(event: MouseEvent, mode: TermMode) -> Vec<u8> {
     use proto_ipc::{MouseAction, MouseButton};
     if !mode.intersects(TermMode::MOUSE_MODE) {
         return Vec::new();
@@ -482,11 +519,25 @@ fn encode_mouse(event: MouseEvent, mode: &TermMode) -> Vec<u8> {
         code += 32;
     }
     let release = event.action == MouseAction::Release;
-    format!(
-        "\x1b[<{code};{};{}{}",
-        event.col + 1,
-        event.row + 1,
-        if release { 'm' } else { 'M' }
-    )
-    .into_bytes()
+    if mode.contains(TermMode::SGR_MOUSE) {
+        return format!(
+            "\x1b[<{code};{};{}{}",
+            event.col + 1,
+            event.row + 1,
+            if release { 'm' } else { 'M' }
+        )
+        .into_bytes();
+    }
+    if release {
+        code = 3;
+    }
+    let coordinate = |value: u16| u8::try_from(32 + value + 1).unwrap_or(255);
+    vec![
+        0x1b,
+        b'[',
+        b'M',
+        u8::try_from(32 + code).unwrap_or(255),
+        coordinate(event.col),
+        coordinate(event.row),
+    ]
 }
