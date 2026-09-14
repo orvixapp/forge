@@ -1,6 +1,7 @@
 //! Headless terminal-grid state consumed by the GPUI frontend.
 
 pub mod config;
+pub mod links;
 pub mod shell;
 pub mod theme;
 
@@ -31,6 +32,8 @@ pub struct TerminalGrid {
     rows: u16,
     revision: u64,
     cells: Vec<ScreenCell>,
+    /// OSC 133 mark per row (0 none, 1 prompt, 2 continuation).
+    prompts: Vec<u8>,
     cursor: Option<ScreenCursor>,
     viewport: Viewport,
 }
@@ -44,6 +47,7 @@ impl TerminalGrid {
             rows,
             revision: 0,
             cells: vec![blank_cell(); usize::from(cols) * usize::from(rows)],
+            prompts: vec![0; usize::from(rows)],
             cursor: None,
             viewport: Viewport::default(),
         }
@@ -82,6 +86,7 @@ impl TerminalGrid {
         for row in &mut dirty_rows {
             let start = usize::from(row.y) * usize::from(cols);
             self.cells[start..start + usize::from(cols)].swap_with_slice(&mut row.cells);
+            self.prompts[usize::from(row.y)] = row.prompt;
         }
         self.revision = revision;
         Ok(true)
@@ -132,6 +137,25 @@ impl TerminalGrid {
     #[must_use]
     pub fn cursor(&self) -> Option<ScreenCursor> {
         self.cursor
+    }
+
+    /// OSC 133 mark of row `y`: 1 on a prompt line, 2 on its continuation.
+    #[must_use]
+    pub fn prompt_mark(&self, y: u16) -> u8 {
+        self.prompts.get(usize::from(y)).copied().unwrap_or(0)
+    }
+
+    /// Row text with one character per column: blank cells (including the
+    /// tail of a wide character) become spaces, so a byte or char offset
+    /// into a run of ASCII maps back to a column.
+    #[must_use]
+    pub fn row_text_padded(&self, y: u16) -> Option<String> {
+        self.row(y).map(|cells| {
+            cells
+                .iter()
+                .map(|cell| if cell.text.is_empty() { " " } else { cell.text.as_str() })
+                .collect()
+        })
     }
 
     /// Applies a screen-bearing IPC message and ignores unrelated messages.
@@ -228,6 +252,7 @@ impl TerminalGrid {
         self.cols = cols;
         self.rows = rows;
         self.cells = vec![blank_cell(); usize::from(cols) * usize::from(rows)];
+        self.prompts = vec![0; usize::from(rows)];
         self.cursor = None;
     }
 }
@@ -415,6 +440,7 @@ fn blank_cell() -> ScreenCell {
         background: None,
         styled: false,
         style: proto_ipc::CellStyle::default(),
+        hyperlink: None,
     }
 }
 
@@ -560,6 +586,7 @@ mod tests {
             background: None,
             styled: true,
             style: proto_ipc::CellStyle::default(),
+            hyperlink: None,
         }
     }
 
@@ -567,6 +594,7 @@ mod tests {
         ScreenRow {
             y,
             cells: values.iter().map(|value| cell(value)).collect(),
+            prompt: 0,
         }
     }
 

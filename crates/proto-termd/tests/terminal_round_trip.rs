@@ -65,6 +65,7 @@ async fn command_output_crosses_the_daemon_boundary() {
             cwd: std::env::current_dir().unwrap(),
             cols: 80,
             rows: 24,
+            env: Vec::new(),
         },
     )
     .await
@@ -232,6 +233,7 @@ async fn scrollback_keys_and_session_info_cross_the_daemon_boundary() {
             cwd: std::env::current_dir().unwrap(),
             cols: 40,
             rows: 10,
+            env: Vec::new(),
         },
     )
     .await
@@ -500,6 +502,7 @@ async fn reattach_recovers_screen_and_ten_thousand_lines() {
             cwd: std::env::current_dir().unwrap(),
             cols: 40,
             rows: 10,
+            env: Vec::new(),
         },
     )
     .await
@@ -660,6 +663,7 @@ async fn search_finds_scrollback_rows_and_reports_bad_patterns() {
             cwd: std::env::current_dir().unwrap(),
             cols: 40,
             rows: 10,
+            env: Vec::new(),
         },
     )
     .await

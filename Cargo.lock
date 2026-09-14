@@ -4062,6 +4062,7 @@ dependencies = [
  "proto-ghostty-vt",
  "proto-ipc",
  "regex",
+ "rustix 1.1.4",
  "tokio",
  "tracing",
  "tracing-subscriber",

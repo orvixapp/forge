@@ -5,7 +5,7 @@
 //! and unsafe boundary here prevents the API churn from leaking into Forge.
 
 use libloading::Library;
-use std::{ffi::c_void, path::Path, ptr, sync::Arc};
+use std::{ffi::c_void, mem::size_of, path::Path, ptr, sync::Arc};
 use thiserror::Error;
 
 const GHOSTTY_SUCCESS: i32 = 0;
@@ -78,9 +78,33 @@ type MouseEventSetMods = unsafe extern "C" fn(RawMouseEvent, u16);
 type MouseEventSetPosition = unsafe extern "C" fn(RawMouseEvent, GhosttyMousePosition);
 type PasteEncode = unsafe extern "C" fn(*mut u8, usize, bool, *mut u8, usize, *mut usize) -> i32;
 type WritePtyFn = unsafe extern "C" fn(RawTerminal, *mut c_void, *const u8, usize);
+type ScreenRowGet = unsafe extern "C" fn(u64, i32, *mut c_void) -> i32;
+type ScreenCellGet = unsafe extern "C" fn(u64, i32, *mut c_void) -> i32;
+type TerminalGridRef = unsafe extern "C" fn(RawTerminal, GhosttyPoint, *mut GhosttyGridRef) -> i32;
+type GridRefRow = unsafe extern "C" fn(*const GhosttyGridRef, *mut u64) -> i32;
+type GridRefHyperlinkUri =
+    unsafe extern "C" fn(*const GhosttyGridRef, *mut u8, usize, *mut usize) -> i32;
+type ClipboardWriteFn =
+    unsafe extern "C" fn(RawTerminal, *mut c_void, *const GhosttyClipboardWrite);
+type ClipboardWriteReplyFn =
+    unsafe extern "C" fn(*const GhosttyClipboardWrite, *const GhosttyClipboardWriteReply);
 
 const TERMINAL_OPT_USERDATA: i32 = 0;
 const TERMINAL_OPT_WRITE_PTY: i32 = 1;
+const TERMINAL_OPT_CLIPBOARD_WRITE: i32 = 26;
+const RENDER_ROW_DATA_RAW: i32 = 2;
+const RENDER_CELLS_DATA_RAW: i32 = 1;
+const ROW_DATA_HYPERLINK: i32 = 5;
+const ROW_DATA_SEMANTIC_PROMPT: i32 = 6;
+const CELL_DATA_HAS_HYPERLINK: i32 = 7;
+const POINT_TAG_VIEWPORT: i32 = 1;
+const POINT_TAG_SCREEN: i32 = 2;
+const ROW_SEMANTIC_PROMPT: i32 = 1;
+/// Rows a prompt search visits before giving up; each lookup may walk the
+/// page list, so an unbounded scan of a 100k-line scrollback would stall
+/// the terminal lock.
+const PROMPT_SCAN_LIMIT: u64 = 20_000;
+const CLIPBOARD_WRITE_RESULT_SUCCESS: i32 = 0;
 const TERMINAL_OPT_SCROLLBACK_MAX_BYTES: i32 = 27;
 const TERMINAL_OPT_SCROLLBACK_MAX_LINES: i32 = 28;
 const TERMINAL_DATA_ACTIVE_SCREEN: i32 = 6;
@@ -125,6 +149,78 @@ struct GhosttyTerminalScrollbar {
 struct GhosttyString {
     ptr: *const u8,
     len: usize,
+}
+
+impl GhosttyString {
+    /// Copies the borrowed bytes; an empty or null string yields `""`.
+    unsafe fn to_string_lossy(self) -> String {
+        if self.ptr.is_null() || self.len == 0 {
+            return String::new();
+        }
+        // SAFETY: Ghostty guarantees `len` readable bytes at `ptr` for the
+        // duration of the call that handed us the string.
+        String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(self.ptr, self.len) })
+            .into_owned()
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GhosttyPointCoordinate {
+    x: u16,
+    y: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+union GhosttyPointValue {
+    coordinate: GhosttyPointCoordinate,
+    padding: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GhosttyPoint {
+    tag: i32,
+    value: GhosttyPointValue,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GhosttyGridRef {
+    size: usize,
+    node: *mut c_void,
+    x: u16,
+    y: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GhosttyClipboardContent {
+    mime: GhosttyString,
+    data: GhosttyString,
+}
+
+/// `GhosttyClipboardWrite`, a sized struct: only fields within `size` may
+/// be read.
+#[repr(C)]
+struct GhosttyClipboardWrite {
+    size: usize,
+    location: i32,
+    contents: *const GhosttyClipboardContent,
+    contents_len: usize,
+    name: GhosttyString,
+    granted: bool,
+    can_remember: bool,
+    ctx: *const c_void,
+    reply: Option<ClipboardWriteReplyFn>,
+}
+
+#[repr(C)]
+struct GhosttyClipboardWriteReply {
+    size: usize,
+    result: i32,
+    remember: bool,
 }
 
 #[repr(C)]
@@ -315,6 +411,11 @@ struct Api {
     mouse_event_set_mods: MouseEventSetMods,
     mouse_event_set_position: MouseEventSetPosition,
     paste_encode: PasteEncode,
+    screen_row_get: ScreenRowGet,
+    screen_cell_get: ScreenCellGet,
+    terminal_grid_ref: TerminalGridRef,
+    grid_ref_hyperlink_uri: GridRefHyperlinkUri,
+    grid_ref_row: GridRefRow,
 }
 
 impl Api {
@@ -409,6 +510,14 @@ impl Api {
                 MouseEventSetPosition
             ),
             paste_encode: symbol!(b"ghostty_paste_encode\0", PasteEncode),
+            screen_row_get: symbol!(b"ghostty_row_get\0", ScreenRowGet),
+            grid_ref_row: symbol!(b"ghostty_grid_ref_row\0", GridRefRow),
+            screen_cell_get: symbol!(b"ghostty_cell_get\0", ScreenCellGet),
+            terminal_grid_ref: symbol!(b"ghostty_terminal_grid_ref\0", TerminalGridRef),
+            grid_ref_hyperlink_uri: symbol!(
+                b"ghostty_grid_ref_hyperlink_uri\0",
+                GridRefHyperlinkUri
+            ),
             _library: library,
         })
     }
@@ -464,6 +573,7 @@ impl GhosttyLibrary {
             raw,
             render_state,
             write_pty: None,
+            userdata: None,
         })
     }
 
@@ -693,9 +803,75 @@ pub struct GhosttyTerminal {
     render_state: RawRenderState,
     /// Owner of the `write_pty` closure handed to Ghostty as userdata.
     write_pty: Option<Box<WritePtyCallback>>,
+    /// Owner of the clipboard-write closure; Ghostty only holds one userdata
+    /// pointer, so both callbacks share [`Userdata`].
+    userdata: Option<Box<Userdata>>,
 }
 
 type WritePtyCallback = Box<dyn Fn(&[u8]) + Send>;
+type ClipboardWriteCallback = Box<dyn Fn(ClipboardLocation, String, String) + Send>;
+
+/// Everything Ghostty hands back through its single `userdata` pointer.
+#[derive(Default)]
+struct Userdata {
+    clipboard_write: Option<ClipboardWriteCallback>,
+}
+
+/// Destination of an OSC 52 / OSC 5522 clipboard write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardLocation {
+    Standard,
+    Selection,
+    Primary,
+}
+
+/// Trampoline for `GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE`: forwards the
+/// `text/plain` representation (else the first one) to the embedder and
+/// acknowledges the write; the embedder applies its own permission policy
+/// before anything reaches a real clipboard.
+unsafe extern "C" fn clipboard_write_trampoline(
+    _terminal: RawTerminal,
+    userdata: *mut c_void,
+    write: *const GhosttyClipboardWrite,
+) {
+    if userdata.is_null() || write.is_null() {
+        return;
+    }
+    // SAFETY: `userdata` is the `*mut Userdata` installed by
+    // `set_clipboard_write`, alive as long as the terminal; `write` is valid
+    // for the duration of the callback per the Ghostty contract.
+    let Some(callback) = (unsafe { &*userdata.cast::<Userdata>() })
+        .clipboard_write
+        .as_ref()
+    else {
+        return;
+    };
+    let write = unsafe { &*write };
+    if write.size < size_of::<GhosttyClipboardWrite>() || write.contents.is_null() {
+        return;
+    }
+    let contents = unsafe { std::slice::from_raw_parts(write.contents, write.contents_len) };
+    let chosen = contents
+        .iter()
+        .find(|content| unsafe { content.mime.to_string_lossy() } == "text/plain")
+        .or_else(|| contents.first());
+    let location = match write.location {
+        1 => ClipboardLocation::Selection,
+        2 => ClipboardLocation::Primary,
+        _ => ClipboardLocation::Standard,
+    };
+    let text = chosen.map_or_else(String::new, |content| unsafe { content.data.to_string_lossy() });
+    let program = unsafe { write.name.to_string_lossy() };
+    callback(location, text, program);
+    if let Some(reply) = write.reply {
+        let answer = GhosttyClipboardWriteReply {
+            size: size_of::<GhosttyClipboardWriteReply>(),
+            result: CLIPBOARD_WRITE_RESULT_SUCCESS,
+            remember: false,
+        };
+        unsafe { reply(write, &raw const answer) };
+    }
+}
 
 /// Trampoline for `GHOSTTY_TERMINAL_OPT_WRITE_PTY`.
 unsafe extern "C" fn write_pty_trampoline(
@@ -740,6 +916,8 @@ pub struct SessionState {
     pub pwd: String,
     pub mouse_tracking: bool,
     pub alternate_screen: bool,
+    /// DEC mode 2004: pasted newlines are data, not Enter.
+    pub bracketed_paste: bool,
 }
 
 /// Key press described with libghostty-vt's own key codes (see `key/event.h`).
@@ -869,6 +1047,46 @@ impl GhosttyTerminal {
         Ok(())
     }
 
+    /// Installs the receiver of OSC 52 / OSC 1337 / OSC 5522 clipboard
+    /// writes. Ghostty is told the write succeeded; whether it reaches a
+    /// clipboard is the embedder's decision. Must be called after
+    /// [`Self::set_write_pty`] is not required; the two are independent
+    /// because Ghostty's userdata slot is shared through [`Userdata`].
+    ///
+    /// # Errors
+    ///
+    /// Ghostty rejecting the option.
+    pub fn set_clipboard_write(
+        &mut self,
+        callback: impl Fn(ClipboardLocation, String, String) + Send + 'static,
+    ) -> Result<(), GhosttyError> {
+        let userdata = Box::into_raw(Box::new(Userdata {
+            clipboard_write: Some(Box::new(callback)),
+        }));
+        // SAFETY: the pointer stays valid until the terminal drops
+        // `self.userdata`; the trampoline signature matches the header.
+        let result = unsafe {
+            (self.api.terminal_set)(self.raw, TERMINAL_OPT_USERDATA, userdata.cast_const().cast())
+        };
+        if let Err(error) = check("terminal_set(userdata)", result) {
+            // SAFETY: not yet owned by anyone else.
+            drop(unsafe { Box::from_raw(userdata) });
+            return Err(error);
+        }
+        let trampoline: ClipboardWriteFn = clipboard_write_trampoline;
+        let result = unsafe {
+            (self.api.terminal_set)(
+                self.raw,
+                TERMINAL_OPT_CLIPBOARD_WRITE,
+                trampoline as *const c_void,
+            )
+        };
+        check("terminal_set(clipboard_write)", result)?;
+        // SAFETY: `userdata` came from `Box::into_raw` above.
+        self.userdata = Some(unsafe { Box::from_raw(userdata) });
+        Ok(())
+    }
+
     /// Moves the viewport over the scrollback.
     pub fn scroll_viewport(&mut self, scroll: ScrollViewport) {
         let behavior = match scroll {
@@ -895,6 +1113,68 @@ impl GhosttyTerminal {
         };
         // SAFETY: the handle is valid and the struct matches the C layout.
         unsafe { (self.api.terminal_scroll_viewport)(self.raw, behavior) };
+    }
+
+    /// Absolute row of the nearest OSC 133 prompt line strictly before
+    /// (`backwards`) or after `from`, within [`PROMPT_SCAN_LIMIT`] rows.
+    ///
+    /// # Errors
+    ///
+    /// Ghostty failing a row lookup.
+    pub fn prompt_row(&self, from: u64, backwards: bool) -> Result<Option<u64>, GhosttyError> {
+        let total = self.scrollbar()?.total;
+        let mut visited = 0;
+        let mut row = from;
+        loop {
+            row = if backwards {
+                match row.checked_sub(1) {
+                    Some(row) => row,
+                    None => return Ok(None),
+                }
+            } else {
+                row + 1
+            };
+            if row >= total || visited >= PROMPT_SCAN_LIMIT {
+                return Ok(None);
+            }
+            visited += 1;
+            if self.screen_row_prompt(row)? == ROW_SEMANTIC_PROMPT {
+                return Ok(Some(row));
+            }
+        }
+    }
+
+    fn screen_row_prompt(&self, row: u64) -> Result<i32, GhosttyError> {
+        let Ok(y) = u32::try_from(row) else {
+            return Ok(0);
+        };
+        let point = GhosttyPoint {
+            tag: POINT_TAG_SCREEN,
+            value: GhosttyPointValue {
+                coordinate: GhosttyPointCoordinate { x: 0, y },
+            },
+        };
+        let mut grid_ref = GhosttyGridRef {
+            size: size_of::<GhosttyGridRef>(),
+            node: ptr::null_mut(),
+            x: 0,
+            y: 0,
+        };
+        // SAFETY: the handle is valid and the structs match the C layout.
+        let result = unsafe { (self.api.terminal_grid_ref)(self.raw, point, &raw mut grid_ref) };
+        if result == GHOSTTY_INVALID_VALUE {
+            return Ok(0);
+        }
+        check("terminal_grid_ref(screen)", result)?;
+        let mut raw_row: u64 = 0;
+        let result = unsafe { (self.api.grid_ref_row)(&raw const grid_ref, &raw mut raw_row) };
+        check("grid_ref_row", result)?;
+        let mut prompt: i32 = 0;
+        let result = unsafe {
+            (self.api.screen_row_get)(raw_row, ROW_DATA_SEMANTIC_PROMPT, (&raw mut prompt).cast())
+        };
+        check("row_get(semantic prompt)", result)?;
+        Ok(prompt)
     }
 
     /// Position of the viewport inside the scrollable area.
@@ -927,6 +1207,7 @@ impl GhosttyTerminal {
             pwd: self.terminal_string(TERMINAL_DATA_PWD, "terminal_get(pwd)")?,
             mouse_tracking,
             alternate_screen: screen == 1,
+            bracketed_paste: self.dec_mode(MODE_BRACKETED_PASTE)?,
         })
     }
 
@@ -1155,22 +1436,117 @@ impl GhosttyTerminal {
             let result =
                 unsafe { (self.api.row_get)(iterator.raw, 3, (&raw mut cells.raw).cast()) };
             check("render_state_row_get(cells)", result)?;
+            let (prompt, has_hyperlinks) = self.row_flags(iterator.raw)?;
             let mut row_cells = Vec::new();
             while unsafe { (self.api.row_cells_next)(cells.raw) } {
+                let x = u16::try_from(row_cells.len()).unwrap_or(u16::MAX);
+                let hyperlink = if has_hyperlinks {
+                    self.cell_hyperlink(cells.raw, x, y)?
+                } else {
+                    None
+                };
                 row_cells.push(RenderCell {
                     text: self.cell_text(cells.raw)?,
                     foreground: self.cell_color(cells.raw, 6)?,
                     background: self.cell_color(cells.raw, 5)?,
                     styled: self.cell_value::<bool>(cells.raw, 8, "cell has styling")?,
                     style: self.cell_style(cells.raw)?,
+                    hyperlink,
                 });
             }
             rows.push(RenderRow {
                 y,
                 cells: row_cells,
+                prompt,
             });
         }
         Ok(rows)
+    }
+
+    /// OSC 133 mark and "row may contain hyperlinks" hint of the row the
+    /// iterator is on; the hint skips the per-cell hyperlink lookups.
+    fn row_flags(&self, iterator: RawRowIterator) -> Result<(u8, bool), GhosttyError> {
+        let mut row: u64 = 0;
+        let result = unsafe { (self.api.row_get)(iterator, RENDER_ROW_DATA_RAW, (&raw mut row).cast()) };
+        check("render_state_row_get(raw)", result)?;
+        let mut prompt: i32 = 0;
+        let result = unsafe {
+            (self.api.screen_row_get)(row, ROW_DATA_SEMANTIC_PROMPT, (&raw mut prompt).cast())
+        };
+        check("row_get(semantic prompt)", result)?;
+        let mut hyperlink = false;
+        let result = unsafe {
+            (self.api.screen_row_get)(row, ROW_DATA_HYPERLINK, (&raw mut hyperlink).cast())
+        };
+        check("row_get(hyperlink)", result)?;
+        Ok((u8::try_from(prompt).unwrap_or(0), hyperlink))
+    }
+
+    /// URI of the OSC 8 hyperlink under viewport cell `(x, y)`, if any.
+    fn cell_hyperlink(
+        &self,
+        cells: RawRowCells,
+        x: u16,
+        y: u16,
+    ) -> Result<Option<String>, GhosttyError> {
+        let mut cell: u64 = 0;
+        let result = unsafe {
+            (self.api.row_cells_get)(cells, RENDER_CELLS_DATA_RAW, (&raw mut cell).cast())
+        };
+        check("render_state_row_cells_get(raw)", result)?;
+        let mut has_hyperlink = false;
+        let result = unsafe {
+            (self.api.screen_cell_get)(cell, CELL_DATA_HAS_HYPERLINK, (&raw mut has_hyperlink).cast())
+        };
+        check("cell_get(has hyperlink)", result)?;
+        if !has_hyperlink {
+            return Ok(None);
+        }
+        let point = GhosttyPoint {
+            tag: POINT_TAG_VIEWPORT,
+            value: GhosttyPointValue {
+                coordinate: GhosttyPointCoordinate {
+                    x,
+                    y: u32::from(y),
+                },
+            },
+        };
+        let mut grid_ref = GhosttyGridRef {
+            size: size_of::<GhosttyGridRef>(),
+            node: ptr::null_mut(),
+            x: 0,
+            y: 0,
+        };
+        // SAFETY: the render state was updated under the same lock, so the
+        // viewport coordinates refer to the rows just read.
+        let result = unsafe { (self.api.terminal_grid_ref)(self.raw, point, &raw mut grid_ref) };
+        if result == GHOSTTY_INVALID_VALUE {
+            return Ok(None);
+        }
+        check("terminal_grid_ref", result)?;
+        let mut required = 0;
+        let query = unsafe {
+            (self.api.grid_ref_hyperlink_uri)(&raw const grid_ref, ptr::null_mut(), 0, &raw mut required)
+        };
+        if required == 0 && query == GHOSTTY_SUCCESS {
+            return Ok(None);
+        }
+        if query != GHOSTTY_OUT_OF_SPACE {
+            check("grid_ref_hyperlink_uri(size)", query)?;
+        }
+        let mut bytes = vec![0_u8; required];
+        let mut written = 0;
+        let result = unsafe {
+            (self.api.grid_ref_hyperlink_uri)(
+                &raw const grid_ref,
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                &raw mut written,
+            )
+        };
+        check("grid_ref_hyperlink_uri", result)?;
+        bytes.truncate(written);
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     }
 
     fn cell_text(&self, cells: RawRowCells) -> Result<String, GhosttyError> {
@@ -1402,6 +1778,8 @@ impl TryFrom<i32> for CursorStyle {
 pub struct RenderRow {
     pub y: u16,
     pub cells: Vec<RenderCell>,
+    /// OSC 133 mark of the row: 0 none, 1 prompt, 2 prompt continuation.
+    pub prompt: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1411,6 +1789,8 @@ pub struct RenderCell {
     pub background: Option<Rgb>,
     pub styled: bool,
     pub style: CellStyle,
+    /// OSC 8 hyperlink target.
+    pub hyperlink: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -12,14 +12,14 @@ mod unix {
     use anyhow::{Context, Result, bail};
     use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
     use proto_ghostty_vt::{
-        DirtyState, GhosttyLibrary, GhosttyTerminal, KeyEncoder, KeyInput, MouseEncoder,
-        MouseInput, RenderSnapshot, ScrollViewport, SessionState,
+        ClipboardLocation, DirtyState, GhosttyLibrary, GhosttyTerminal, KeyEncoder, KeyInput,
+        MouseEncoder, MouseInput, RenderSnapshot, ScrollViewport, SessionState,
     };
     use proto_ipc::{
-        CellStyle, ClientMessage, CursorStyle, FrameKind, KeyAction, KeyEvent, KeyMods,
-        MouseAction, MouseButton, MouseEvent, PROTOCOL_VERSION, Rgb, ScreenCell, ScreenCursor,
-        ScreenRow, ScrollRequest, SearchMatch, ServerMessage, TerminalKey, Viewport, read_message,
-        write_message,
+        CellStyle, ClientMessage, ClipboardTarget, CursorStyle, FrameKind, KeyAction, KeyEvent,
+        KeyMods, MouseAction, MouseButton, MouseEvent, PROTOCOL_VERSION, ProcessSignal,
+        PromptDirection, Rgb, ScreenCell, ScreenCursor, ScreenRow, ScrollRequest, SearchMatch,
+        ServerMessage, TerminalKey, Viewport, read_message, write_message,
     };
     use std::{
         collections::{HashMap, VecDeque},
@@ -52,6 +52,12 @@ mod unix {
             viewport: Viewport,
         },
         Info(SessionState),
+        /// OSC 52 and friends; the client applies its clipboard policy.
+        Clipboard {
+            target: ClipboardTarget,
+            text: String,
+            program: String,
+        },
         Exited(Option<u32>),
     }
 
@@ -72,6 +78,8 @@ mod unix {
         /// Plain text of the whole scrollable area, one line per row, for
         /// search. Must not disturb render state or the viewport.
         fn text(&self) -> Result<String>;
+        /// Nearest OSC 133 prompt row before/after `from`.
+        fn prompt_row(&self, from: u64, backwards: bool) -> Result<Option<u64>>;
     }
 
     struct GhosttyVtEngine {
@@ -139,6 +147,12 @@ mod unix {
                 .snapshot_text()
                 .context("format scrollback as text")
         }
+
+        fn prompt_row(&self, from: u64, backwards: bool) -> Result<Option<u64>> {
+            self.terminal
+                .prompt_row(from, backwards)
+                .context("scan prompt rows")
+        }
     }
 
     struct Session {
@@ -196,6 +210,46 @@ mod unix {
                 .expect("child mutex poisoned")
                 .kill()
                 .context("kill PTY child")
+        }
+
+        /// Signals the whole process group of the shell (it is a session
+        /// leader, so the group id is its pid), like the driver does for
+        /// Ctrl+C but for any signal and regardless of terminal modes.
+        fn signal(&self, signal: ProcessSignal) -> Result<()> {
+            let pid = self
+                .child
+                .lock()
+                .expect("child mutex poisoned")
+                .process_id()
+                .context("the shell already exited")?;
+            let pid = rustix::process::Pid::from_raw(i32::try_from(pid).context("pid range")?)
+                .context("invalid pid")?;
+            let signal = match signal {
+                ProcessSignal::Interrupt => rustix::process::Signal::INT,
+                ProcessSignal::Terminate => rustix::process::Signal::TERM,
+                ProcessSignal::Kill => rustix::process::Signal::KILL,
+                ProcessSignal::Hangup => rustix::process::Signal::HUP,
+            };
+            rustix::process::kill_process_group(pid, signal).context("send signal")
+        }
+
+        /// Scrolls the viewport to the previous/next prompt line marked by
+        /// OSC 133 (shell integration); nothing happens without marks.
+        fn scroll_to_prompt(&self, direction: PromptDirection) -> Result<bool> {
+            let target = {
+                let mut terminal = self.terminal.lock().expect("terminal mutex poisoned");
+                let viewport = terminal.viewport()?;
+                let target = match direction {
+                    PromptDirection::Previous => terminal.prompt_row(viewport.offset, true)?,
+                    PromptDirection::Next => terminal.prompt_row(viewport.offset, false)?,
+                };
+                if let Some(row) = target {
+                    terminal.scroll(ScrollViewport::Row(row));
+                }
+                target
+            };
+            self.emit_screen()?;
+            Ok(target.is_some())
         }
 
         fn feed_vt(&self, data: &[u8]) -> Result<()> {
@@ -368,10 +422,12 @@ mod unix {
     fn convert_row(row: proto_ghostty_vt::RenderRow) -> ScreenRow {
         ScreenRow {
             y: row.y,
+            prompt: row.prompt,
             cells: row
                 .cells
                 .into_iter()
                 .map(|cell| ScreenCell {
+                    hyperlink: cell.hyperlink,
                     text: cell.text,
                     foreground: cell.foreground.map(|color| Rgb {
                         r: color.r,
@@ -407,6 +463,7 @@ mod unix {
             pwd: decode_pwd(&state.pwd),
             mouse_tracking: state.mouse_tracking,
             alternate_screen: state.alternate_screen,
+            bracketed_paste: state.bracketed_paste,
         }
     }
 
@@ -641,6 +698,7 @@ mod unix {
             cwd: PathBuf,
             cols: u16,
             rows: u16,
+            env: Vec<(String, String)>,
         ) -> Result<u64> {
             let pair = native_pty_system()
                 .openpty(PtySize {
@@ -654,6 +712,9 @@ mod unix {
             builder.cwd(cwd);
             for arg in args {
                 builder.arg(arg);
+            }
+            for (key, value) in env {
+                builder.env(key, value);
             }
             let child = pair.slave.spawn_command(builder).context("spawn command")?;
             drop(pair.slave);
@@ -679,6 +740,24 @@ mod unix {
                     let _ = replies.send(bytes.to_vec());
                 })
                 .context("install PTY reply callback")?;
+            // Clipboard writes are forwarded to every attached client; the
+            // daemon has no clipboard and never decides for the user.
+            let clipboard_events = events.clone();
+            terminal
+                .set_clipboard_write(move |location, text, program| {
+                    let target = match location {
+                        ClipboardLocation::Standard | ClipboardLocation::Selection => {
+                            ClipboardTarget::Clipboard
+                        }
+                        ClipboardLocation::Primary => ClipboardTarget::Primary,
+                    };
+                    let _ = clipboard_events.send(SessionEvent::Clipboard {
+                        target,
+                        text,
+                        program,
+                    });
+                })
+                .context("install clipboard write callback")?;
             let key_encoder = self.ghostty.key_encoder().context("create key encoder")?;
             let mouse_encoder = self
                 .ghostty
@@ -970,9 +1049,10 @@ mod unix {
                 cwd,
                 cols,
                 rows,
+                env,
             } => {
                 let session_id = daemon
-                    .create_session(command, args, cwd, cols, rows)
+                    .create_session(command, args, cwd, cols, rows, env)
                     .await?;
                 out_tx
                     .send((
@@ -1022,30 +1102,18 @@ mod unix {
                 query,
                 regex,
                 case_sensitive,
+            } => search(daemon, out_tx, session_id, request_id, query, regex, case_sensitive).await?,
+            ClientMessage::Signal { session_id, signal } => {
+                daemon.session(session_id).await?.signal(signal)?;
+            }
+            ClientMessage::ScrollToPrompt {
+                session_id,
+                direction,
             } => {
-                // A bad pattern is the user's typo, not a daemon failure:
-                // it travels inside the results so the search bar shows it.
-                let (matches, error) =
-                    match daemon
-                        .session(session_id)
-                        .await?
-                        .search(&query, regex, case_sensitive)
-                    {
-                        Ok(matches) => (matches, None),
-                        Err(error) => (Vec::new(), Some(format!("{error:#}"))),
-                    };
-                out_tx
-                    .send((
-                        FrameKind::Response,
-                        ServerMessage::SearchResults {
-                            session_id,
-                            request_id,
-                            query,
-                            matches,
-                            error,
-                        },
-                    ))
-                    .await?;
+                daemon
+                    .session(session_id)
+                    .await?
+                    .scroll_to_prompt(direction)?;
             }
             ClientMessage::ListSessions => list_sessions(daemon, out_tx).await?,
             ClientMessage::Detach { .. } => {
@@ -1054,6 +1122,40 @@ mod unix {
             }
             ClientMessage::Initialize { .. } => bail!("connection is already initialized"),
         }
+        Ok(())
+    }
+
+    /// A bad pattern is the user's typo, not a daemon failure: it travels
+    /// inside the results so the search bar shows it.
+    async fn search(
+        daemon: &Arc<Daemon>,
+        out_tx: &async_mpsc::Sender<(FrameKind, ServerMessage)>,
+        session_id: u64,
+        request_id: u64,
+        query: String,
+        regex: bool,
+        case_sensitive: bool,
+    ) -> Result<()> {
+        let (matches, error) = match daemon
+            .session(session_id)
+            .await?
+            .search(&query, regex, case_sensitive)
+        {
+            Ok(matches) => (matches, None),
+            Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+        };
+        out_tx
+            .send((
+                FrameKind::Response,
+                ServerMessage::SearchResults {
+                    session_id,
+                    request_id,
+                    query,
+                    matches,
+                    error,
+                },
+            ))
+            .await?;
         Ok(())
     }
 
@@ -1187,6 +1289,16 @@ mod unix {
                         viewport,
                     },
                     Ok(SessionEvent::Info(state)) => session_info(session_id, &state),
+                    Ok(SessionEvent::Clipboard {
+                        target,
+                        text,
+                        program,
+                    }) => ServerMessage::ClipboardWrite {
+                        session_id,
+                        target,
+                        text,
+                        program,
+                    },
                     Ok(SessionEvent::Exited(exit_code)) => {
                         let _ = forwarding
                             .send((

@@ -179,6 +179,7 @@ pub fn synthetic_grid_patch(revision: usize) -> ServerMessage {
             background: None,
             styled: true,
             style: proto_ipc::CellStyle::default(),
+            hyperlink: None,
         }
     };
     ServerMessage::ScreenPatch {
@@ -191,6 +192,7 @@ pub fn synthetic_grid_patch(revision: usize) -> ServerMessage {
             .map(|y| ScreenRow {
                 y,
                 cells: (0..200).map(|x| cell(x, usize::from(y))).collect(),
+                prompt: 0,
             })
             .collect(),
         cursor: Some(ScreenCursor {

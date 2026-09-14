@@ -255,6 +255,9 @@ pub enum ClientMessage {
         cwd: std::path::PathBuf,
         cols: u16,
         rows: u16,
+        /// Extra environment for the program (shell integration, TERM_PROGRAM).
+        #[serde(default)]
+        env: Vec<(String, String)>,
     },
     Attach {
         session_id: u64,
@@ -305,8 +308,48 @@ pub enum ClientMessage {
         regex: bool,
         case_sensitive: bool,
     },
+    /// Sends a POSIX signal to the session's process group.
+    Signal {
+        session_id: u64,
+        signal: ProcessSignal,
+    },
+    /// Moves the viewport to the previous/next OSC 133 prompt row.
+    ScrollToPrompt {
+        session_id: u64,
+        direction: PromptDirection,
+    },
     /// Sessions the daemon still holds, so a restarted client can reattach.
     ListSessions,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessSignal {
+    /// SIGINT, what Ctrl+C sends.
+    Interrupt,
+    /// SIGTERM.
+    Terminate,
+    /// SIGKILL.
+    Kill,
+    /// SIGHUP.
+    Hangup,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptDirection {
+    /// Towards older rows.
+    Previous,
+    Next,
+}
+
+/// Destination of a clipboard write requested by the application.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardTarget {
+    Clipboard,
+    /// X11/Wayland primary selection.
+    Primary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -582,6 +625,18 @@ pub enum ServerMessage {
         /// The application wants mouse events (modes 9/1000/1002/1003).
         mouse_tracking: bool,
         alternate_screen: bool,
+        /// Mode 2004: pasted newlines are wrapped, not executed.
+        #[serde(default)]
+        bracketed_paste: bool,
+    },
+    /// The application asked to write the clipboard (OSC 52, OSC 1337,
+    /// OSC 5522). The client decides whether to honour it.
+    ClipboardWrite {
+        session_id: u64,
+        target: ClipboardTarget,
+        text: String,
+        /// Program name when the protocol carries one; empty otherwise.
+        program: String,
     },
     /// Answer to `Search`; `matches` are ordered from the oldest row to the
     /// newest. `error` reports an invalid pattern instead of a daemon error,
@@ -620,6 +675,9 @@ pub struct SearchMatch {
 pub struct ScreenRow {
     pub y: u16,
     pub cells: Vec<ScreenCell>,
+    /// OSC 133 mark: 0 none, 1 prompt line, 2 prompt continuation.
+    #[serde(default)]
+    pub prompt: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -631,6 +689,9 @@ pub struct ScreenCell {
     pub styled: bool,
     #[serde(default)]
     pub style: CellStyle,
+    /// OSC 8 hyperlink target, when the application attached one.
+    #[serde(default)]
+    pub hyperlink: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

@@ -254,6 +254,7 @@ mod key_echo {
                 cwd: std::env::current_dir()?,
                 cols: 80,
                 rows: 24,
+                env: Vec::new(),
             },
         )
         .await?;
@@ -548,6 +549,7 @@ mod termd_idle {
                     cwd: std::env::current_dir()?,
                     cols: 80,
                     rows: 24,
+                    env: Vec::new(),
                 },
             )
             .await?;

@@ -58,6 +58,7 @@ mod unix {
                     cwd: std::env::current_dir()?,
                     cols: 80,
                     rows: 24,
+                    env: Vec::new(),
                 },
             )
             .await?;
