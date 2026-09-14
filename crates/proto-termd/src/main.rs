@@ -705,6 +705,8 @@ mod daemon {
 
     struct Daemon {
         instance_id: u64,
+        /// Only consulted when a second engine is compiled in.
+        #[cfg_attr(not(feature = "alacritty"), allow(dead_code))]
         engine: EngineKind,
         ghostty: GhosttyLibrary,
         sessions: RwLock<HashMap<u64, Arc<Session>>>,
