@@ -9,7 +9,7 @@ use crate::{
 };
 use forge_gui::{
     CellPos, Selection, TerminalGrid,
-    config::{ClipboardPolicy, Config, ConfigSources, resolve_font_family},
+    config::{ClipboardPolicy, Config, ConfigSources, TerminalProfile, resolve_font_family},
     key_event,
     links::{self, LinkTarget, PasteRisk},
     shell::{
@@ -93,16 +93,36 @@ impl WindowFactory {
             .map(|path| path.with_file_name("session.json"))
     }
 
-    fn spec(&self, cwd: PathBuf, attach: Option<u64>, daemon_instance: Option<u64>) -> SessionSpec {
+    fn spec(
+        &self,
+        cwd: PathBuf,
+        attach: Option<u64>,
+        daemon_instance: Option<u64>,
+        profile: Option<&TerminalProfile>,
+    ) -> SessionSpec {
         let chrome_height = chrome::TOPBAR_HEIGHT + chrome::STATUS_HEIGHT;
         let (cols, rows) = crate::grid_dimensions(self.window_size, self.metrics, chrome_height);
-        let command = self.config.shell();
-        let (args, env) = integration_launch(
+        let command = profile
+            .and_then(|profile| profile.shell.clone())
+            .unwrap_or_else(|| self.config.shell());
+        let args = profile.map_or_else(
+            || self.config.terminal.args.clone(),
+            |profile| profile.args.clone(),
+        );
+        let (args, mut env) = integration_launch(
             &command,
-            self.config.terminal.args.clone(),
+            args,
             shell_integration_dir().as_deref(),
             self.config.terminal.shell_integration,
         );
+        if let Some(profile) = profile {
+            env.extend(
+                profile
+                    .env
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
         SessionSpec {
             socket: self.socket.clone(),
             command,
@@ -154,6 +174,8 @@ pub struct TerminalTab {
     pub id: u64,
     /// Name shown when the application has not set a title.
     pub default_title: String,
+    /// Name given by the user (`terminal.renameTab`); wins over everything.
+    pub custom_title: Option<String>,
     pub terminal: TerminalSurface,
     pub status: String,
     pub input: async_mpsc::UnboundedSender<IpcCommand>,
@@ -198,6 +220,9 @@ pub enum ConfirmationKind {
 
 impl TerminalTab {
     pub fn title(&self) -> Cow<'_, str> {
+        if let Some(custom) = &self.custom_title {
+            return Cow::Borrowed(custom);
+        }
         if let Some(pwd) = &self.info.pwd {
             return pwd
                 .file_name()
@@ -237,6 +262,19 @@ pub struct PaletteState {
     pub index: usize,
 }
 
+/// Single-line text prompt inside the window (tab rename).
+pub struct TextPrompt {
+    pub title: String,
+    pub value: String,
+}
+
+/// List picker inside the window (profiles); `index` selects an item.
+pub struct Picker {
+    pub title: String,
+    pub items: Vec<String>,
+    pub index: usize,
+}
+
 pub struct ForgeWindow {
     pub tabs: Vec<TerminalTab>,
     pub active_tab: usize,
@@ -253,6 +291,12 @@ pub struct ForgeWindow {
     pub palette: PaletteState,
     pub search: SearchState,
     pub confirmation: Option<Confirmation>,
+    pub rename: Option<TextPrompt>,
+    pub picker: Option<Picker>,
+    /// Font zoom steps (each ±10 %) on top of `font.size`.
+    pub zoom: i8,
+    /// Show only the active pane of the split tree.
+    pub pane_zoom: bool,
     pub process_explorer: bool,
     pub split: Option<PaneTree>,
     pub notifications: Vec<Notification>,
@@ -283,6 +327,10 @@ impl ForgeWindow {
             palette: PaletteState::default(),
             search: SearchState::default(),
             confirmation: None,
+            rename: None,
+            picker: None,
+            zoom: 0,
+            pane_zoom: false,
             process_explorer: false,
             split: None,
             notifications: Vec::new(),
@@ -386,18 +434,13 @@ impl ForgeWindow {
     }
 
     fn apply_config(&mut self, config: Config, sources: ConfigSources, cx: &mut Context<Self>) {
-        let metrics = crate::cell_metrics_for(&config, cx);
         self.keymap = ShellKeymap::default().with_overrides(&config.keybindings);
-        self.factory.metrics = metrics;
         self.factory.sources = sources;
         self.factory.config = Arc::new(config);
         self.config = Arc::clone(&self.factory.config);
         let (theme, name) = load_theme(&self.factory);
         self.set_theme(theme, name);
-        for tab in &mut self.tabs {
-            tab.terminal.metrics = metrics;
-            tab.viewport = None;
-        }
+        self.apply_zoom(cx);
         self.notify_user(NotificationLevel::Info, "Configuración recargada");
         cx.notify();
     }
@@ -451,6 +494,12 @@ impl ForgeWindow {
             theme: Some(self.theme_name.clone()),
             sessions: self.tabs.iter().map(|tab| tab.session_id).collect(),
             daemon_instance: self.daemon_instance,
+            titles: self
+                .tabs
+                .iter()
+                .map(|tab| tab.custom_title.clone())
+                .collect(),
+            zoom: self.zoom,
         }
     }
 
@@ -499,9 +548,14 @@ impl ForgeWindow {
                 session.daemon_instance,
                 cx,
             );
+            self.tabs[index].custom_title = session.title(index).map(str::to_owned);
         }
         self.active_tab = session.active.min(self.tabs.len().saturating_sub(1));
         self.split = session.split;
+        if session.zoom != 0 {
+            self.zoom = session.zoom;
+            self.apply_zoom(cx);
+        }
         if let Some(name) = session.theme
             && !name.eq_ignore_ascii_case(&self.theme_name)
             && let Ok(colors) = theme::load_theme(&name, self.themes_dir().as_deref())
@@ -552,6 +606,20 @@ impl ForgeWindow {
         daemon_instance: Option<u64>,
         cx: &mut Context<Self>,
     ) -> usize {
+        self.open_tab_with(cwd, attach, daemon_instance, None, cx)
+    }
+
+    fn open_tab_with(
+        &mut self,
+        cwd: Option<PathBuf>,
+        attach: Option<u64>,
+        daemon_instance: Option<u64>,
+        profile: Option<&TerminalProfile>,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let cwd = cwd
+            .or_else(|| profile.and_then(|profile| profile.cwd.clone()))
+            .filter(|path| path.is_dir());
         let cwd = cwd.or_else(|| {
             self.tabs
                 .get(self.active_tab)
@@ -561,9 +629,14 @@ impl ForgeWindow {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let (input, input_rx) = async_mpsc::unbounded_channel();
-        let title = cwd.as_ref().and_then(|path| path.file_name()).map_or_else(
-            || format!("Terminal {id}"),
-            |name| name.to_string_lossy().into_owned(),
+        let title = profile.map_or_else(
+            || {
+                cwd.as_ref().and_then(|path| path.file_name()).map_or_else(
+                    || format!("Terminal {id}"),
+                    |name| name.to_string_lossy().into_owned(),
+                )
+            },
+            |profile| profile.name.clone(),
         );
         let chrome_height = chrome::TOPBAR_HEIGHT + chrome::STATUS_HEIGHT;
         let (initial_cols, initial_rows) = crate::grid_dimensions(
@@ -574,6 +647,7 @@ impl ForgeWindow {
         self.tabs.push(TerminalTab {
             id,
             default_title: title,
+            custom_title: None,
             terminal: TerminalSurface::new(
                 TerminalGrid::new(initial_cols, initial_rows),
                 self.factory.metrics,
@@ -595,7 +669,7 @@ impl ForgeWindow {
         if self.factory.start_ipc {
             let cwd = cwd.unwrap_or_else(|| self.factory.cwd.clone());
             spawn_ipc_worker(
-                self.factory.spec(cwd, attach, daemon_instance),
+                self.factory.spec(cwd, attach, daemon_instance, profile),
                 id,
                 self.event_tx.clone(),
                 input_rx,
@@ -815,8 +889,109 @@ impl ForgeWindow {
     pub fn visible_tree(&self) -> PaneTree {
         self.split
             .clone()
-            .filter(|tree| tree.contains(self.active_tab))
+            .filter(|tree| !self.pane_zoom && tree.contains(self.active_tab))
             .unwrap_or(PaneTree::leaf(self.active_tab))
+    }
+
+    /// Swaps the active tab with its neighbour; panes follow their tabs.
+    fn move_active_tab(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let from = self.active_tab;
+        let Some(to) = from
+            .checked_add_signed(delta)
+            .filter(|to| *to < self.tabs.len())
+        else {
+            return;
+        };
+        self.tabs.swap(from, to);
+        if let Some(tree) = &mut self.split {
+            tree.swap_indices(from, to);
+        }
+        self.active_tab = to;
+        cx.notify();
+    }
+
+    // ----- zoom -----------------------------------------------------------
+
+    fn zoom_by(&mut self, delta: i8, cx: &mut Context<Self>) {
+        let zoom = if delta == 0 {
+            0
+        } else {
+            (self.zoom + delta).clamp(-8, 12)
+        };
+        if zoom == self.zoom {
+            return;
+        }
+        self.zoom = zoom;
+        self.apply_zoom(cx);
+        let percent = (zoom_factor(zoom) * 100.0).round();
+        self.notify_user(NotificationLevel::Info, format!("Zoom {percent} %"));
+        cx.notify();
+    }
+
+    /// Recomputes cell metrics from `font.size × factor` and lets every pane
+    /// resize its PTY on the next paint.
+    fn apply_zoom(&mut self, cx: &mut Context<Self>) {
+        let mut config = (*self.config).clone();
+        config.font.size = (config.font.size * zoom_factor(self.zoom)).clamp(4.0, 200.0);
+        let metrics = crate::cell_metrics_for(&config, cx);
+        self.factory.metrics = metrics;
+        for tab in &mut self.tabs {
+            tab.terminal.metrics = metrics;
+            tab.viewport = None;
+        }
+    }
+
+    // ----- rename and profile picker --------------------------------------
+
+    fn rename_key(
+        &mut self,
+        key: &str,
+        key_char: Option<&str>,
+        modifiers: KeyMods,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(prompt) = &mut self.rename else {
+            return;
+        };
+        match key {
+            "escape" => self.rename = None,
+            "enter" => {
+                let value = prompt.value.trim().to_owned();
+                self.rename = None;
+                self.active_tab_mut().custom_title = (!value.is_empty()).then_some(value);
+                self.save_session();
+            }
+            "backspace" => {
+                prompt.value.pop();
+            }
+            _ if !modifiers.control && !modifiers.alt => {
+                if let Some(text) = key_char {
+                    prompt.value.push_str(text);
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn picker_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        match key {
+            "escape" => self.picker = None,
+            "up" => picker.index = picker.index.saturating_sub(1),
+            "down" => picker.index = (picker.index + 1).min(picker.items.len().saturating_sub(1)),
+            "enter" => {
+                let index = picker.index;
+                self.picker = None;
+                if let Some(profile) = self.config.profiles.get(index).cloned() {
+                    self.open_tab_with(None, None, None, Some(&profile), cx);
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
     }
 
     fn split_active(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
@@ -985,28 +1160,13 @@ impl ForgeWindow {
         cx.stop_propagation();
         let keystroke = &event.keystroke;
         let modifiers = key_mods(keystroke.modifiers);
-        if self.confirmation.is_some() {
-            self.confirmation_key(keystroke.key.as_str(), cx);
-            return;
-        }
-        if self.palette.open {
-            self.palette_key(
-                keystroke.key.as_str(),
-                keystroke.key_char.as_deref(),
-                modifiers,
-                window,
-                cx,
-            );
-            return;
-        }
-        if self.search.open {
-            self.search_key(
-                keystroke.key.as_str(),
-                keystroke.key_char.as_deref(),
-                modifiers,
-                window,
-                cx,
-            );
+        if self.overlay_key(
+            keystroke.key.as_str(),
+            keystroke.key_char.as_deref(),
+            modifiers,
+            window,
+            cx,
+        ) {
             return;
         }
         let shell_key = ShellKeystroke::new(
@@ -1071,6 +1231,32 @@ impl ForgeWindow {
             let _ = tab.input.send(IpcCommand::Key(event));
             cx.notify();
         }
+    }
+
+    /// Routes a key to whichever overlay is open (confirmation, rename,
+    /// picker, palette, search bar). Returns whether one consumed it.
+    fn overlay_key(
+        &mut self,
+        key: &str,
+        key_char: Option<&str>,
+        modifiers: KeyMods,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.confirmation.is_some() {
+            self.confirmation_key(key, cx);
+        } else if self.rename.is_some() {
+            self.rename_key(key, key_char, modifiers, cx);
+        } else if self.picker.is_some() {
+            self.picker_key(key, cx);
+        } else if self.palette.open {
+            self.palette_key(key, key_char, modifiers, window, cx);
+        } else if self.search.open {
+            self.search_key(key, key_char, modifiers, window, cx);
+        } else {
+            return false;
+        }
+        true
     }
 
     /// Rows scrolled by Shift+PageUp/PageDown: one screen minus a line.
@@ -1238,6 +1424,71 @@ impl ForgeWindow {
             ShellCommand::SignalInterrupt => self.signal(ProcessSignal::Interrupt),
             ShellCommand::SignalTerminate => self.signal(ProcessSignal::Terminate),
             ShellCommand::SignalKill => self.signal(ProcessSignal::Kill),
+            other => self.run_layout_command(other, cx),
+        }
+    }
+
+    /// Tab, zoom and pane-layout commands, split out of
+    /// [`Self::run_shell_command`] to keep each match readable.
+    fn run_layout_command(&mut self, command: ShellCommand, cx: &mut Context<Self>) {
+        match command {
+            ShellCommand::RenameTab => {
+                self.rename = Some(TextPrompt {
+                    title: "Nombre de la pestaña".into(),
+                    value: self.active_tab().custom_title.clone().unwrap_or_default(),
+                });
+                cx.notify();
+            }
+            ShellCommand::MoveTabLeft => self.move_active_tab(-1, cx),
+            ShellCommand::MoveTabRight => self.move_active_tab(1, cx),
+            ShellCommand::ZoomIn => self.zoom_by(1, cx),
+            ShellCommand::ZoomOut => self.zoom_by(-1, cx),
+            ShellCommand::ZoomReset => self.zoom_by(0, cx),
+            ShellCommand::FocusPreviousPane => {
+                let previous = self.visible_tree().previous_leaf(self.active_tab);
+                let previous = if previous == self.active_tab && self.tabs.len() > 1 {
+                    (self.active_tab + self.tabs.len() - 1) % self.tabs.len()
+                } else {
+                    previous
+                };
+                self.activate_tab(previous, cx);
+            }
+            ShellCommand::ZoomPane => {
+                self.pane_zoom = !self.pane_zoom;
+                cx.notify();
+            }
+            ShellCommand::Unsplit => {
+                self.split = None;
+                self.pane_zoom = false;
+                cx.notify();
+            }
+            ShellCommand::NewTabWithProfile => {
+                if self.config.profiles.is_empty() {
+                    self.notify_user(
+                        NotificationLevel::Info,
+                        "Sin perfiles: añade [[profiles]] con name/shell/args/cwd/env en config.toml",
+                    );
+                } else {
+                    self.picker = Some(Picker {
+                        title: "Perfil de terminal".into(),
+                        items: self
+                            .config
+                            .profiles
+                            .iter()
+                            .map(|profile| {
+                                format!(
+                                    "{} · {}",
+                                    profile.name,
+                                    profile.shell.as_deref().unwrap_or("shell por defecto")
+                                )
+                            })
+                            .collect(),
+                        index: 0,
+                    });
+                }
+                cx.notify();
+            }
+            _ => {}
         }
     }
 
@@ -1758,6 +2009,11 @@ fn write_primary(cx: &App, item: ClipboardItem) {
 
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 fn write_primary(_cx: &App, _item: ClipboardItem) {}
+
+/// 10 % per step, like browsers.
+fn zoom_factor(steps: i8) -> f32 {
+    1.1_f32.powi(i32::from(steps))
+}
 
 /// Writes an application-requested clipboard payload to the target it named.
 fn write_clipboard(cx: &mut App, target: ClipboardTarget, text: String) {

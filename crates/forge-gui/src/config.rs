@@ -31,7 +31,8 @@ pub enum ConfigError {
 
 /// Keys the workspace layer may not set: a repository must not be able to
 /// pick the program Forge executes on the user's machine.
-pub const WORKSPACE_FORBIDDEN_KEYS: &[&[&str]] = &[&["terminal", "shell"], &["terminal", "args"]];
+pub const WORKSPACE_FORBIDDEN_KEYS: &[&[&str]] =
+    &[&["terminal", "shell"], &["terminal", "args"], &["profiles"]];
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -42,6 +43,26 @@ pub struct Config {
     pub terminal: TerminalConfig,
     pub ui: UiConfig,
     pub keybindings: Vec<UserKeyBinding>,
+    /// Named terminal setups for `terminal.newTabWithProfile`. Ignored in
+    /// the workspace layer, like `terminal.shell`.
+    pub profiles: Vec<TerminalProfile>,
+}
+
+/// A way to start a terminal: program, arguments, directory, environment.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalProfile {
+    pub name: String,
+    /// Program to run; defaults to `terminal.shell`.
+    #[serde(default)]
+    pub shell: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Starting directory; defaults to the active tab's.
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]

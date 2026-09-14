@@ -80,6 +80,12 @@ pub fn render_window(
         .when_some(view.confirmation.as_ref(), |root, confirmation| {
             root.child(confirmation_dialog(view, confirmation))
         })
+        .when_some(view.rename.as_ref(), |root, prompt| {
+            root.child(text_prompt(view, prompt))
+        })
+        .when_some(view.picker.as_ref(), |root, picker| {
+            root.child(picker_overlay(view, picker))
+        })
         .children(resize_handles())
         .into_any_element()
 }
@@ -544,6 +550,89 @@ fn process_explorer(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> impl I
                 .mt(px(4.0))
                 .child(format!("{} · {cols}×{rows} · {}", tab.title(), tab.status))
         }))
+}
+
+/// Floating box shared by the small overlays: same position as the palette.
+fn overlay_box(view: &ForgeWindow, id: &'static str) -> gpui::Stateful<gpui::Div> {
+    let theme = view.theme;
+    div()
+        .id(id)
+        .absolute()
+        .top(px(TOPBAR_HEIGHT + 28.0))
+        .left(px(48.0))
+        .w(px(440.0))
+        .p(px(12.0))
+        .rounded(px(8.0))
+        .bg(color(theme.chrome))
+        .border_1()
+        .border_color(color(theme.chrome_border))
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+}
+
+fn text_prompt(view: &ForgeWindow, prompt: &crate::window::TextPrompt) -> impl IntoElement {
+    let theme = view.theme;
+    let english = view.config.ui.language == Language::English;
+    overlay_box(view, "text-prompt")
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(color(theme.muted))
+                .child(prompt.title.clone()),
+        )
+        .child(
+            div()
+                .text_size(px(14.0))
+                .text_color(color(theme.foreground))
+                .child(format!("› {}▏", prompt.value)),
+        )
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(color(theme.muted))
+                .child(if english {
+                    "Enter applies · empty restores the automatic name · Esc cancels"
+                } else {
+                    "Enter aplica · vacío recupera el nombre automático · Esc cancela"
+                }),
+        )
+}
+
+fn picker_overlay(view: &ForgeWindow, picker: &crate::window::Picker) -> impl IntoElement {
+    let theme = view.theme;
+    let english = view.config.ui.language == Language::English;
+    overlay_box(view, "picker")
+        .child(
+            div()
+                .text_size(px(14.0))
+                .text_color(color(theme.foreground))
+                .child(picker.title.clone()),
+        )
+        .children(picker.items.iter().enumerate().map(|(index, item)| {
+            let selected = index == picker.index;
+            div()
+                .px(px(8.0))
+                .py(px(5.0))
+                .rounded(px(4.0))
+                .bg(color(if selected {
+                    theme.highlight
+                } else {
+                    theme.chrome_active
+                }))
+                .text_size(px(13.0))
+                .child(item.clone())
+        }))
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(color(theme.muted))
+                .child(if english {
+                    "↑↓ select · Enter opens · Esc closes"
+                } else {
+                    "↑↓ selecciona · Enter abre · Esc cierra"
+                }),
+        )
 }
 
 /// Modal question centred over the panes; answered from the keyboard

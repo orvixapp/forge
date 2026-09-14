@@ -31,10 +31,20 @@ pub enum ShellCommand {
     SignalInterrupt,
     SignalTerminate,
     SignalKill,
+    RenameTab,
+    MoveTabLeft,
+    MoveTabRight,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    FocusPreviousPane,
+    ZoomPane,
+    Unsplit,
+    NewTabWithProfile,
 }
 
 impl ShellCommand {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 29] = [
         Self::NewTerminalTab,
         Self::NewTerminalTabInDirectory,
         Self::CloseWindow,
@@ -54,6 +64,16 @@ impl ShellCommand {
         Self::SignalInterrupt,
         Self::SignalTerminate,
         Self::SignalKill,
+        Self::RenameTab,
+        Self::MoveTabLeft,
+        Self::MoveTabRight,
+        Self::ZoomIn,
+        Self::ZoomOut,
+        Self::ZoomReset,
+        Self::FocusPreviousPane,
+        Self::ZoomPane,
+        Self::Unsplit,
+        Self::NewTabWithProfile,
     ];
 
     #[must_use]
@@ -78,6 +98,16 @@ impl ShellCommand {
             Self::SignalInterrupt => "terminal.signal.interrupt",
             Self::SignalTerminate => "terminal.signal.terminate",
             Self::SignalKill => "terminal.signal.kill",
+            Self::RenameTab => "terminal.renameTab",
+            Self::MoveTabLeft => "terminal.moveTabLeft",
+            Self::MoveTabRight => "terminal.moveTabRight",
+            Self::ZoomIn => "view.zoomIn",
+            Self::ZoomOut => "view.zoomOut",
+            Self::ZoomReset => "view.zoomReset",
+            Self::FocusPreviousPane => "layout.focusPreviousPane",
+            Self::ZoomPane => "layout.zoomPane",
+            Self::Unsplit => "layout.unsplit",
+            Self::NewTabWithProfile => "terminal.newTabWithProfile",
         }
     }
 
@@ -103,6 +133,16 @@ impl ShellCommand {
             Self::SignalInterrupt => "Send SIGINT to the terminal's processes",
             Self::SignalTerminate => "Send SIGTERM to the terminal's processes",
             Self::SignalKill => "Send SIGKILL to the terminal's processes",
+            Self::RenameTab => "Rename tab…",
+            Self::MoveTabLeft => "Move tab left",
+            Self::MoveTabRight => "Move tab right",
+            Self::ZoomIn => "Zoom in (larger font)",
+            Self::ZoomOut => "Zoom out (smaller font)",
+            Self::ZoomReset => "Reset zoom",
+            Self::FocusPreviousPane => "Focus previous pane",
+            Self::ZoomPane => "Toggle pane zoom (show only the active pane)",
+            Self::Unsplit => "Unsplit: keep every terminal as a plain tab",
+            Self::NewTabWithProfile => "New terminal tab with profile…",
         }
     }
 
@@ -207,9 +247,10 @@ pub struct ShellKeymap {
 impl Default for ShellKeymap {
     fn default() -> Self {
         use ShellCommand::{
-            CloseWindow, CycleTheme, FocusNextPane, NewTerminalTab, NextPrompt, PreviousPrompt,
-            SearchNext, SearchPrevious, SearchScrollback, ShowCommandPalette, SplitHorizontal,
-            SplitVertical,
+            CloseWindow, CycleTheme, FocusNextPane, FocusPreviousPane, MoveTabLeft, MoveTabRight,
+            NewTerminalTab, NextPrompt, PreviousPrompt, RenameTab, SearchNext, SearchPrevious,
+            SearchScrollback, ShowCommandPalette, SplitHorizontal, SplitVertical, ZoomIn, ZoomOut,
+            ZoomPane, ZoomReset,
         };
         use ShellContext::{Terminal, Window};
         Self {
@@ -226,6 +267,15 @@ impl Default for ShellKeymap {
                 binding("h", true, false, true, Terminal, SearchPrevious),
                 binding("up", true, false, true, Terminal, PreviousPrompt),
                 binding("down", true, false, true, Terminal, NextPrompt),
+                binding("r", true, false, true, Window, RenameTab),
+                binding("pageup", true, false, true, Window, MoveTabLeft),
+                binding("pagedown", true, false, true, Window, MoveTabRight),
+                binding("=", true, false, false, Window, ZoomIn),
+                binding("+", true, false, true, Window, ZoomIn),
+                binding("-", true, false, false, Window, ZoomOut),
+                binding("0", true, false, false, Window, ZoomReset),
+                binding("tab", true, false, true, Window, FocusPreviousPane),
+                binding("enter", true, false, true, Window, ZoomPane),
             ],
         }
     }
@@ -571,6 +621,32 @@ impl PaneTree {
         let position = leaves.iter().position(|leaf| *leaf == current).unwrap_or(0);
         leaves[(position + 1) % leaves.len()]
     }
+
+    /// Leaf before `current` in reading order, wrapping around.
+    #[must_use]
+    pub fn previous_leaf(&self, current: usize) -> usize {
+        let leaves = self.leaves();
+        let position = leaves.iter().position(|leaf| *leaf == current).unwrap_or(0);
+        leaves[(position + leaves.len() - 1) % leaves.len()]
+    }
+
+    /// Renumbers leaves after tabs `a` and `b` swapped places in the tab
+    /// list, so every pane keeps showing the same terminal.
+    pub fn swap_indices(&mut self, a: usize, b: usize) {
+        match self {
+            Self::Leaf { index } => {
+                if *index == a {
+                    *index = b;
+                } else if *index == b {
+                    *index = a;
+                }
+            }
+            Self::Split { first, second, .. } => {
+                first.swap_indices(a, b);
+                second.swap_indices(a, b);
+            }
+        }
+    }
 }
 
 /// Persisted, versioned window state. Invalid or future state is rejected so
@@ -596,6 +672,12 @@ pub struct WindowSession {
     /// must never be reattached.
     #[serde(default)]
     pub daemon_instance: Option<u64>,
+    /// User-given tab names (`terminal.renameTab`), parallel to `sessions`.
+    #[serde(default)]
+    pub titles: Vec<Option<String>>,
+    /// Font zoom steps applied on top of `font.size`.
+    #[serde(default)]
+    pub zoom: i8,
 }
 
 impl WindowSession {
@@ -671,10 +753,16 @@ impl WindowSession {
         if !(self.width.is_finite() && self.height.is_finite()) {
             return Err("window size is not finite".into());
         }
-        if self.sessions.len() > self.count {
+        if self.sessions.len() > self.count || self.titles.len() > self.count {
             return Err("more daemon sessions than tabs".into());
         }
         Ok(())
+    }
+
+    /// User-given title of tab `index`, if the file recorded one.
+    #[must_use]
+    pub fn title(&self, index: usize) -> Option<&str> {
+        self.titles.get(index).and_then(Option::as_deref)
     }
 
     /// Daemon session for tab `index`, if the file recorded one.
@@ -841,6 +929,10 @@ mod tests {
         tree.split(2, 3, SplitDirection::Vertical);
         assert_eq!(tree.leaves(), [0, 1, 2, 3]);
         assert_eq!(tree.next_leaf(3), 0);
+        assert_eq!(tree.previous_leaf(0), 3);
+        let mut swapped = tree.clone();
+        swapped.swap_indices(0, 3);
+        assert_eq!(swapped.leaves(), [3, 1, 2, 0]);
         let tree = tree.remove(1).unwrap();
         assert_eq!(tree.leaves(), [0, 1, 2]);
         assert!(matches!(tree, PaneTree::Split { .. }));
@@ -922,6 +1014,8 @@ mod tests {
             theme: Some("forge-light".into()),
             sessions: vec![Some(7), None],
             daemon_instance: Some(42),
+            titles: vec![None, Some("build".into())],
+            zoom: 2,
         };
         session.save(&path).unwrap();
         assert_eq!(WindowSession::load(&path).unwrap(), Some(session.clone()));
@@ -943,6 +1037,8 @@ mod tests {
         assert_eq!(session.daemon_session(0), Some(7));
         assert_eq!(session.daemon_session(1), None);
         assert_eq!(session.daemon_session(5), None);
+        assert_eq!(session.title(1), Some("build"));
+        assert_eq!(session.title(0), None);
         let too_many = WindowSession {
             sessions: vec![None; 3],
             ..session

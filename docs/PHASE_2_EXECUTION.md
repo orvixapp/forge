@@ -102,11 +102,31 @@ y [`2026-09-13-flood-input.md`](../bench/results/2026-09-13-flood-input.md).
   por fila en la C API; queda para cuando lo haga (o se reconstruya desde
   las marcas A).
 
+## 2.6 — Acciones terminales
+
+- [x] Renombrar pestañas (`terminal.renameTab`, `Ctrl+Shift+R`) con prompt
+  en ventana; el nombre manda sobre OSC 7/título y se persiste en
+  `session.json` (`titles`).
+- [x] Mover/reordenar pestañas (`Ctrl+Shift+PageUp`/`PageDown`); los paneles
+  del árbol de splits siguen a su pestaña (`PaneTree::swap_indices`).
+- [x] Zoom de fuente `view.zoomIn`/`zoomOut`/`zoomReset` (`Ctrl+=`/`-`/`0`),
+  pasos del 10 % sobre `font.size`, métricas de celda recalculadas y PTY
+  redimensionado; el nivel se persiste.
+- [x] Señales `terminal.signal.interrupt`/`terminate`/`kill` al grupo de
+  procesos de la shell (`ClientMessage::Signal`, `rustix::kill_process_group`).
+- [x] Splits finales: `layout.focusPreviousPane` (`Ctrl+Shift+Tab`),
+  `layout.zoomPane` (`Ctrl+Shift+Enter`, sólo el panel activo) y
+  `layout.unsplit`.
+- [x] Perfiles por terminal (`[[profiles]]`: `name`, `shell`, `args`, `cwd`,
+  `env`) con selector `terminal.newTabWithProfile`; la capa de workspace no
+  puede definirlos (misma regla que `terminal.shell`).
+- [x] Cierre limpio: cerrar pestaña → `ShutdownSession`; cerrar ventana deja
+  las sesiones vivas en el daemon para reatachar.
+
 ## Resto de Fase 2
 
 - [ ] Comparación Ghostty/Alacritty (`VtEngine` ya desacoplado).
 - [ ] ConPTY y transporte equivalente en Windows.
 - [ ] Renderer completo: atlas, wide chars, emoji, estilos y redraw incremental.
 - [ ] Entrada xterm/Kitty, mouse, selección, copiar/pegar y protección.
-- [ ] Acciones finales de tabs/splits, renombrado, settings y señales.
 - [ ] Conformance (`vttest`/`esctest`), benchmarks finales y CI verde.

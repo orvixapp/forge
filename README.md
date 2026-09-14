@@ -91,9 +91,25 @@ before closing the last one), `window.toggleMaximize`, `layout.splitVertical`
 `terminal.searchNext` (`Ctrl+Shift+G`, towards older rows),
 `terminal.searchPrevious` (`Ctrl+Shift+H`), `terminal.previousPrompt` /
 `terminal.nextPrompt` (`Ctrl+Shift+Up`/`Down`, need shell integration),
-`terminal.signal.interrupt` / `terminate` / `kill` (palette only). The last
-window layout, size and theme are restored from `session.json` next to the
+`terminal.signal.interrupt` / `terminate` / `kill` (palette only),
+`terminal.renameTab` (`Ctrl+Shift+R`), `terminal.moveTabLeft` / `Right`
+(`Ctrl+Shift+PageUp`/`PageDown`), `view.zoomIn` / `zoomOut` / `zoomReset`
+(`Ctrl+=`, `Ctrl+-`, `Ctrl+0`), `layout.focusPreviousPane` (`Ctrl+Shift+Tab`),
+`layout.zoomPane` (`Ctrl+Shift+Enter`, shows only the active pane),
+`layout.unsplit`, `terminal.newTabWithProfile`. The last window layout, size,
+theme, tab names and zoom are restored from `session.json` next to the
 config.
+
+Profiles are named terminal setups for `terminal.newTabWithProfile`:
+
+```toml
+[[profiles]]
+name = "python"
+shell = "/usr/bin/python3"
+args = ["-q"]
+cwd = "~/proyectos"      # optional; defaults to the active tab's directory
+env = { PYTHONSTARTUP = "/home/me/.pythonrc" }
+```
 
 Search: the bar searches the whole scrollback in `forge-termd` (literal and
 case-insensitive by default; `Alt+R` regex, `Alt+C` case), highlights every

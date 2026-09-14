@@ -21,6 +21,13 @@
       "items": {
         "$ref": "#/$defs/UserKeyBinding"
       }
+    },
+    "profiles": {
+      "description": "Named terminal setups for `terminal.newTabWithProfile`. Ignored in\nthe workspace layer, like `terminal.shell`.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TerminalProfile"
+      }
     }
   },
   "additionalProperties": false,
@@ -224,6 +231,49 @@
       "required": [
         "command",
         "keys"
+      ]
+    },
+    "TerminalProfile": {
+      "description": "A way to start a terminal: program, arguments, directory, environment.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "shell": {
+          "description": "Program to run; defaults to `terminal.shell`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "cwd": {
+          "description": "Starting directory; defaults to the active tab's.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
       ]
     }
   }
