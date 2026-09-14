@@ -159,7 +159,10 @@ C; colours come from the theme's `[syntax]` table (`keyword`, `string`,
 in the working directory (respecting `.gitignore` and the global excludes),
 `Ctrl+Shift+F` searches the project with the ripgrep engine, `Ctrl+F` /
 `Ctrl+H` find and replace in the current file; files changed on disk reload
-while their buffer is clean.
+while their buffer is clean. Files ≥ 200 MB (or with lines over 1 MB) open
+memory-mapped and read-only (`editor.materialize` loads them for editing).
+`editor.autosave_ms` saves dirty files after a quiet period; `editor.modal`
+enables a small Helix-like Normal/Insert keymap.
 
 Diagnostics: `FORGE_LOG=debug` prints tracing/GPUI logs; `FORGE_TRACE_FILE=trace.json`
 writes a Chrome trace of the startup spans that Perfetto can open.

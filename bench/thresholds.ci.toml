@@ -21,3 +21,15 @@ p95_ms = 20.0
 
 [key_echo]
 p95_ms = 40.0
+
+[editor_typing]
+p95_ms = 30.0
+
+[open_large_log]
+p95_ms = 5000.0
+
+[fuzzy_1m_paths]
+p95_ms = 100.0
+
+[search_project_literal]
+p95_ms = 4000.0

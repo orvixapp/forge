@@ -235,6 +235,18 @@
         "line_numbers": {
           "type": "boolean",
           "default": true
+        },
+        "autosave_ms": {
+          "description": "Save dirty files this long after the last edit; 0 disables.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 0
+        },
+        "modal": {
+          "description": "Helix-like modal editing: files open in Normal mode (`i` inserts,\n`Esc` returns, `hjkl`/`w`/`b`/`0`/`$`/`G` move, `x`/`d` delete,\n`u`/`U` undo/redo, `v` extends, `y`/`p` copy/paste, `/` finds).",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false

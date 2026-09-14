@@ -57,6 +57,12 @@ pub struct EditorConfig {
     /// Insert `\t` instead of spaces on Tab.
     pub indent_with_tabs: bool,
     pub line_numbers: bool,
+    /// Save dirty files this long after the last edit; 0 disables.
+    pub autosave_ms: u64,
+    /// Helix-like modal editing: files open in Normal mode (`i` inserts,
+    /// `Esc` returns, `hjkl`/`w`/`b`/`0`/`$`/`G` move, `x`/`d` delete,
+    /// `u`/`U` undo/redo, `v` extends, `y`/`p` copy/paste, `/` finds).
+    pub modal: bool,
 }
 
 impl Default for EditorConfig {
@@ -65,6 +71,8 @@ impl Default for EditorConfig {
             tab_size: 4,
             indent_with_tabs: false,
             line_numbers: true,
+            autosave_ms: 0,
+            modal: false,
         }
     }
 }

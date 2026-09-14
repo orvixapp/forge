@@ -71,6 +71,8 @@ pub fn walker(root: &Path, extra_excludes: &[String]) -> Result<WalkBuilder, ign
 pub struct PathIndex {
     root: PathBuf,
     paths: Vec<String>,
+    /// ASCII-lowercased copy of `paths`, for the pre-filter.
+    lower: Vec<Vec<u8>>,
     pub scanned_in_ms: u128,
 }
 
@@ -99,11 +101,26 @@ impl PathIndex {
         drop(tx);
         let mut paths: Vec<String> = rx.into_iter().collect();
         paths.sort_unstable();
+        let lower = lowercase_all(&paths);
         Ok(Self {
             root: root.to_path_buf(),
             paths,
+            lower,
             scanned_in_ms: started.elapsed().as_millis(),
         })
+    }
+
+    /// An index over an already known list of paths (tests, benchmarks).
+    #[must_use]
+    pub fn from_paths(root: &Path, mut paths: Vec<String>) -> Self {
+        paths.sort_unstable();
+        let lower = lowercase_all(&paths);
+        Self {
+            root: root.to_path_buf(),
+            paths,
+            lower,
+            scanned_in_ms: 0,
+        }
     }
 
     #[must_use]
@@ -127,7 +144,9 @@ impl PathIndex {
     }
 
     /// Best `limit` matches for `query` (nucleo scoring, smart case); an
-    /// empty query lists the first paths in order.
+    /// empty query lists the first paths in order. Large indexes are
+    /// matched on every core after a cheap subsequence pre-filter, so a
+    /// million paths answer in a few milliseconds.
     #[must_use]
     pub fn fuzzy(&self, query: &str, limit: usize) -> Vec<FuzzyMatch<'_>> {
         if query.trim().is_empty() {
@@ -142,19 +161,50 @@ impl PathIndex {
                 })
                 .collect();
         }
-        let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
         let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
-        let mut buffer = Vec::new();
-        let mut scored: Vec<(u32, &String)> = self
-            .paths
-            .iter()
-            .filter_map(|path| {
-                pattern
-                    .score(Utf32Str::new(path, &mut buffer), &mut matcher)
-                    .map(|score| (score, path))
-            })
+        let needles: Vec<Vec<u8>> = query
+            .split_whitespace()
+            .map(|atom| atom.to_ascii_lowercase().into_bytes())
             .collect();
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(16));
+        let chunk = self.paths.len().div_ceil(threads).max(1);
+        let mut scored: Vec<(u32, &String)> = std::thread::scope(|scope| {
+            let workers: Vec<_> = self
+                .paths
+                .chunks(chunk)
+                .zip(self.lower.chunks(chunk))
+                .map(|(paths, lower)| {
+                    let pattern = &pattern;
+                    let needles = &needles;
+                    scope.spawn(move || {
+                        let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+                        let mut buffer = Vec::new();
+                        let mut hits: Vec<(u32, &String)> = paths
+                            .iter()
+                            .zip(lower)
+                            .filter(|(_, lower)| {
+                                needles.iter().all(|needle| is_subsequence(needle, lower))
+                            })
+                            .filter_map(|(path, _)| {
+                                pattern
+                                    .score(Utf32Str::new(path, &mut buffer), &mut matcher)
+                                    .map(|score| (score, path))
+                            })
+                            .collect();
+                        hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.len().cmp(&b.1.len())));
+                        hits.truncate(limit);
+                        hits
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap_or_default())
+                .collect()
+        });
         scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.len().cmp(&b.1.len())));
+        let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+        let mut buffer = Vec::new();
         scored
             .into_iter()
             .take(limit)
@@ -171,6 +221,30 @@ impl PathIndex {
             })
             .collect()
     }
+}
+
+fn lowercase_all(paths: &[String]) -> Vec<Vec<u8>> {
+    paths
+        .iter()
+        .map(|path| path.to_ascii_lowercase().into_bytes())
+        .collect()
+}
+
+/// Whether the bytes of `needle` (lowercase ASCII) appear in order inside
+/// the lowercased `haystack`. Non-ASCII needles pass through so nucleo
+/// decides.
+fn is_subsequence(needle: &[u8], haystack: &[u8]) -> bool {
+    if !needle.is_ascii() {
+        return true;
+    }
+    let mut rest = haystack;
+    for wanted in needle {
+        let Some(at) = rest.iter().position(|byte| byte == wanted) else {
+            return false;
+        };
+        rest = &rest[at + 1..];
+    }
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,6 +359,8 @@ mod tests {
         assert!(!found[0].indices.is_empty());
         assert_eq!(index.fuzzy("", 2).len(), 2);
         assert!(index.fuzzy("zzzz", 10).is_empty());
+        assert!(is_subsequence(b"cfl", b"src/config_loader.rs"));
+        assert!(!is_subsequence(b"lfc", b"src/config_loader.rs"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

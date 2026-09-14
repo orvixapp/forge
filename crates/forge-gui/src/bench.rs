@@ -164,6 +164,58 @@ pub fn spawn_panes_benchmark(
     );
 }
 
+/// Types `iterations` characters into the active editor (which the caller
+/// opened with a 10k-line Rust file), one per frame, measuring keystroke →
+/// present with highlighting on. The text exercises the parser: an
+/// identifier, a call and a newline per cycle.
+pub fn spawn_typing_benchmark(iterations: usize, window: WindowHandle<ForgeWindow>, cx: &mut App) {
+    const TYPED: &str = "let value = compute(input, 42);\n";
+    spawn_frame_benchmark(
+        "editor_typing",
+        iterations,
+        window,
+        |view, iteration| {
+            let text = TYPED
+                .chars()
+                .nth((iteration - 1) % TYPED.chars().count())
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            view.editor_type(&text);
+        },
+        cx,
+    );
+}
+
+/// A synthetic Rust file of `lines` lines for the typing benchmark.
+#[must_use]
+pub fn synthetic_rust_source(lines: usize) -> String {
+    use std::fmt::Write as _;
+    let mut source = String::with_capacity(lines * 48);
+    let mut line = 0;
+    while line < lines {
+        let _ = writeln!(
+            source,
+            "/// Item {line} generated for the typing benchmark."
+        );
+        let _ = writeln!(source, "pub fn item_{line}(input: &[u32]) -> u32 {{");
+        let _ = writeln!(
+            source,
+            "    let total: u32 = input.iter().map(|value| value * {}).sum();",
+            line % 7 + 1
+        );
+        let _ = writeln!(
+            source,
+            "    if total > {} {{ total - {} }} else {{ total }}",
+            line * 3,
+            line
+        );
+        let _ = writeln!(source, "}}");
+        source.push('\n');
+        line += 6;
+    }
+    source
+}
+
 /// Full 200×60 frame where every cell changes glyph and colour each revision,
 /// so the renderer cannot reuse anything from the previous frame.
 #[must_use]

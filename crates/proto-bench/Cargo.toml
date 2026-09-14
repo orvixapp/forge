@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+forge-project = { path = "../forge-project" }
+forge-search = { path = "../forge-search" }
 proto-ipc = { path = "../proto-ipc" }
 serde.workspace = true
 serde_json.workspace = true

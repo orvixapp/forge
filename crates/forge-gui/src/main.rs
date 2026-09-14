@@ -10,10 +10,10 @@ mod window;
 use crate::{
     bench::{
         GuiMetrics, emit_metrics, process_pss_kib, spawn_grid_benchmark, spawn_idle_benchmark,
-        spawn_panes_benchmark,
+        spawn_panes_benchmark, spawn_typing_benchmark, synthetic_rust_source,
     },
     grid_element::CellMetrics,
-    window::{WindowFactory, initial_cwd},
+    window::{ForgeWindow, WindowFactory, initial_cwd},
 };
 use forge_gui::{
     config::{Config, ConfigSources, resolve_font_family},
@@ -56,7 +56,9 @@ struct Startup {
 
 fn prepare_startup(options: &RunOptions) -> Startup {
     let _span = tracing::info_span!("startup").entered();
-    let benchmark = options.benchmark_grid_frames.is_some() || options.benchmark_panes.is_some();
+    let benchmark = options.benchmark_grid_frames.is_some()
+        || options.benchmark_panes.is_some()
+        || options.benchmark_typing.is_some();
     let headless =
         benchmark || options.benchmark_idle_ms.is_some() || options.exit_after_first_frame;
     // Benchmarks stay comparable across machines by ignoring user config.
@@ -145,7 +147,7 @@ fn main() {
                 config_path,
                 config,
                 sources,
-                socket: options.socket,
+                socket: options.socket.clone(),
                 cwd,
                 metrics,
                 window_size,
@@ -185,17 +187,38 @@ fn main() {
                     })
                     .expect("schedule startup measurement");
             }
-            if let Some(idle_ms) = options.benchmark_idle_ms {
-                spawn_idle_benchmark(idle_ms, Arc::clone(&render_count), cx);
-            }
-            if let Some(iterations) = options.benchmark_grid_frames {
-                spawn_grid_benchmark(iterations, window, cx);
-            }
-            if let Some((count, frames)) = panes {
-                spawn_panes_benchmark(count, frames, window, cx);
-            }
+            spawn_benchmarks(&options, panes, window, &render_count, cx);
             cx.activate(true);
         });
+}
+
+/// Starts whichever `--benchmark-*` scenario was requested.
+fn spawn_benchmarks(
+    options: &RunOptions,
+    panes: Option<(usize, usize)>,
+    window: gpui::WindowHandle<ForgeWindow>,
+    render_count: &Arc<AtomicU64>,
+    cx: &mut gpui::App,
+) {
+    if let Some(idle_ms) = options.benchmark_idle_ms {
+        spawn_idle_benchmark(idle_ms, Arc::clone(render_count), cx);
+    }
+    if let Some(iterations) = options.benchmark_grid_frames {
+        spawn_grid_benchmark(iterations, window, cx);
+    }
+    if let Some((count, frames)) = panes {
+        spawn_panes_benchmark(count, frames, window, cx);
+    }
+    if let Some(keystrokes) = options.benchmark_typing {
+        let path = std::env::temp_dir().join("forge-bench-typing.rs");
+        std::fs::write(&path, synthetic_rust_source(10_000)).expect("write the synthetic source");
+        window
+            .update(cx, |view, _, cx| {
+                view.open_file(&path, Some(5_000), Some(5), cx);
+            })
+            .expect("open the benchmark file");
+        spawn_typing_benchmark(keystrokes, window, cx);
+    }
 }
 
 /// `FORGE_LOG` filters `tracing` output on stderr; `FORGE_TRACE_FILE` writes
@@ -276,6 +299,8 @@ struct RunOptions {
     benchmark_grid_frames: Option<usize>,
     benchmark_panes: Option<usize>,
     benchmark_frames: usize,
+    /// Keystrokes to type into a synthetic 10k-line Rust file.
+    benchmark_typing: Option<usize>,
     /// Files to open in editor tabs, as `path` or `path:line[:col]`.
     files: Vec<String>,
 }
@@ -291,6 +316,7 @@ fn run_options() -> RunOptions {
         benchmark_grid_frames: None,
         benchmark_panes: None,
         benchmark_frames: 120,
+        benchmark_typing: None,
         files: Vec::new(),
     };
     while let Some(arg) = args.next() {
@@ -311,6 +337,9 @@ fn run_options() -> RunOptions {
             }
             "--benchmark-panes" => {
                 options.benchmark_panes = args.next().and_then(|value| value.parse().ok());
+            }
+            "--benchmark-typing" => {
+                options.benchmark_typing = args.next().and_then(|value| value.parse().ok());
             }
             "--benchmark-frames" => {
                 if let Some(frames) = args.next().and_then(|value| value.parse().ok()) {

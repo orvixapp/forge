@@ -444,7 +444,9 @@ impl ForgeWindow {
                         Err(_) => return,
                     }
                 }
-                match this.update(cx, |view, _| view.poll_project_search()) {
+                match this.update(cx, |view, _| {
+                    view.poll_project_search() | view.poll_syntax()
+                }) {
                     Ok(dirty) => changed |= dirty,
                     Err(_) => return,
                 }
@@ -466,6 +468,7 @@ impl ForgeWindow {
         self.save_session();
         self.refresh_search_if_due();
         dirty |= self.poll_watcher(cx);
+        dirty |= self.autosave();
         dirty
     }
 
@@ -1263,7 +1266,6 @@ impl ForgeWindow {
                     tab.status = status;
                 }
             }
-            UiEvent::SyntaxReady { tab_id, state } => self.on_syntax_ready(tab_id, *state, cx),
             UiEvent::IndexReady { index } => self.on_index_ready(*index, cx),
             UiEvent::Attached {
                 tab_id,

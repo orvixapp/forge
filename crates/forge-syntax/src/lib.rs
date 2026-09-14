@@ -7,7 +7,11 @@
 //! exists in the config.
 
 use ropey::Rope;
-use std::{ops::Range, path::Path, time::Instant};
+use std::{
+    ops::Range,
+    path::Path,
+    sync::{Arc, mpsc},
+};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{InputEdit, Language, Parser, Point, Query, QueryCursor, Tree};
 
@@ -156,27 +160,54 @@ pub struct Span {
     pub token: Token,
 }
 
-/// Parser, tree and query for one buffer.
+/// tree-sitter state for one buffer. Parsing runs on a worker thread that
+/// owns the `Parser`; the UI keeps the last tree it received, applies
+/// edits to it ahead of time (so highlights follow the text while the
+/// worker catches up) and adopts fresh trees as they arrive.
 pub struct SyntaxState {
     config: &'static LanguageConfig,
-    parser: Parser,
-    query: Query,
-    tokens: Vec<Option<Token>>,
+    query: Arc<Query>,
+    tokens: Arc<Vec<Option<Token>>>,
     tree: Option<Tree>,
-    /// Version of the buffer the tree corresponds to.
+    /// Buffer version the UI tree describes (edits applied ahead count).
     pub version: u64,
+    /// Version of the last tree the worker produced.
+    pub parsed_version: u64,
+    requests: mpsc::Sender<Request>,
+    replies: mpsc::Receiver<(u64, Tree)>,
+    /// Edits applied to the UI tree since the last adopted parse, replayed
+    /// onto trees that arrive for older versions.
+    pending: Vec<(u64, InputEdit)>,
+    /// Spans of the last requested line range, valid for `generation`.
+    cache: Option<HighlightCache>,
+    generation: u64,
 }
 
-/// Parsing budget per call on the UI thread; longer parses keep the old
-/// tree and retry on the next tick.
+enum Request {
+    Edit(InputEdit),
+    Parse(Rope, u64),
+    Reset,
+}
+
+struct HighlightCache {
+    generation: u64,
+    lines: Range<usize>,
+    spans: Vec<Vec<Span>>,
+}
+
+/// Longest an incremental parse of one keystroke may take on the UI
+/// thread; kept for API compatibility with callers that pass a budget to
+/// [`SyntaxState::parse`]. Parsing itself now happens off-thread.
 pub const PARSE_BUDGET_MS: u128 = 8;
 
 impl SyntaxState {
-    /// Prepares a parser for `config`; the query is compiled once.
+    /// Prepares a parser for `config` on a worker thread; the query is
+    /// compiled once.
     ///
     /// # Errors
     ///
-    /// Grammar/binding version mismatch or an invalid bundled query.
+    /// Grammar/binding version mismatch, an invalid bundled query or a
+    /// thread that cannot be spawned.
     pub fn new(config: &'static LanguageConfig) -> Result<Self, String> {
         let language = (config.language)();
         let mut parser = Parser::new();
@@ -190,13 +221,24 @@ impl SyntaxState {
             .iter()
             .map(|name| Token::from_capture(name))
             .collect();
+        let (requests, worker_rx) = mpsc::channel();
+        let (worker_tx, replies) = mpsc::channel();
+        std::thread::Builder::new()
+            .name(format!("forge-syntax-{}", config.name))
+            .spawn(move || worker(parser, &worker_rx, &worker_tx))
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             config,
-            parser,
-            query,
-            tokens,
+            query: Arc::new(query),
+            tokens: Arc::new(tokens),
             tree: None,
             version: 0,
+            parsed_version: 0,
+            requests,
+            replies,
+            pending: Vec::new(),
+            cache: None,
+            generation: 0,
         })
     }
 
@@ -210,80 +252,198 @@ impl SyntaxState {
         self.tree.is_some()
     }
 
-    /// Tells the tree about an edit so the next parse is incremental.
-    pub fn edited(&mut self, edit: &InputEdit) {
+    /// Records an edit that took the text to `version`: the UI tree shifts
+    /// immediately and the worker applies it before its next parse.
+    pub fn edited(&mut self, edit: &InputEdit, version: u64) {
         if let Some(tree) = &mut self.tree {
             tree.edit(edit);
         }
+        self.version = version;
+        self.pending.push((version, *edit));
+        self.cache = None;
+        let _ = self.requests.send(Request::Edit(*edit));
     }
 
     /// Forgets the tree; the next parse starts from scratch.
     pub fn invalidate(&mut self) {
         self.tree = None;
+        self.cache = None;
+        self.pending.clear();
+        let _ = self.requests.send(Request::Reset);
     }
 
-    /// Parses `text` (a snapshot at `version`), incrementally when a tree
-    /// exists. Returns `false` when the budget ran out; the old tree stays.
-    pub fn parse(&mut self, text: &Rope, version: u64, budget_ms: Option<u128>) -> bool {
-        let started = Instant::now();
-        let mut over_budget = |_: &tree_sitter::ParseState| {
-            if budget_ms.is_some_and(|budget| started.elapsed().as_millis() > budget) {
-                std::ops::ControlFlow::Break(())
-            } else {
-                std::ops::ControlFlow::Continue(())
+    /// Asks the worker for a tree of `text` (a snapshot at `version`).
+    /// Returns immediately; [`Self::poll`] adopts the result. The budget
+    /// is ignored: parsing never blocks the caller.
+    pub fn parse(&mut self, text: &Rope, version: u64, _budget_ms: Option<u128>) -> bool {
+        self.version = version;
+        self.requests
+            .send(Request::Parse(text.clone(), version))
+            .is_ok()
+    }
+
+    /// Adopts trees the worker finished. Returns whether highlights changed.
+    pub fn poll(&mut self) -> bool {
+        let mut adopted = false;
+        while let Ok((version, mut tree)) = self.replies.try_recv() {
+            if version < self.parsed_version {
+                continue;
             }
-        };
-        let options = tree_sitter::ParseOptions::new().progress_callback(&mut over_budget);
-        let mut read = |byte: usize, _: Point| -> &[u8] {
-            if byte >= text.len_bytes() {
-                return &[];
+            // Bring an older tree up to the UI's text with the edits it
+            // has not seen; the worker will deliver the real thing later.
+            for (edit_version, edit) in &self.pending {
+                if *edit_version > version {
+                    tree.edit(edit);
+                }
             }
-            let (chunk, chunk_start, _, _) = text.chunk_at_byte(byte);
-            &chunk.as_bytes()[byte - chunk_start..]
-        };
-        match self
-            .parser
-            .parse_with_options(&mut read, self.tree.as_ref(), Some(options))
-        {
-            Some(tree) => {
-                self.tree = Some(tree);
-                self.version = version;
-                true
-            }
-            None => false,
+            self.pending
+                .retain(|(edit_version, _)| *edit_version > version);
+            self.parsed_version = version;
+            self.tree = Some(tree);
+            adopted = true;
         }
+        if adopted {
+            self.cache = None;
+            self.generation += 1;
+        }
+        adopted
     }
 
-    /// Highlight spans of the line covering bytes `line_range` of `text`,
-    /// with byte ranges relative to the line start. Inner captures win
-    /// over enclosing ones, like tree-sitter-highlight.
+    /// Whether the worker still owes a tree for the current text.
     #[must_use]
-    pub fn line_spans(&self, text: &Rope, line_range: Range<usize>) -> Vec<Span> {
+    pub fn is_stale(&self) -> bool {
+        self.parsed_version < self.version || self.tree.is_none()
+    }
+
+    /// Highlight spans for each line in `lines` (byte ranges relative to
+    /// each line's start). One query run covers the whole range and the
+    /// result is cached until the tree or the text changes.
+    pub fn highlights(&mut self, text: &Rope, lines: Range<usize>) -> Vec<Vec<Span>> {
+        if let Some(cache) = &self.cache
+            && cache.generation == self.generation
+            && cache.lines.start <= lines.start
+            && cache.lines.end >= lines.end
+        {
+            let offset = lines.start - cache.lines.start;
+            return cache.spans[offset..offset + lines.len()].to_vec();
+        }
+        let lines = lines.start..lines.end.min(text.len_lines());
+        let spans = self.range_highlights(text, lines.clone());
+        self.cache = Some(HighlightCache {
+            generation: self.generation,
+            lines,
+            spans: spans.clone(),
+        });
+        spans
+    }
+
+    fn range_highlights(&self, text: &Rope, lines: Range<usize>) -> Vec<Vec<Span>> {
+        let mut per_line: Vec<Vec<(Range<usize>, Token)>> = vec![Vec::new(); lines.len()];
         let Some(tree) = &self.tree else {
-            return Vec::new();
+            return per_line.into_iter().map(|_| Vec::new()).collect();
         };
+        if lines.is_empty() {
+            return Vec::new();
+        }
+        let starts: Vec<usize> = (lines.start..=lines.end)
+            .map(|line| {
+                if line < text.len_lines() {
+                    text.line_to_byte(line)
+                } else {
+                    text.len_bytes()
+                }
+            })
+            .collect();
+        let byte_range = starts[0]..starts[starts.len() - 1];
         let mut cursor = QueryCursor::new();
-        cursor.set_byte_range(line_range.clone());
+        cursor.set_byte_range(byte_range.clone());
         let provider = |node: tree_sitter::Node| {
-            text.byte_slice(node.byte_range())
-                .chunks()
-                .map(str::as_bytes)
+            text.byte_slice(
+                node.byte_range().start.min(text.len_bytes())
+                    ..node.byte_range().end.min(text.len_bytes()),
+            )
+            .chunks()
+            .map(str::as_bytes)
         };
         let mut captures = cursor.captures(&self.query, tree.root_node(), provider);
-        let mut raw: Vec<(Range<usize>, Token)> = Vec::new();
         while let Some((matched, index)) = captures.next() {
             let capture = matched.captures()[*index];
             let Some(token) = self.tokens.get(capture.index as usize).copied().flatten() else {
                 continue;
             };
             let range = capture.node.byte_range();
-            let start = range.start.max(line_range.start);
-            let end = range.end.min(line_range.end);
-            if start < end {
-                raw.push((start - line_range.start..end - line_range.start, token));
+            let start = range.start.max(byte_range.start);
+            let end = range.end.min(byte_range.end);
+            if start >= end {
+                continue;
+            }
+            // A capture may span several lines: cut it at line starts.
+            let first = starts.partition_point(|line_start| *line_start <= start) - 1;
+            for (offset, line_start) in starts[first..starts.len() - 1].iter().enumerate() {
+                let line_end = starts[first + offset + 1];
+                if *line_start >= end {
+                    break;
+                }
+                let from = start.max(*line_start) - line_start;
+                let to = end.min(line_end) - line_start;
+                if from < to {
+                    per_line[first + offset].push((from..to, token));
+                }
             }
         }
-        resolve_overlaps(raw)
+        per_line.into_iter().map(resolve_overlaps).collect()
+    }
+
+    /// Spans of one line, for tests and one-off callers; uncached.
+    #[must_use]
+    pub fn line_spans(&self, text: &Rope, line_range: Range<usize>) -> Vec<Span> {
+        let line = text.byte_to_line(line_range.start.min(text.len_bytes()));
+        self.range_highlights(text, line..line + 1)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    }
+}
+
+/// The parsing thread: keeps its own tree, applies edits in order and
+/// parses the newest snapshot, coalescing requests that piled up.
+fn worker(
+    mut parser: Parser,
+    requests: &mpsc::Receiver<Request>,
+    replies: &mpsc::Sender<(u64, Tree)>,
+) {
+    let mut tree: Option<Tree> = None;
+    while let Ok(first) = requests.recv() {
+        let mut snapshot: Option<(Rope, u64)> = None;
+        let mut handle = |request: Request| match request {
+            Request::Edit(edit) => {
+                if let Some(tree) = &mut tree {
+                    tree.edit(&edit);
+                }
+            }
+            Request::Parse(rope, version) => snapshot = Some((rope, version)),
+            Request::Reset => tree = None,
+        };
+        handle(first);
+        while let Ok(request) = requests.try_recv() {
+            handle(request);
+        }
+        let Some((rope, version)) = snapshot else {
+            continue;
+        };
+        let mut read = |byte: usize, _: Point| -> &[u8] {
+            if byte >= rope.len_bytes() {
+                return &[];
+            }
+            let (chunk, chunk_start, _, _) = rope.chunk_at_byte(byte);
+            &chunk.as_bytes()[byte - chunk_start..]
+        };
+        if let Some(parsed) = parser.parse_with_options(&mut read, tree.as_ref(), None) {
+            tree = Some(parsed.clone());
+            if replies.send((version, parsed)).is_err() {
+                return;
+            }
+        }
     }
 }
 
@@ -351,6 +511,7 @@ pub fn input_edit(text: &Rope, new_start_char: usize, inserted: &str, removed: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn detects_languages_by_extension_and_shebang() {
@@ -367,6 +528,20 @@ mod tests {
             None
         );
         assert_eq!(detect(None, "#!/bin/sh").map(|l| l.name), Some("bash"));
+    }
+
+    /// Requests a parse and blocks until the worker delivered it.
+    fn parse_now(state: &mut SyntaxState, text: &Rope, version: u64) {
+        assert!(state.parse(text, version, None));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.is_stale() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+            state.poll();
+        }
+        assert!(
+            !state.is_stale(),
+            "parse of version {version} never arrived"
+        );
     }
 
     #[test]
@@ -386,7 +561,7 @@ mod tests {
         let config = LANGUAGES.iter().find(|l| l.name == "rust").unwrap();
         let mut state = SyntaxState::new(config).unwrap();
         let text = Rope::from_str("fn main() {\n    let s = \"hi\"; // note\n}\n");
-        assert!(state.parse(&text, 1, None));
+        parse_now(&mut state, &text, 1);
         let line1 = text.line_to_byte(1)..text.line_to_byte(2);
         let spans = state.line_spans(&text, line1);
         let token_at = |offset: usize| {
@@ -411,23 +586,59 @@ mod tests {
     }
 
     #[test]
+    fn range_highlights_match_per_line_queries_and_cache() {
+        let config = LANGUAGES.iter().find(|l| l.name == "rust").unwrap();
+        let mut state = SyntaxState::new(config).unwrap();
+        let text = Rope::from_str(
+            "fn main() {\n    let s = \"hi\"; // note\n    /* multi\n    line */ x();\n}\n",
+        );
+        parse_now(&mut state, &text, 1);
+        let all = state.highlights(&text, 0..5);
+        assert_eq!(all.len(), 5);
+        for (line, spans) in all.iter().enumerate() {
+            let start = text.line_to_byte(line);
+            let end = if line + 1 < text.len_lines() {
+                text.line_to_byte(line + 1)
+            } else {
+                text.len_bytes()
+            };
+            assert_eq!(spans, &state.line_spans(&text, start..end), "line {line}");
+        }
+        assert!(
+            all[3].iter().any(|span| span.token == Token::Comment),
+            "comment continues on line 3"
+        );
+        let sub = state.highlights(&text, 1..3);
+        assert_eq!(sub, all[1..3].to_vec(), "served from the cache");
+    }
+
+    #[test]
     fn incremental_parse_follows_edits() {
         let config = LANGUAGES.iter().find(|l| l.name == "rust").unwrap();
         let mut state = SyntaxState::new(config).unwrap();
         let mut text = Rope::from_str("fn a() {}\n");
-        assert!(state.parse(&text, 1, None));
+        parse_now(&mut state, &text, 1);
         // Insert a second function after the first line.
         let inserted = "fn b() {}\n";
         text.insert(text.line_to_char(1), inserted);
         let edit = input_edit(&text, text.line_to_char(1), inserted, "");
         assert_eq!(edit.start_byte, 10);
         assert_eq!(edit.new_end_position, Point { row: 2, column: 0 });
-        state.edited(&edit);
-        assert!(state.parse(&text, 2, Some(PARSE_BUDGET_MS)));
-        let line1 = text.line_to_byte(1)..text.line_to_byte(2);
-        let spans = state.line_spans(&text, line1);
-        assert_eq!(spans.first().map(|span| span.token), Some(Token::Keyword));
-        assert_eq!(state.version, 2);
+        state.edited(&edit, 2);
+        assert!(state.is_stale());
+        // The edited old tree still yields highlights for untouched lines.
+        let line0 = state.highlights(&text, 0..1);
+        assert_eq!(
+            line0[0].first().map(|span| span.token),
+            Some(Token::Keyword)
+        );
+        parse_now(&mut state, &text, 2);
+        let spans = state.highlights(&text, 1..2);
+        assert_eq!(
+            spans[0].first().map(|span| span.token),
+            Some(Token::Keyword)
+        );
+        assert_eq!(state.parsed_version, 2);
     }
 
     #[test]

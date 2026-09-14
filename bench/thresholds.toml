@@ -28,3 +28,19 @@ p95_ms = 16.0
 # terminals under the same 100 MiB daemon budget.
 [termd_idle]
 max_pss_kib = 102400
+
+# Phase 3 editor budgets (ARCHITECTURE.md §29): keystroke → present with
+# highlighting on a 10k-line file; opening a large log (includes ~120 ms
+# of startup; product target 500 ms for the open alone); fuzzy over 1M
+# paths; literal search of the workspace (≤ 1.2× ripgrep, checked by eye).
+[editor_typing]
+p95_ms = 3.0
+
+[open_large_log]
+p95_ms = 650.0
+
+[fuzzy_1m_paths]
+p95_ms = 10.0
+
+[search_project_literal]
+p95_ms = 400.0

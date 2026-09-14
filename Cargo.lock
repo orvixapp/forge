@@ -1826,6 +1826,8 @@ name = "forge-bench"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "forge-project",
+ "forge-search",
  "proto-ipc",
  "serde",
  "serde_json",

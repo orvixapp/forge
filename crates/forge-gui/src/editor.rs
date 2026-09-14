@@ -5,14 +5,13 @@
 
 use crate::{
     grid_element::{CellMetrics, color},
-    ipc::UiEvent,
     window::{ForgeWindow, NotificationLevel, Tab, TabContent},
 };
 use forge_buffer::{
     Buffer, Cursor, Edit, Journal, LargeFile, LoadedFile, Motion, Position, Selection, Selections,
     large,
 };
-use forge_syntax::{PARSE_BUDGET_MS, Span, SyntaxState, Token};
+use forge_syntax::{Span, SyntaxState, Token};
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, Element, ElementId, Entity, Font,
     GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, MouseDownEvent, Pixels,
@@ -23,12 +22,15 @@ use std::{
     borrow::Cow,
     ops::Range,
     path::{Path, PathBuf},
-    sync::mpsc::Sender,
+    time::{Duration, Instant},
 };
 
-/// Files above this size are parsed on a background thread the first time;
-/// smaller ones parse synchronously when opened.
-const BACKGROUND_PARSE_BYTES: usize = 256 * 1024;
+/// Helix-like editing modes, active when `editor.modal` is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorMode {
+    Insert,
+    Normal,
+}
 
 /// Space between the gutter text and the code, and around the gutter.
 const GUTTER_PADDING: f32 = 12.0;
@@ -50,14 +52,16 @@ pub struct EditorTab {
     pub recovered: bool,
     /// Line to centre on the next paint, once the row count is known.
     pending_center: Option<usize>,
-    /// tree-sitter state; `None` while unknown language or while a
-    /// background parse owns it.
+    /// tree-sitter state; `None` for unknown languages and large files.
     pub syntax: Option<SyntaxState>,
-    /// A background parse is in flight for this tab.
-    parsing: bool,
     /// Large-file mode: the text lives in this map, read-only, until the
     /// user materialises it (§13.4).
     pub large: Option<LargeFile>,
+    pub mode: EditorMode,
+    /// Normal-mode motions extend the selection instead of moving it.
+    pub extending: bool,
+    /// When the buffer last changed, for autosave.
+    pub last_edit: Instant,
 }
 
 /// Longest line prefix painted in large mode.
@@ -78,8 +82,10 @@ impl EditorTab {
             recovered: false,
             pending_center: None,
             syntax: None,
-            parsing: false,
             large: None,
+            mode: EditorMode::Insert,
+            extending: false,
+            last_edit: Instant::now(),
         }
     }
 
@@ -146,10 +152,8 @@ impl EditorTab {
         Ok(())
     }
 
-    /// Picks the grammar for the file and parses it (synchronously for
-    /// small files; otherwise on a thread that hands the state back via
-    /// `UiEvent::SyntaxReady`).
-    pub fn detect_language(&mut self, tab_id: u64, events: &Sender<UiEvent>) {
+    /// Picks the grammar for the file and asks its worker for a tree.
+    pub fn detect_language(&mut self) {
         if self.large.is_some() || self.buffer.len_bytes() > SYNTAX_MAX_BYTES {
             self.syntax = None;
             return;
@@ -163,41 +167,21 @@ impl EditorTab {
             self.syntax = None;
             return;
         };
-        let rope = self.buffer.rope();
-        let version = self.buffer.version();
-        if self.buffer.len_bytes() <= BACKGROUND_PARSE_BYTES {
-            state.parse(&rope, version, None);
-            self.syntax = Some(state);
-            return;
-        }
-        self.parsing = true;
-        let events = events.clone();
-        std::thread::Builder::new()
-            .name("forge-syntax".into())
-            .spawn(move || {
-                state.parse(&rope, version, None);
-                let _ = events.send(UiEvent::SyntaxReady {
-                    tab_id,
-                    state: Box::new(state),
-                });
-            })
-            .expect("spawn syntax parser");
+        state.parse(&self.buffer.rope(), self.buffer.version(), None);
+        self.syntax = Some(state);
     }
 
-    /// Takes a background parse result; a version gap triggers another
-    /// full parse so highlights never describe stale text.
-    pub fn syntax_ready(&mut self, state: SyntaxState, tab_id: u64, events: &Sender<UiEvent>) {
-        self.parsing = false;
-        if state.version == self.buffer.version() {
-            self.syntax = Some(state);
-        } else {
-            self.detect_language(tab_id, events);
-        }
+    /// Adopts trees the syntax worker finished; true when highlights
+    /// changed and the pane should repaint.
+    pub fn poll_syntax(&mut self) -> bool {
+        self.syntax.as_mut().is_some_and(SyntaxState::poll)
     }
 
-    /// Brings the tree up to date after buffer changes: incrementally when
-    /// only the last change is missing, otherwise from scratch.
+    /// Tells the syntax worker about the last change and marks the edit
+    /// time for autosave; every mutation ends up here. The UI tree shifts
+    /// immediately, the reparse arrives through [`Self::poll_syntax`].
     pub fn sync_syntax(&mut self) {
+        self.last_edit = Instant::now();
         let Some(state) = &mut self.syntax else {
             return;
         };
@@ -206,19 +190,22 @@ impl EditorTab {
             return;
         }
         let rope = self.buffer.rope();
-        if state.version + 1 == version && state.has_tree() {
+        if state.version + 1 == version {
             for change in self.buffer.last_change() {
-                state.edited(&forge_syntax::input_edit(
-                    &rope,
-                    change.new_start_char,
-                    &change.inserted,
-                    &change.removed,
-                ));
+                state.edited(
+                    &forge_syntax::input_edit(
+                        &rope,
+                        change.new_start_char,
+                        &change.inserted,
+                        &change.removed,
+                    ),
+                    version,
+                );
             }
         } else {
             state.invalidate();
         }
-        state.parse(&rope, version, Some(PARSE_BUDGET_MS));
+        state.parse(&rope, version, None);
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -239,6 +226,16 @@ impl EditorTab {
         let mut parts = vec![format!("Ln {}, Col {}", cursor.line + 1, cursor.column + 1)];
         if self.buffer.selections().len() > 1 {
             parts.push(format!("{} cursores", self.buffer.selections().len()));
+        }
+        if self.mode == EditorMode::Normal {
+            parts.insert(
+                0,
+                if self.extending {
+                    "SELECT".into()
+                } else {
+                    "NORMAL".into()
+                },
+            );
         }
         if let Some(file) = &self.file {
             parts.push(file.encoding.to_owned());
@@ -623,28 +620,24 @@ fn paint_editor(
     }
     let selections = editor.buffer.selections().clone();
     let primary_line = editor.buffer.position_of(selections.primary().head).line;
-    // Highlights come from the tree as of the last successful parse; a
-    // parse that ran out of budget keeps the previous tree, so a stale
-    // frame is at worst one keystroke behind.
+    // Highlights come from the tree as of the last successful parse (one
+    // query for the visible range, cached until the next edit); a parse
+    // that ran out of budget keeps the previous tree, so a stale frame is
+    // at worst one keystroke behind.
     let rope = editor.buffer.rope();
-    let spans_for = |line: usize| -> Vec<Span> {
-        editor.syntax.as_ref().map_or_else(Vec::new, |state| {
-            let start = rope.line_to_byte(line);
-            let end = if line + 1 < rope.len_lines() {
-                rope.line_to_byte(line + 1)
-            } else {
-                rope.len_bytes()
-            };
-            state.line_spans(&rope, start..end)
-        })
-    };
+    let highlights: Vec<Vec<Span>> = editor
+        .syntax
+        .as_mut()
+        .map_or_else(Vec::new, |state| state.highlights(&rope, first..last));
+    let spans_for =
+        |line: usize| -> &[Span] { highlights.get(line - first).map_or(&[][..], Vec::as_slice) };
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         window.paint_layer(bounds, |window| {
             for line in first..last {
                 let y = bounds.origin.y + line_height * ((line - first) as f32);
                 let text = editor.buffer.line(line).unwrap_or_default();
                 let (display, offsets) = display_line(&text, paint.tab_size);
-                let runs = paint.runs(&text, &offsets, display.len(), &spans_for(line));
+                let runs = paint.runs(&text, &offsets, display.len(), spans_for(line));
                 let shaped =
                     text_system.shape_line(SharedString::from(display), font_size, &runs, None);
                 let line_start = editor.buffer.char_at(Position { line, column: 0 });
@@ -834,6 +827,9 @@ impl ForgeWindow {
             editor.buffer = buffer;
             editor.file = Some(file);
             editor.recovered = recovered;
+            if self.config.editor.modal {
+                editor.mode = EditorMode::Normal;
+            }
             if recovered {
                 self.notify_user(
                     NotificationLevel::Warning,
@@ -844,10 +840,8 @@ impl ForgeWindow {
                 );
             }
             let index = self.push_tab(TabContent::Editor(Box::new(editor)), cx);
-            let tab_id = self.tabs[index].id;
-            let events = self.event_tx.clone();
             if let Some(editor) = self.tabs[index].editor_mut() {
-                editor.detect_language(tab_id, &events);
+                editor.detect_language();
             }
             self.watch_file(&path);
         }
@@ -861,8 +855,6 @@ impl ForgeWindow {
 
     /// Loads a large-mode file into memory so it becomes editable.
     pub fn materialize_active(&mut self, cx: &mut Context<Self>) {
-        let tab_id = self.active_tab().id;
-        let events = self.event_tx.clone();
         let Some(editor) = self.active_tab_mut().editor_mut() else {
             return;
         };
@@ -871,7 +863,7 @@ impl ForgeWindow {
         }
         match editor.materialize() {
             Ok(()) => {
-                editor.detect_language(tab_id, &events);
+                editor.detect_language();
                 if let Some(path) = editor.path().map(Path::to_path_buf) {
                     let mut buffer = std::mem::take(&mut editor.buffer);
                     let _ = self.attach_journal(&mut buffer, &path);
@@ -889,13 +881,15 @@ impl ForgeWindow {
         cx.notify();
     }
 
-    /// A background parse finished for `tab_id`.
-    pub fn on_syntax_ready(&mut self, tab_id: u64, state: SyntaxState, cx: &mut Context<Self>) {
-        let events = self.event_tx.clone();
-        if let Some(editor) = self.tab_mut(tab_id).and_then(Tab::editor_mut) {
-            editor.syntax_ready(state, tab_id, &events);
-            cx.notify();
+    /// Adopts finished parses of every editor tab; true when a repaint is
+    /// due. Called from the frame-rate poll loop.
+    pub fn poll_syntax(&mut self) -> bool {
+        // Every tab is polled (no short circuit) so no tree stays queued.
+        let mut changed = false;
+        for editor in self.tabs.iter_mut().filter_map(Tab::editor_mut) {
+            changed |= editor.poll_syntax();
         }
+        changed
     }
 
     /// Replays a leftover journal for `path` into `buffer` and attaches a
@@ -992,9 +986,8 @@ impl ForgeWindow {
                         }
                         let index = view.tabs.iter().position(|tab| tab.id == tab_id);
                         if let Some(index) = index {
-                            let events = view.event_tx.clone();
                             if let Some(editor) = view.tabs[index].editor_mut() {
-                                editor.detect_language(tab_id, &events);
+                                editor.detect_language();
                             }
                             view.activate_tab(index, cx);
                             view.save_active(cx);
@@ -1037,9 +1030,10 @@ impl ForgeWindow {
         modifiers: KeyMods,
         cx: &mut Context<Self>,
     ) {
-        let (tab_size, indent_with_tabs) = (
+        let (tab_size, indent_with_tabs, modal) = (
             self.config.editor.tab_size,
             self.config.editor.indent_with_tabs,
+            self.config.editor.modal,
         );
         let Some(editor) = self.active_tab_mut().editor_mut() else {
             return;
@@ -1063,6 +1057,9 @@ impl ForgeWindow {
             }
             cx.notify();
             return;
+        }
+        if editor.mode == EditorMode::Normal {
+            return self.normal_mode_key(key, key_char, modifiers, cx);
         }
         let extend = modifiers.shift;
         let word = modifiers.control;
@@ -1161,6 +1158,10 @@ impl ForgeWindow {
             "escape" => {
                 let collapsed = editor.buffer.selections().clone().collapse_to_primary();
                 editor.buffer.set_selections(collapsed);
+                if modal {
+                    editor.mode = EditorMode::Normal;
+                    editor.extending = false;
+                }
                 Ok(None)
             }
             _ if !modifiers.control && !modifiers.alt => match key_char {
@@ -1179,6 +1180,193 @@ impl ForgeWindow {
             editor.follow_cursor();
         }
         cx.notify();
+    }
+
+    /// Normal-mode keys of the modal keymap (a Helix subset).
+    #[allow(clippy::too_many_lines)]
+    fn normal_mode_key(
+        &mut self,
+        key: &str,
+        key_char: Option<&str>,
+        modifiers: KeyMods,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.active_tab_mut().editor_mut() else {
+            return;
+        };
+        let rows = editor.visible_rows.saturating_sub(1).max(1);
+        let extend = editor.extending || modifiers.shift;
+        let motion = match key_char.filter(|_| !modifiers.control && !modifiers.alt) {
+            Some("h") => Some(Motion::Left),
+            Some("l") => Some(Motion::Right),
+            Some("k") => Some(Motion::Up),
+            Some("j") => Some(Motion::Down),
+            Some("w") => Some(Motion::WordRight),
+            Some("b") => Some(Motion::WordLeft),
+            Some("0") => Some(Motion::LineStart),
+            Some("$") => Some(Motion::LineEnd),
+            Some("G") => Some(Motion::DocumentEnd),
+            _ => match key {
+                "left" => Some(Motion::Left),
+                "right" => Some(Motion::Right),
+                "up" => Some(Motion::Up),
+                "down" => Some(Motion::Down),
+                "home" => Some(Motion::LineStart),
+                "end" => Some(Motion::LineEnd),
+                "pageup" => Some(Motion::PageUp(rows)),
+                "pagedown" => Some(Motion::PageDown(rows)),
+                _ => None,
+            },
+        };
+        if let Some(motion) = motion {
+            let goal = editor.goal_column;
+            let vertical = matches!(
+                motion,
+                Motion::Up | Motion::Down | Motion::PageUp(_) | Motion::PageDown(_)
+            );
+            let mut new_goal = None;
+            let selections = editor.buffer.selections().clone().map(|selection| {
+                let cursor = editor.buffer.apply_motion(
+                    Cursor {
+                        selection,
+                        goal_column: if vertical { goal } else { None },
+                    },
+                    motion,
+                    extend,
+                );
+                new_goal = cursor.goal_column;
+                cursor.selection
+            });
+            editor.buffer.set_selections(selections);
+            editor.goal_column = if vertical { new_goal } else { None };
+            editor.follow_cursor();
+            cx.notify();
+            return;
+        }
+        let mut changed = false;
+        match (key, key_char) {
+            ("escape", _) => {
+                let collapsed = editor.buffer.selections().clone().collapse_to_primary();
+                editor.buffer.set_selections(collapsed);
+                editor.extending = false;
+            }
+            (_, Some("i")) => editor.mode = EditorMode::Insert,
+            (_, Some("a")) => {
+                let moved = editor.buffer.selections().clone().map(|selection| {
+                    Selection::point((selection.range().end).min(editor.buffer.len_chars()))
+                });
+                editor.buffer.set_selections(moved);
+                editor.mode = EditorMode::Insert;
+            }
+            (_, Some("o" | "O")) => {
+                let below = key_char == Some("o");
+                let line = editor
+                    .buffer
+                    .position_of(editor.buffer.selections().primary().head)
+                    .line;
+                let indent: String = editor
+                    .buffer
+                    .line(line)
+                    .unwrap_or_default()
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .collect();
+                let (at, text) = if below {
+                    (
+                        editor.buffer.char_at(Position {
+                            line,
+                            column: usize::MAX,
+                        }),
+                        format!("\n{indent}"),
+                    )
+                } else {
+                    (
+                        editor.buffer.char_at(Position { line, column: 0 }),
+                        format!("{indent}\n"),
+                    )
+                };
+                let after = if below {
+                    at + 1 + indent.chars().count()
+                } else {
+                    at + indent.chars().count()
+                };
+                changed = editor
+                    .buffer
+                    .edit_with_selections(
+                        vec![Edit::insert(at, text)],
+                        Selections::single(Selection::point(after)),
+                        false,
+                    )
+                    .is_ok();
+                editor.mode = EditorMode::Insert;
+            }
+            (_, Some("v")) => editor.extending = !editor.extending,
+            (_, Some("x")) => changed = editor.buffer.delete(0, 1).is_ok(),
+            (_, Some("d")) => {
+                let edits: Vec<Edit> = editor
+                    .buffer
+                    .selections()
+                    .iter()
+                    .filter(|selection| !selection.is_empty())
+                    .map(|selection| Edit::delete(selection.range()))
+                    .collect();
+                changed = !edits.is_empty() && editor.buffer.edit(edits, false).is_ok();
+                editor.extending = false;
+            }
+            (_, Some("u")) => changed = editor.buffer.undo(),
+            (_, Some("U")) => changed = editor.buffer.redo(),
+            (_, Some("y")) => return self.editor_copy(false, cx),
+            (_, Some("p")) => return self.editor_paste(cx),
+            (_, Some("/")) => return self.open_find(false, cx),
+            _ => {}
+        }
+        if changed {
+            editor.goal_column = None;
+            editor.follow_cursor();
+            editor.sync_syntax();
+        }
+        self.refresh_find();
+        cx.notify();
+    }
+
+    /// Saves every dirty file whose last edit is older than the configured
+    /// autosave delay. Returns whether anything was written.
+    pub fn autosave(&mut self) -> bool {
+        let delay = self.config.editor.autosave_ms;
+        if delay == 0 {
+            return false;
+        }
+        let delay = Duration::from_millis(delay);
+        let mut saved = Vec::new();
+        for tab in &mut self.tabs {
+            let Some(editor) = tab.editor_mut() else {
+                continue;
+            };
+            let Some(file) = &editor.file else { continue };
+            if editor.is_large() || !editor.buffer.is_dirty() || editor.last_edit.elapsed() < delay
+            {
+                continue;
+            }
+            if file.write(&editor.buffer.text()).is_ok() {
+                editor.buffer.mark_saved();
+                editor.recovered = false;
+                saved.push(file.path.display().to_string());
+            }
+        }
+        for path in &saved {
+            self.notify_user(NotificationLevel::Info, format!("Autoguardado {path}"));
+        }
+        !saved.is_empty()
+    }
+
+    /// Inserts text at the cursors of the active editor without a GPUI
+    /// context; the benchmark harness redraws on its own.
+    pub fn editor_type(&mut self, text: &str) {
+        if let Some(editor) = self.active_tab_mut().editor_mut() {
+            let _ = editor.buffer.insert(text, true);
+            editor.follow_cursor();
+            editor.sync_syntax();
+        }
     }
 
     /// Text committed by the IME (dead keys, CJK) into the active editor.

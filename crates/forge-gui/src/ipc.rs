@@ -29,11 +29,6 @@ pub enum UiEvent {
         session_id: u64,
         daemon_instance: u64,
     },
-    /// A background tree-sitter parse finished for an editor tab.
-    SyntaxReady {
-        tab_id: u64,
-        state: Box<forge_syntax::SyntaxState>,
-    },
     /// The workspace path index was (re)built.
     IndexReady {
         index: Box<Result<forge_project::PathIndex, String>>,

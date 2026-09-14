@@ -48,8 +48,16 @@ async fn main() -> Result<()> {
         "key_echo" => key_echo::run(options.iterations).await?,
         "flood_input" => key_echo::run_flood(options.iterations).await?,
         "termd_idle" => termd_idle::run(options.iterations).await?,
+        "editor_typing" => gui_scenario(
+            "editor_typing",
+            1,
+            &["--benchmark-typing", &options.iterations.to_string()],
+        )?,
+        "open_large_log" => editor::open_large_log(options.iterations)?,
+        "fuzzy_1m_paths" => editor::fuzzy_1m_paths(options.iterations),
+        "search_project_literal" => editor::search_project_literal(options.iterations)?,
         _ => bail!(
-            "unknown scenario {scenario}; use ipc_round_trip, startup_empty, idle, grid_full, panes_20, key_echo, flood_input, or termd_idle"
+            "unknown scenario {scenario}; use ipc_round_trip, startup_empty, idle, grid_full, panes_20, key_echo, flood_input, termd_idle, editor_typing, open_large_log, fuzzy_1m_paths, or search_project_literal"
         ),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -152,6 +160,154 @@ fn gui_scenario(scenario: &str, iterations: usize, args: &[&str]) -> Result<Benc
         frames = Some(metrics.frames);
     }
     Ok(summarize(scenario, samples, &pss, frames))
+}
+
+/// Phase 3 editor scenarios (ARCHITECTURE.md §29): opening a large log,
+/// fuzzy matching a million paths and searching the workspace.
+mod editor {
+    use super::{BenchmarkResult, gui_scenario, summarize};
+    use anyhow::{Context as _, Result, bail};
+    use std::{
+        io::Write as _,
+        path::{Path, PathBuf},
+        time::Instant,
+    };
+
+    /// Size of the generated log in MiB; `FORGE_BENCH_LOG_MB` overrides the
+    /// 256 MiB default (the product target is a 1 GiB file).
+    fn log_size_mib() -> u64 {
+        std::env::var("FORGE_BENCH_LOG_MB")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(256)
+    }
+
+    fn generated_log() -> Result<PathBuf> {
+        let path = std::env::temp_dir().join(format!("forge-bench-{}mib.log", log_size_mib()));
+        let wanted = log_size_mib() * 1024 * 1024;
+        if std::fs::metadata(&path).map_or(0, |meta| meta.len()) >= wanted {
+            return Ok(path);
+        }
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&path)?);
+        let mut written = 0_u64;
+        let mut line = 0_u64;
+        while written < wanted {
+            let text = format!(
+                "2026-09-14T12:00:{:02}.{:03}Z INFO worker-{} request {line} handled in {} ms status=200\n",
+                line % 60,
+                line % 1000,
+                line % 17,
+                line % 97
+            );
+            written += text.len() as u64;
+            line += 1;
+            file.write_all(text.as_bytes())?;
+        }
+        file.flush()?;
+        Ok(path)
+    }
+
+    /// Time from process start to the first painted frame with the log
+    /// open in large mode, minus nothing: the number includes Forge's own
+    /// startup (~120 ms on DEV-1), so compare it against `startup_empty`.
+    pub fn open_large_log(iterations: usize) -> Result<BenchmarkResult> {
+        let path = generated_log()?;
+        let file = path.to_string_lossy().into_owned();
+        let result = gui_scenario(
+            "open_large_log",
+            iterations,
+            &["--exit-after-first-frame", &file],
+        )?;
+        Ok(result)
+    }
+
+    /// Fuzzy queries over a million synthetic paths, single-threaded.
+    pub fn fuzzy_1m_paths(iterations: usize) -> BenchmarkResult {
+        let dirs = [
+            "src",
+            "crates",
+            "lib",
+            "tests",
+            "docs",
+            "vendor_ok",
+            "app",
+            "pkg",
+        ];
+        let names = [
+            "config", "loader", "window", "buffer", "syntax", "editor", "search", "index",
+        ];
+        let paths: Vec<String> = (0..1_000_000)
+            .map(|i| {
+                format!(
+                    "{}/module_{}/{}_{}.rs",
+                    dirs[i % dirs.len()],
+                    i / 64,
+                    names[(i / 8) % names.len()],
+                    i % 8
+                )
+            })
+            .collect();
+        let index = forge_project::PathIndex::from_paths(Path::new("/bench"), paths);
+        let queries = ["cfg ld", "win 5", "syntax_3", "crates/module_9/editor"];
+        let mut samples = Vec::with_capacity(iterations);
+        for iteration in 0..iterations {
+            let query = queries[iteration % queries.len()];
+            let started = Instant::now();
+            let found = index.fuzzy(query, 12);
+            samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+            assert!(!found.is_empty(), "query {query} matched nothing");
+        }
+        summarize("fuzzy_1m_paths", samples, &[], None)
+    }
+
+    /// Literal search across the Forge repository (the "linux" tree of the
+    /// architecture is not on hand), against ripgrep when it is installed.
+    pub fn search_project_literal(iterations: usize) -> Result<BenchmarkResult> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .context("workspace root")?
+            .to_path_buf();
+        let query = "fn ";
+        let mut samples = Vec::with_capacity(iterations);
+        let mut matches = 0;
+        for _ in 0..iterations {
+            let started = Instant::now();
+            let search = forge_search::search_project(
+                &root,
+                query,
+                forge_search::SearchOptions::default(),
+                usize::MAX,
+            )
+            .map_err(|error| anyhow::anyhow!(error))?;
+            matches = search
+                .events
+                .iter()
+                .filter(|event| matches!(event, forge_search::SearchEvent::Match(_)))
+                .count();
+            samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+        }
+        if matches == 0 {
+            bail!("the literal search found nothing in {}", root.display());
+        }
+        if let Ok(output) = std::process::Command::new("rg")
+            .args(["--count-matches", "-F", query])
+            .current_dir(&root)
+            .output()
+        {
+            let started = Instant::now();
+            let _ = std::process::Command::new("rg")
+                .args(["-F", query])
+                .current_dir(&root)
+                .output();
+            eprintln!(
+                "rg -F {query:?}: {:.1} ms (forge found {matches} matching lines; rg exit {})",
+                started.elapsed().as_secs_f64() * 1_000.0,
+                output.status
+            );
+        }
+        Ok(summarize("search_project_literal", samples, &[], None))
+    }
 }
 
 fn forge_gui_executable() -> PathBuf {
