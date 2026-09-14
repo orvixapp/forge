@@ -1112,7 +1112,7 @@ mod unix {
                     regex,
                     case_sensitive,
                 )
-                .await?
+                .await?;
             }
             ClientMessage::Signal { session_id, signal } => {
                 daemon.session(session_id).await?.signal(signal)?;

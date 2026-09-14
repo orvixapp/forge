@@ -532,7 +532,9 @@ impl<V: EntityInputHandler> Element for TerminalGridElement<V> {
             );
         }
         self.view.update(cx, |view, _| {
-            paint_grid(surface(view, index, inner), inner, window);
+            // Prompt marks sit in the padding, left of column zero.
+            let gutter = self.padding.min(px(6.0));
+            paint_grid(surface(view, index, inner), inner, gutter, window);
         });
     }
 }
@@ -555,7 +557,12 @@ impl GridFrame {
     }
 }
 
-fn paint_grid(surface: &mut TerminalSurface, bounds: Bounds<Pixels>, window: &mut Window) {
+fn paint_grid(
+    surface: &mut TerminalSurface,
+    bounds: Bounds<Pixels>,
+    gutter: Pixels,
+    window: &mut Window,
+) {
     let text_system = window.text_system().clone();
     let font = window.text_style().font();
     let metrics = surface.metrics;
@@ -601,7 +608,11 @@ fn paint_grid(surface: &mut TerminalSurface, bounds: Bounds<Pixels>, window: &mu
     // This is a custom-painted element, so the parent's `overflow_hidden`
     // does not automatically constrain glyph sprites. Some fonts overhang
     // their cell; without an explicit mask row zero bleeds into the tab bar.
-    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+    let mask = Bounds::new(
+        bounds.origin - point(gutter, px(0.0)),
+        size(bounds.size.width + gutter, bounds.size.height),
+    );
+    window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
         window.paint_layer(bounds, |window| {
             paint_backgrounds(grid, &frame, &mut scratch.colors, window);
             if !search.matches.is_empty() {
@@ -637,7 +648,9 @@ fn paint_grid(surface: &mut TerminalSurface, bounds: Bounds<Pixels>, window: &mu
                 blink_visible,
                 window,
             );
-            paint_prompt_marks(grid, &frame, palette.accent, window);
+            if gutter > px(0.0) {
+                paint_prompt_marks(grid, &frame, gutter, palette.accent, window);
+            }
             if let Some((y, cols)) = hover_link {
                 paint_link_underline(&frame, y, cols, metrics, palette.accent, window);
             }
@@ -849,17 +862,24 @@ fn paint_decorations(
 
 /// A short bar in the left margin of every OSC 133 prompt row, so the eye
 /// finds command boundaries in long output.
-fn paint_prompt_marks(grid: &TerminalGrid, frame: &GridFrame, color: Rgba, window: &mut Window) {
+fn paint_prompt_marks(
+    grid: &TerminalGrid,
+    frame: &GridFrame,
+    gutter: Pixels,
+    color: Rgba,
+    window: &mut Window,
+) {
     if frame.cols.start != 0 {
         return;
     }
+    let width = px(2.0).min(gutter);
     for y in frame.rows.clone() {
         if grid.prompt_mark(y) != 1 {
             continue;
         }
-        let origin = frame.cell_origin(0, y) - point(px(4.0), px(0.0));
+        let origin = frame.cell_origin(0, y) - point(gutter, px(0.0));
         window.paint_quad(fill(
-            Bounds::new(origin, size(px(2.0), frame.cell.height)),
+            Bounds::new(origin, size(width, frame.cell.height)),
             color,
         ));
     }

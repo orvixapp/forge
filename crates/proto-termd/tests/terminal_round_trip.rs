@@ -801,3 +801,173 @@ async fn search_finds_scrollback_rows_and_reports_bad_patterns() {
     daemon.kill().await.ok();
     let _ = std::fs::remove_file(&socket);
 }
+
+/// OSC 133 prompt marks, OSC 8 hyperlinks and OSC 52 clipboard writes
+/// reach the client, and prompt navigation moves the viewport.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn osc_marks_hyperlinks_and_clipboard_cross_the_daemon_boundary() {
+    let Some(ghostty_lib) = ghostty_library() else {
+        eprintln!("skipping Ghostty integration test; set FORGE_GHOSTTY_LIB");
+        return;
+    };
+    let socket = unique_socket();
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_proto-termd"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--ghostty-lib")
+        .arg(ghostty_lib)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn daemon");
+    let stream = timeout(Duration::from_secs(5), connect_when_ready(&socket))
+        .await
+        .expect("daemon startup timed out")
+        .expect("connect to daemon");
+    let (mut reader, mut writer) = stream.into_split();
+    write_message(
+        &mut writer,
+        FrameKind::Request,
+        &ClientMessage::Initialize {
+            protocol_version: PROTOCOL_VERSION,
+            client_name: "integration-test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    read_message::<_, ServerMessage>(&mut reader).await.unwrap();
+    // Two "prompts" separated by 30 lines of output, a hyperlink, an
+    // OSC 52 write (base64 "forge"), then `cat` keeps the PTY open.
+    let script = "printf '\\033]133;A\\007$ one\\033]133;B\\007\\n'; \
+        i=1; while [ $i -le 30 ]; do echo \"out $i\"; i=$((i+1)); done; \
+        printf '\\033]133;A\\007$ two\\033]133;B\\007\\n'; \
+        printf '\\033]8;;https://forge.dev/x\\033\\\\link\\033]8;;\\033\\\\ plain\\n'; \
+        printf '\\033]52;c;Zm9yZ2U=\\007'; \
+        printf 'ENV=%s\\n' \"$FORGE_TEST_ENV\"; cat";
+    write_message(
+        &mut writer,
+        FrameKind::Request,
+        &ClientMessage::CreateSession {
+            request_id: 1,
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: std::env::current_dir().unwrap(),
+            cols: 40,
+            rows: 10,
+            env: vec![("FORGE_TEST_ENV".into(), "injected".into())],
+        },
+    )
+    .await
+    .unwrap();
+    let session_id = match read_message::<_, ServerMessage>(&mut reader)
+        .await
+        .unwrap()
+        .1
+    {
+        ServerMessage::SessionCreated { session_id, .. } => session_id,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    write_message(
+        &mut writer,
+        FrameKind::Request,
+        &ClientMessage::Attach { session_id },
+    )
+    .await
+    .unwrap();
+
+    // The clipboard write arrives decoded, targeting the clipboard.
+    let (text, target) = wait_for(&mut reader, |message| match message {
+        ServerMessage::ClipboardWrite { text, target, .. } => Some((text.clone(), *target)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(text, "forge");
+    assert_eq!(target, proto_ipc::ClipboardTarget::Clipboard);
+
+    // Once everything printed, the visible rows carry the hyperlink on the
+    // "link" cells only, and the env var reached the shell.
+    let rows = wait_for(&mut reader, |message| match message {
+        ServerMessage::ScreenPatch { dirty_rows, .. }
+            if dirty_rows.iter().any(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+                    .starts_with("ENV=injected")
+            }) =>
+        {
+            Some(dirty_rows.clone())
+        }
+        _ => None,
+    })
+    .await;
+    let link_row = rows
+        .iter()
+        .find(|row| row.cells.iter().any(|cell| cell.hyperlink.is_some()))
+        .expect("a row with a hyperlink");
+    let linked: String = link_row
+        .cells
+        .iter()
+        .filter(|cell| cell.hyperlink.as_deref() == Some("https://forge.dev/x"))
+        .map(|cell| cell.text.as_str())
+        .collect();
+    assert_eq!(linked, "link");
+    assert!(
+        link_row
+            .cells
+            .iter()
+            .filter(|cell| cell.hyperlink.is_some())
+            .count()
+            == 4,
+        "only the link cells carry the URI"
+    );
+    // The second prompt is on screen and marked.
+    assert!(
+        rows.iter().any(|row| row.prompt == 1
+            && row
+                .cells
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<String>()
+                .starts_with("$ two")),
+        "prompt mark missing: {:?}",
+        rows.iter()
+            .map(|row| (row.y, row.prompt))
+            .collect::<Vec<_>>()
+    );
+
+    // Previous prompt: the viewport jumps back to "$ one" at row 0.
+    write_message(
+        &mut writer,
+        FrameKind::Notification,
+        &ClientMessage::ScrollToPrompt {
+            session_id,
+            direction: proto_ipc::PromptDirection::Previous,
+        },
+    )
+    .await
+    .unwrap();
+    let (offset, first) = wait_for(&mut reader, |message| match message {
+        ServerMessage::ScreenPatch {
+            viewport,
+            dirty_rows,
+            ..
+        } if viewport.scrolled_back() => dirty_rows.iter().find(|row| row.y == 0).map(|row| {
+            (
+                viewport.offset,
+                row.cells
+                    .iter()
+                    .map(|c| c.text.as_str())
+                    .collect::<String>(),
+            )
+        }),
+        _ => None,
+    })
+    .await;
+    assert!(first.starts_with("$ one"), "{offset} {first:?}");
+
+    daemon.kill().await.ok();
+    let _ = std::fs::remove_file(&socket);
+}
