@@ -244,6 +244,12 @@ impl ProviderConfig {
                 set(&mut env, "ANTHROPIC_MODEL", &self.model);
                 if let Some(key) = &key {
                     set(&mut env, "ANTHROPIC_API_KEY", key);
+                    // Gateways (Token Harbor, LiteLLM…) take the key as a
+                    // bearer token, which is what Claude Code sends from
+                    // `ANTHROPIC_AUTH_TOKEN`; direct Anthropic ignores it.
+                    if !self.base_url.is_empty() {
+                        set(&mut env, "ANTHROPIC_AUTH_TOKEN", key);
+                    }
                 }
             }
             ProviderKind::Google => {

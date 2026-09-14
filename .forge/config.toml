@@ -1,0 +1,6 @@
+# Forge — workspace configuration (.forge/config.toml). Layered on top of
+# the user file. Cannot set terminal.shell/args, providers, router or
+# mcp_servers.
+
+[editor]
+# tab_size = 2

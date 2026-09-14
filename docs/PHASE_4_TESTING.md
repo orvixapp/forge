@@ -62,7 +62,40 @@ Después:
 ## Token Harbor como proveedor opcional
 
 El dominio correcto es `tokenharbor.ai`. Token Harbor no sustituye ACP ni se
-añade como `[[agents]]`: se conecta al agente que Forge ya lanza.
+añade como `[[agents]]`: es un proveedor (`[[providers]]`) que Forge inyecta
+como entorno al agente que ya lanza. Endpoints (docs oficiales):
+`https://tokenharbor.ai/v1` compatible con OpenAI (Codex, OpenCode) y
+`https://tokenharbor.ai` compatible con Anthropic (Claude Code); la clave
+`thk_…` sale del dashboard y viaja como `Bearer`.
+
+```toml
+# ~/.config/forge/config.toml — export TOKENHARBOR_API_KEY=thk_... en la shell
+[[providers]]
+name = "tokenharbor"
+kind = "openai-compatible"          # Codex y OpenCode
+model = "th-orchestra"              # o un id explícito: tokenharbor/qwen3-max…
+base_url = "https://tokenharbor.ai/v1"
+api_key_env = "TOKENHARBOR_API_KEY"
+
+[[providers]]
+name = "tokenharbor-claude"
+kind = "anthropic"                  # Claude Code (ANTHROPIC_BASE_URL + AUTH_TOKEN)
+model = "th-orchestra"
+base_url = "https://tokenharbor.ai"
+api_key_env = "TOKENHARBOR_API_KEY"
+
+[router]
+trivial = "tokenharbor"
+normal = "tokenharbor"
+deep = "tokenharbor"
+```
+
+Lo que Forge no puede hacer desde fuera es elegir el proveedor dentro de la
+configuración propia de cada agente: OpenCode necesita el bloque `provider`
+de `~/.config/opencode/opencode.json` y Codex `model_provider` en
+`~/.codex/config.toml` (`tokenharbor connect opencode|codex|claude` los
+escribe). Con eso hecho, el entorno que inyecta Forge aporta la clave y la
+URL y la ruta del panel muestra `tokenharbor`.
 
 1. Instalar y ejecutar el conector siguiendo la documentación oficial de Token
    Harbor.
