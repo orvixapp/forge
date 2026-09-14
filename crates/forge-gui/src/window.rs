@@ -2,7 +2,7 @@
 //! keyboard/mouse plumbing that turns shell commands into state changes.
 
 use crate::{
-    agent::{AgentTab, spawn_agent_worker},
+    agent::{AgentTab, PromptContext, spawn_agent_worker},
     chrome,
     editor::EditorTab,
     grid_element::{CellMetrics, Palette, SearchHighlights, TerminalSurface},
@@ -247,7 +247,7 @@ impl Tab {
         match &self.content {
             TabContent::Terminal(terminal) => terminal.terminal.contains(position),
             TabContent::Editor(editor) => editor.contains(position),
-            TabContent::Agent(_) => true,
+            TabContent::Agent(_) => false,
         }
     }
 }
@@ -764,6 +764,7 @@ impl ForgeWindow {
     }
 
     fn create_agent_tab(&mut self, cx: &mut Context<Self>) -> usize {
+        let context = self.agent_prompt_context();
         let configured = self
             .config
             .agents
@@ -773,34 +774,98 @@ impl ForgeWindow {
         let name = configured
             .as_ref()
             .map_or_else(|| "ACP".to_owned(), |agent| agent.name.clone());
-        let index = self.push_tab(TabContent::Agent(Box::new(AgentTab::new(name))), cx);
-        if let Some(configured) = configured {
-            let definition = proto_acp::AgentDefinition {
-                name: configured.name,
-                command: configured.command,
-                args: configured.args,
-                env: configured.env,
-                cwd: Some(self.factory.cwd.clone()),
-                auth_method: configured.auth_method,
-                enabled: configured.enabled,
-            };
-            let (commands, command_rx) = async_mpsc::unbounded_channel();
-            self.tabs[index]
-                .agent_mut()
-                .expect("new agent tab")
-                .connect(commands);
-            spawn_agent_worker(
-                definition,
-                self.factory.cwd.clone(),
-                self.tabs[index].id,
-                self.event_tx.clone(),
-                command_rx,
+        let mut agent_tab = AgentTab::new(name, self.factory.cwd.clone());
+        agent_tab.set_context(context);
+        let index = self.push_tab(TabContent::Agent(Box::new(agent_tab)), cx);
+        let definition = configured.map(|configured| proto_acp::AgentDefinition {
+            name: configured.name,
+            command: configured.command,
+            args: configured.args,
+            env: configured.env,
+            cwd: Some(self.factory.cwd.clone()),
+            auth_method: configured.auth_method,
+            enabled: configured.enabled,
+        });
+        let registry_cache = self
+            .factory
+            .config_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map_or_else(
+                || std::env::temp_dir().join("forge-acp-registry.json"),
+                |directory| directory.join("acp-registry.json"),
             );
-        } else {
-            self.tabs[index].agent_mut().expect("new agent tab").status =
-                "Configura [[agents]] para conectar un adaptador ACP".into();
-        }
+        let (commands, command_rx) = async_mpsc::unbounded_channel();
+        self.tabs[index]
+            .agent_mut()
+            .expect("new agent tab")
+            .connect(commands);
+        spawn_agent_worker(
+            definition,
+            registry_cache,
+            self.factory.cwd.clone(),
+            self.tabs[index].id,
+            self.event_tx.clone(),
+            command_rx,
+        );
         index
+    }
+
+    fn agent_prompt_context(&self) -> Vec<PromptContext> {
+        match &self.active_tab().content {
+            TabContent::Editor(editor) => {
+                let Some(path) = editor.path() else {
+                    return Vec::new();
+                };
+                let selection = editor.buffer.selections().primary();
+                let range = selection.range();
+                let content = if selection.is_empty() {
+                    editor.buffer.text()
+                } else {
+                    editor.buffer.slice(range.clone())
+                };
+                let start = editor.buffer.position_of(range.start);
+                let end = editor.buffer.position_of(range.end);
+                vec![PromptContext {
+                    label: format!(
+                        "{}:{}:{}-{}:{}",
+                        path.display(),
+                        start.line + 1,
+                        start.column + 1,
+                        end.line + 1,
+                        end.column + 1
+                    ),
+                    content,
+                }]
+            }
+            TabContent::Terminal(terminal) => {
+                let content = terminal.terminal.selection.map_or_else(
+                    || {
+                        let (_, rows) = terminal.terminal.grid.dimensions();
+                        (0..rows)
+                            .filter_map(|row| terminal.terminal.grid.row_text(row))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                            .trim_end()
+                            .to_owned()
+                    },
+                    |selection| terminal.terminal.grid.selected_text(selection),
+                );
+                (!content.is_empty())
+                    .then(|| PromptContext {
+                        label: format!(
+                            "terminal://{}",
+                            terminal
+                                .session_id
+                                .map_or_else(|| "active".into(), |id| id.to_string())
+                        ),
+                        content,
+                    })
+                    .into_iter()
+                    .collect()
+            }
+            TabContent::Agent(_) => Vec::new(),
+        }
     }
 
     /// Like [`Self::create_terminal_tab`], reattaching to a daemon session
@@ -1580,6 +1645,10 @@ impl ForgeWindow {
             "backspace" => {
                 agent.prompt.pop();
             }
+            "pageup" => agent.scroll_by(-agent.visible_items.cast_signed()),
+            "pagedown" => agent.scroll_by(agent.visible_items.cast_signed()),
+            "home" if modifiers.control => agent.scroll_item = 0,
+            "end" if modifiers.control => agent.scroll_to_end(),
             _ if !modifiers.control && !modifiers.alt => {
                 if let Some(text) = key_char {
                     agent.prompt.push_str(text);
@@ -1651,6 +1720,21 @@ impl ForgeWindow {
     }
 
     pub fn on_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        if matches!(self.active_tab().content, TabContent::Agent(_)) {
+            let lines = match event.delta {
+                ScrollDelta::Lines(delta) => delta.y * 3.0,
+                ScrollDelta::Pixels(delta) => f32::from(delta.y) / self.factory.metrics.height,
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            let rows = lines.round() as isize;
+            if rows != 0
+                && let Some(agent) = self.active_agent_mut()
+            {
+                agent.scroll_by(-rows);
+                cx.notify();
+            }
+            return;
+        }
         let Some(index) = self.pane_at(event.position) else {
             return;
         };

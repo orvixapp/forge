@@ -14,7 +14,7 @@ pub use client::{
     AcpClient, AcpEvent, AcpSession, AgentProcess, AgentProcessEvent, ClientError,
     InitializeResult, PromptBlock, SessionMode,
 };
-pub use registry::{AgentDefinition, AgentRegistry, AgentRegistryError};
+pub use registry::{AgentDefinition, AgentRegistry, AgentRegistryError, OFFICIAL_REGISTRY_URL};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JsonRpcMessage {

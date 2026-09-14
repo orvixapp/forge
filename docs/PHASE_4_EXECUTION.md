@@ -29,19 +29,19 @@ Fase 0 en `crates/proto-acp` (cliente ACP mínimo que habló con
 - [x] `initialize`/`authenticate`/`session/new`/`session/load`/`prompt`/
   `cancel`/`set_mode`/`session/update` sobre stdio (JSON-RPC), con
   capacidades opcionales toleradas.
-- [ ] Registro de agentes (`[[agents]]` en config + ACP registry) y
+- [x] Registro de agentes (`[[agents]]` en config + ACP registry) y
   arranque como proceso hijo supervisado (reinicio con backoff, §26).
   - [x] `[[agents]]`, registro validado, proceso hijo y reanudación con
     `session/load` tras reinicio con backoff.
-  - [ ] Importar el registro oficial ACP y detección adicional en `PATH`.
+  - [x] Importar el registro oficial ACP y detección adicional en `PATH`.
 
 ## 4.2 — Panel de sesión
-- [ ] `TabContent::Agent`: streaming virtualizado de mensajes, tool calls
+- [x] `TabContent::Agent`: streaming virtualizado de mensajes, tool calls
   con estado, planes; entrada de prompt con contexto (@archivo, selección,
   salida de terminal).
   - [x] Tercer `TabContent`, streaming incremental y entrada de prompt.
   - [x] Tool calls con actualización de estado y planes.
-  - [ ] Contexto visible (`@archivo`, selección y salida de terminal) y
+  - [x] Contexto visible (`@archivo`, selección y salida de terminal) y
     desplazamiento virtualizado navegable.
 - [x] Línea de tiempo de herramientas (§17.9).
 

@@ -13,11 +13,12 @@ use tokio::sync::mpsc as async_mpsc;
 
 use crate::ipc::UiEvent;
 use proto_acp::{
-    AcpEvent, AgentDefinition, AgentProcess, ClientSurface, PermissionChoice, PromptBlock,
+    AcpEvent, AgentDefinition, AgentProcess, AgentRegistry, ClientSurface, PermissionChoice,
+    PromptBlock,
 };
 
 pub enum AgentCommand {
-    Prompt(String),
+    Prompt(Vec<PromptBlock>),
     Cancel,
 }
 
@@ -55,18 +56,29 @@ pub enum TimelineItem {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptContext {
+    pub label: String,
+    pub content: String,
+}
+
 pub struct AgentTab {
     pub agent_name: String,
     pub session_id: Option<String>,
     pub status: String,
     pub prompt: String,
     pub timeline: Vec<TimelineItem>,
+    pub context: Vec<PromptContext>,
+    pub scroll_item: usize,
+    pub visible_items: usize,
+    following_tail: bool,
+    workspace: PathBuf,
     commands: Option<async_mpsc::UnboundedSender<AgentCommand>>,
 }
 
 impl AgentTab {
     #[must_use]
-    pub fn new(agent_name: impl Into<String>) -> Self {
+    pub fn new(agent_name: impl Into<String>, workspace: PathBuf) -> Self {
         let agent_name = agent_name.into();
         Self {
             status: "Lista para iniciar sesión".into(),
@@ -74,6 +86,11 @@ impl AgentTab {
             session_id: None,
             prompt: String::new(),
             timeline: Vec::new(),
+            context: Vec::new(),
+            scroll_item: 0,
+            visible_items: 40,
+            following_tail: true,
+            workspace,
             commands: None,
         }
     }
@@ -95,21 +112,84 @@ impl AgentTab {
             return None;
         }
         self.prompt.clear();
+        self.resolve_file_mentions(&prompt);
         self.timeline.push(TimelineItem::Message {
             role: MessageRole::User,
             text: prompt.clone(),
         });
         self.status = "Esperando al agente…".into();
         if let Some(commands) = &self.commands {
-            let _ = commands.send(AgentCommand::Prompt(prompt.clone()));
+            let mut blocks = vec![PromptBlock::Text {
+                text: prompt.clone(),
+            }];
+            blocks.extend(self.context.iter().map(|context| {
+                PromptBlock::Raw(serde_json::json!({
+                    "type": "resource",
+                    "resource": {"uri": context.label, "text": context.content}
+                }))
+            }));
+            let _ = commands.send(AgentCommand::Prompt(blocks));
         }
+        self.scroll_to_end();
         Some(prompt)
+    }
+
+    pub fn set_context(&mut self, context: Vec<PromptContext>) {
+        self.context = context;
+    }
+
+    fn resolve_file_mentions(&mut self, prompt: &str) {
+        for mention in prompt
+            .split_whitespace()
+            .filter_map(|word| word.strip_prefix('@'))
+        {
+            let mention = mention.trim_matches(|character: char| ",.;:)]}".contains(character));
+            let requested = self.workspace.join(mention);
+            let Ok(path) = requested.canonicalize() else {
+                continue;
+            };
+            let Ok(workspace) = self.workspace.canonicalize() else {
+                continue;
+            };
+            if !path.starts_with(&workspace)
+                || self
+                    .context
+                    .iter()
+                    .any(|item| item.label == path.display().to_string())
+            {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                self.context.push(PromptContext {
+                    label: path.display().to_string(),
+                    content,
+                });
+            }
+        }
+    }
+
+    pub fn scroll_by(&mut self, delta: isize) {
+        let maximum = self.timeline.len().saturating_sub(self.visible_items);
+        self.scroll_item = self.scroll_item.saturating_add_signed(delta).min(maximum);
+        self.following_tail = self.scroll_item == maximum;
+    }
+
+    pub fn scroll_to_end(&mut self) {
+        self.scroll_item = self.timeline.len().saturating_sub(self.visible_items);
+        self.following_tail = true;
+    }
+
+    #[must_use]
+    pub fn visible_range(&self) -> Range<usize> {
+        let start = self.scroll_item.min(self.timeline.len());
+        start..(start + self.visible_items).min(self.timeline.len())
     }
 
     /// Applies one tolerant `session/update`. Unknown update shapes are kept
     /// as system messages, making optional vendor capabilities visible rather
     /// than fatal to the session.
     pub fn apply_update(&mut self, update: &Value) {
+        let follow_tail = self.following_tail;
         let kind = update
             .get("sessionUpdate")
             .or_else(|| update.get("type"))
@@ -154,6 +234,9 @@ impl AgentTab {
                 role: MessageRole::System,
                 text: update.to_string(),
             }),
+        }
+        if follow_tail {
+            self.scroll_to_end();
         }
     }
 
@@ -229,7 +312,8 @@ impl AgentTab {
 }
 
 pub fn spawn_agent_worker(
-    definition: AgentDefinition,
+    definition: Option<AgentDefinition>,
+    registry_cache: PathBuf,
     workspace: PathBuf,
     tab_id: u64,
     events: Sender<UiEvent>,
@@ -238,6 +322,13 @@ pub fn spawn_agent_worker(
     std::thread::Builder::new()
         .name(format!("forge-agent-{tab_id}"))
         .spawn(move || {
+            let Some(definition) = definition.or_else(|| discover_agent(&registry_cache)) else {
+                let _ = events.send(UiEvent::AgentStatus {
+                    tab_id,
+                    status: "No se encontró ningún adaptador ACP instalado en PATH".into(),
+                });
+                return;
+            };
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
             let Ok(runtime) = runtime else {
                 let _ = events.send(UiEvent::AgentStatus { tab_id, status: "No se pudo crear el runtime ACP".into() });
@@ -277,7 +368,7 @@ pub fn spawn_agent_worker(
                                 loop {
                                     tokio::select! {
                                         command = commands.recv() => match command {
-                                            Some(AgentCommand::Prompt(text)) => { if let Err(error) = client.prompt(&session, vec![PromptBlock::Text { text }]).await { let _ = events.send(UiEvent::AgentStatus { tab_id, status: error.to_string() }); } }
+                                            Some(AgentCommand::Prompt(blocks)) => { if let Err(error) = client.prompt(&session, blocks).await { let _ = events.send(UiEvent::AgentStatus { tab_id, status: error.to_string() }); } }
                                             Some(AgentCommand::Cancel) => { let _ = client.cancel(&session).await; }
                                             None => return,
                                         },
@@ -303,6 +394,13 @@ pub fn spawn_agent_worker(
         .expect("spawn ACP worker");
 }
 
+fn discover_agent(cache: &std::path::Path) -> Option<AgentDefinition> {
+    let mut registry = AgentRegistry::default();
+    let _ = AgentRegistry::refresh_official_cache(cache);
+    let _ = registry.import_official_cache(cache);
+    registry.available().next().cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,7 +408,7 @@ mod tests {
 
     #[test]
     fn coalesces_streaming_chunks() {
-        let mut tab = AgentTab::new("Codex");
+        let mut tab = AgentTab::new("Codex", PathBuf::from("."));
         tab.apply_update(
             &json!({"sessionUpdate":"agent_message_chunk","content":{"text":"hola "}}),
         );
@@ -328,7 +426,7 @@ mod tests {
 
     #[test]
     fn updates_tool_call_in_place() {
-        let mut tab = AgentTab::new("Codex");
+        let mut tab = AgentTab::new("Codex", PathBuf::from("."));
         tab.apply_update(&json!({"sessionUpdate":"tool_call","toolCallId":"1","title":"cargo test","status":"running"}));
         tab.apply_update(&json!({"sessionUpdate":"tool_call_update","toolCallId":"1","title":"cargo test","status":"completed"}));
         assert!(matches!(
@@ -338,5 +436,36 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn scrolling_away_from_tail_survives_new_updates() {
+        let mut tab = AgentTab::new("Codex", PathBuf::from("."));
+        tab.visible_items = 2;
+        for index in 0..5 {
+            tab.apply_update(&json!({"type":"message_chunk","text":format!("{index}")}));
+            tab.timeline.push(TimelineItem::Message {
+                role: MessageRole::System,
+                text: index.to_string(),
+            });
+        }
+        tab.scroll_to_end();
+        tab.scroll_by(-2);
+        let before = tab.scroll_item;
+        tab.apply_update(&json!({"type":"plan","entries":[]}));
+        assert_eq!(tab.scroll_item, before);
+    }
+
+    #[test]
+    fn file_mentions_are_confined_to_the_workspace() {
+        let root = std::env::temp_dir().join(format!("forge-agent-context-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("notes.txt"), "contexto").unwrap();
+        let mut tab = AgentTab::new("Codex", root.clone());
+        tab.prompt = "revisa @notes.txt y @../fuera.txt".into();
+        tab.submit_prompt();
+        assert_eq!(tab.context.len(), 1);
+        assert_eq!(tab.context[0].content, "contexto");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

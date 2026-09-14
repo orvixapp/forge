@@ -605,7 +605,7 @@ fn agent_panel(
     agent: &crate::agent::AgentTab,
     theme: forge_gui::theme::ThemeColors,
 ) -> impl IntoElement {
-    let start = agent.timeline.len().saturating_sub(200);
+    let visible = agent.visible_range();
     div()
         .size_full()
         .flex()
@@ -623,6 +623,19 @@ fn agent_panel(
                     agent.session_id.as_deref().unwrap_or("sin id")
                 )),
         )
+        .when(!agent.context.is_empty(), |panel| {
+            panel.child(div().flex().gap(px(6.0)).overflow_hidden().children(
+                agent.context.iter().map(|context| {
+                    div()
+                        .px(px(7.0))
+                        .py(px(3.0))
+                        .rounded(px(4.0))
+                        .bg(color(theme.chrome))
+                        .text_size(px(11.0))
+                        .child(context.label.clone())
+                }),
+            ))
+        })
         .child(
             div()
                 .flex_1()
@@ -633,57 +646,9 @@ fn agent_panel(
                 .gap(px(6.0))
                 .children(
                     agent
-                        .visible_timeline(start..agent.timeline.len())
+                        .visible_timeline(visible)
                         .iter()
-                        .map(|item| {
-                            let (label, body, tint) = match item {
-                                TimelineItem::Message { role, text } => {
-                                    let label = match role {
-                                        MessageRole::User => "Tú",
-                                        MessageRole::Agent => "Agente",
-                                        MessageRole::System => "Sistema",
-                                    };
-                                    (label, text.clone(), theme.foreground)
-                                }
-                                TimelineItem::ToolCall {
-                                    title,
-                                    state,
-                                    detail,
-                                    ..
-                                } => {
-                                    let state = match state {
-                                        ToolState::Pending => "pendiente",
-                                        ToolState::Running => "en curso",
-                                        ToolState::Succeeded => "completada",
-                                        ToolState::Failed => "falló",
-                                        ToolState::WaitingPermission => "espera permiso",
-                                    };
-                                    (
-                                        "Herramienta",
-                                        format!("{title} · {state}\n{detail}"),
-                                        theme.accent,
-                                    )
-                                }
-                                TimelineItem::Plan { title, entries } => (
-                                    "Plan",
-                                    format!("{title}\n{}", entries.join("\n")),
-                                    theme.accent,
-                                ),
-                            };
-                            div()
-                                .px(px(10.0))
-                                .py(px(7.0))
-                                .rounded(px(5.0))
-                                .bg(color(theme.chrome))
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .text_color(color(tint))
-                                        .child(label),
-                                )
-                                .child(div().text_size(px(13.0)).child(body))
-                                .into_any_element()
-                        }),
+                        .map(|item| agent_timeline_item(item, theme)),
                 ),
         )
         .child(
@@ -700,6 +665,71 @@ fn agent_panel(
                     agent.prompt.clone()
                 }),
         )
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(color(theme.muted))
+                .child(format!(
+                    "eventos {}–{} de {} · rueda/PageUp/PageDown para navegar",
+                    agent
+                        .visible_range()
+                        .start
+                        .saturating_add(1)
+                        .min(agent.timeline.len()),
+                    agent.visible_range().end,
+                    agent.timeline.len()
+                )),
+        )
+}
+
+fn agent_timeline_item(item: &TimelineItem, theme: forge_gui::theme::ThemeColors) -> AnyElement {
+    let (label, body, tint) = match item {
+        TimelineItem::Message { role, text } => {
+            let label = match role {
+                MessageRole::User => "Tú",
+                MessageRole::Agent => "Agente",
+                MessageRole::System => "Sistema",
+            };
+            (label, text.clone(), theme.foreground)
+        }
+        TimelineItem::ToolCall {
+            title,
+            state,
+            detail,
+            ..
+        } => {
+            let state = match state {
+                ToolState::Pending => "pendiente",
+                ToolState::Running => "en curso",
+                ToolState::Succeeded => "completada",
+                ToolState::Failed => "falló",
+                ToolState::WaitingPermission => "espera permiso",
+            };
+            (
+                "Herramienta",
+                format!("{title} · {state}\n{detail}"),
+                theme.accent,
+            )
+        }
+        TimelineItem::Plan { title, entries } => (
+            "Plan",
+            format!("{title}\n{}", entries.join("\n")),
+            theme.accent,
+        ),
+    };
+    div()
+        .px(px(10.0))
+        .py(px(7.0))
+        .rounded(px(5.0))
+        .bg(color(theme.chrome))
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(color(tint))
+                .child(label),
+        )
+        .child(div().text_size(px(13.0)).child(body))
+        .into_any_element()
 }
 
 /// Right-click menu at the pointer: command titles with their chords.
