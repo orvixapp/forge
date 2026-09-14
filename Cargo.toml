@@ -10,6 +10,7 @@ members = [
     "crates/forge-syntax",
     "crates/forge-project",
     "crates/forge-search",
+    "crates/forge-git",
     "crates/forge-gui",
 ]
 resolver = "3"

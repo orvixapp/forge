@@ -202,4 +202,3 @@ writes a Chrome trace of the startup spans that Perfetto can open.
   ACP capability flow and benchmark history persistence. The Open VSX scanner
   is implemented; its first registry run remains an evidence-gathering task,
   not a claim of extension compatibility.
-

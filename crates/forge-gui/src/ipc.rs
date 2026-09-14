@@ -33,6 +33,19 @@ pub enum UiEvent {
     IndexReady {
         index: Box<Result<forge_project::PathIndex, String>>,
     },
+    /// A gutter diff against `HEAD` finished for an editor tab.
+    GitDiff {
+        tab_id: u64,
+        version: u64,
+        /// Repository, `HEAD` text (`None` when untracked) and the diff.
+        state: Box<GitDiffResult>,
+    },
+}
+
+pub struct GitDiffResult {
+    pub info: Option<forge_git::RepoInfo>,
+    pub head: Option<String>,
+    pub diff: forge_git::LineDiff,
 }
 
 #[cfg_attr(not(any(unix, windows)), allow(dead_code))]

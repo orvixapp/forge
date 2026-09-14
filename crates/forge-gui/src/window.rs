@@ -459,6 +459,7 @@ impl ForgeWindow {
                     }
                 }
                 match this.update(cx, |view, _| {
+                    view.refresh_git_diffs();
                     view.poll_project_search() | view.poll_syntax()
                 }) {
                     Ok(dirty) => changed |= dirty,
@@ -1281,6 +1282,11 @@ impl ForgeWindow {
                 }
             }
             UiEvent::IndexReady { index } => self.on_index_ready(*index, cx),
+            UiEvent::GitDiff {
+                tab_id,
+                version,
+                state,
+            } => self.on_git_diff(tab_id, version, *state, cx),
             UiEvent::Attached {
                 tab_id,
                 session_id,

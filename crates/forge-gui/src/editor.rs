@@ -5,6 +5,7 @@
 
 use crate::{
     grid_element::{CellMetrics, color},
+    ipc::{GitDiffResult, UiEvent},
     window::{ForgeWindow, NotificationLevel, Tab, TabContent},
 };
 use forge_buffer::{
@@ -22,6 +23,7 @@ use std::{
     borrow::Cow,
     ops::Range,
     path::{Path, PathBuf},
+    sync::mpsc::Sender,
     time::{Duration, Instant},
 };
 
@@ -80,7 +82,32 @@ pub struct EditorTab {
     pub dragging_minimap: bool,
     /// Coarse highlights for the minimap, refreshed at most twice a second.
     minimap_cache: Option<MinimapCache>,
+    /// Slider drag: where it started and the scroll line at that moment.
+    minimap_drag: Option<(Pixels, usize)>,
+    /// Git state: repository/branch, `HEAD` text and the gutter diff.
+    pub git: GitState,
 }
+
+/// What the editor knows about its file in git.
+#[derive(Default)]
+pub struct GitState {
+    pub info: Option<forge_git::RepoInfo>,
+    /// `HEAD` content, cached until save or reload; `None` = untracked.
+    head: Option<String>,
+    pub diff: forge_git::LineDiff,
+    /// Buffer version the diff describes.
+    pub diff_version: Option<u64>,
+    /// A diff is being computed for this version.
+    pending: Option<u64>,
+    /// The repository was looked up at least once (so `info == None`
+    /// means "not in a repository", not "unknown yet").
+    discovered: bool,
+}
+
+/// Edits settle this long before the gutter diff is recomputed.
+const GIT_DIFF_DEBOUNCE: Duration = Duration::from_millis(300);
+/// Width of the change bar between the line numbers and the text.
+const GIT_GUTTER_WIDTH: f32 = 3.0;
 
 struct MinimapCache {
     at: Instant,
@@ -153,7 +180,116 @@ impl EditorTab {
             minimap_top: 0,
             dragging_minimap: false,
             minimap_cache: None,
+            minimap_drag: None,
+            git: GitState::default(),
         }
+    }
+
+    /// Starts a slider drag at `y` (window space).
+    pub fn begin_minimap_drag(&mut self, y: Pixels) {
+        self.dragging_minimap = true;
+        self.minimap_drag = Some((y, self.scroll_line));
+    }
+
+    /// Dragging the slider moves through the whole document over the
+    /// strip's height, like VS Code: a short drag covers many lines in a
+    /// long file.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    pub fn drag_minimap(&mut self, y: Pixels) {
+        let Some((start_y, start_line)) = self.minimap_drag else {
+            return self.scroll_to_minimap(y);
+        };
+        let Some(bounds) = self.minimap_bounds else {
+            return;
+        };
+        let total = self.total_lines();
+        let capacity = (f32::from(bounds.size.height) / MINIMAP_ROW).max(1.0);
+        let lines_per_px = if (total as f32) > capacity {
+            total as f32 / f32::from(bounds.size.height)
+        } else {
+            1.0 / MINIMAP_ROW
+        };
+        let delta = f32::from(y - start_y) * lines_per_px;
+        let target = (start_line as f32 + delta).round() as i64;
+        self.scroll_line = usize::try_from(target.max(0))
+            .unwrap_or(0)
+            .min(total.saturating_sub(1));
+    }
+
+    /// Kicks off a `HEAD` diff on a thread when the buffer settled; the
+    /// result comes back through `UiEvent::GitDiff`.
+    pub fn refresh_git(&mut self, tab_id: u64, events: &Sender<UiEvent>) {
+        if self.large.is_some() {
+            return;
+        }
+        let Some(path) = self.path().map(Path::to_path_buf) else {
+            return;
+        };
+        let version = self.buffer.version();
+        if self.git.diff_version == Some(version)
+            || self.git.pending == Some(version)
+            || self.last_edit.elapsed() < GIT_DIFF_DEBOUNCE
+        {
+            return;
+        }
+        if self.git.discovered && self.git.info.is_none() {
+            return;
+        }
+        self.git.pending = Some(version);
+        let text = self.buffer.text();
+        let info = self.git.info.clone();
+        let head = self.git.head.clone();
+        let discovered = self.git.discovered;
+        let events = events.clone();
+        std::thread::Builder::new()
+            .name("forge-git-diff".into())
+            .spawn(move || {
+                let info = if discovered {
+                    info
+                } else {
+                    forge_git::discover(&path)
+                };
+                let head = match (&info, head) {
+                    (None, _) => None,
+                    (Some(_), Some(head)) => Some(head),
+                    (Some(info), None) => forge_git::head_text(info).ok().flatten(),
+                };
+                let diff = match &info {
+                    Some(_) => forge_git::line_diff(head.as_deref(), &text),
+                    None => forge_git::LineDiff::default(),
+                };
+                let _ = events.send(UiEvent::GitDiff {
+                    tab_id,
+                    version,
+                    state: Box::new(GitDiffResult { info, head, diff }),
+                });
+            })
+            .expect("spawn git diff");
+    }
+
+    /// Takes a finished diff; stale ones (older version) are dropped.
+    pub fn git_ready(&mut self, version: u64, result: GitDiffResult) -> bool {
+        self.git.pending = None;
+        self.git.discovered = true;
+        self.git.info = result.info;
+        self.git.head = result.head;
+        if self
+            .git
+            .diff_version
+            .is_some_and(|current| current > version)
+        {
+            return false;
+        }
+        self.git.diff = result.diff;
+        self.git.diff_version = Some(version);
+        true
+    }
+
+    /// The file on disk changed (save/reload): `HEAD` may differ now.
+    pub fn invalidate_git(&mut self) {
+        self.git.head = None;
+        self.git.diff_version = None;
+        self.git.discovered = false;
     }
 
     /// Whether a window position is over the minimap strip.
@@ -388,6 +524,18 @@ impl EditorTab {
                 forge_buffer::LineEnding::CrLf => "CRLF".into(),
             });
         }
+        if let Some(info) = &self.git.info {
+            let diff = &self.git.diff;
+            let label = if diff.added + diff.modified + diff.deleted > 0 {
+                format!(
+                    "⎇ {} +{} ~{} −{}",
+                    info.branch, diff.added, diff.modified, diff.deleted
+                )
+            } else {
+                format!("⎇ {}", info.branch)
+            };
+            parts.push(label);
+        }
         if self.recovered {
             parts.push("recuperado del journal".into());
         }
@@ -478,6 +626,7 @@ impl EditorTab {
         self.buffer.mark_saved();
         self.file = Some(reloaded);
         self.sync_syntax();
+        self.invalidate_git();
         true
     }
 
@@ -719,6 +868,9 @@ impl Element for EditorElement {
                     ink.a = 0.7;
                     ink
                 },
+                git_added: color(theme.git_added).into(),
+                git_modified: color(theme.git_modified).into(),
+                git_deleted: color(theme.git_deleted).into(),
             };
             let Some(editor) = view.tabs.get_mut(index).and_then(Tab::editor_mut) else {
                 return;
@@ -750,6 +902,9 @@ struct EditorPaint {
     /// Minimap slider and ink colours.
     slider: Hsla,
     ink: Hsla,
+    git_added: Hsla,
+    git_modified: Hsla,
+    git_deleted: Hsla,
 }
 
 impl EditorPaint {
@@ -851,6 +1006,7 @@ fn paint_editor(
     } else {
         px(GUTTER_PADDING)
     };
+    let gutter = gutter + px(GIT_GUTTER_WIDTH + 2.0);
     let full_width = (bounds.size.width - gutter).max(px(0.0));
     let minimap_width = if paint.minimap
         && editor.large.is_none()
@@ -1076,6 +1232,22 @@ fn paint_editor(
                         window,
                         cx,
                     );
+                }
+                if row.first
+                    && let Some(mark) = editor.git.diff.mark(line)
+                {
+                    // VS Code's gutter: a bar for added/modified lines and a
+                    // small wedge where lines were removed.
+                    let x = text_bounds.origin.x - px(GIT_GUTTER_WIDTH + 2.0);
+                    let (colour, height) = match mark {
+                        forge_git::GutterMark::Added => (paint.git_added, line_height),
+                        forge_git::GutterMark::Modified => (paint.git_modified, line_height),
+                        forge_git::GutterMark::Deleted => (paint.git_deleted, px(3.0)),
+                    };
+                    window.paint_quad(fill(
+                        Bounds::new(point(x, y), size(px(GIT_GUTTER_WIDTH), height)),
+                        colour,
+                    ));
                 }
             }
         });
@@ -1735,27 +1907,26 @@ impl ForgeWindow {
         if editor.is_large() {
             return;
         }
-        match &editor.file {
-            Some(file) => {
-                let text = editor.buffer.text();
-                match file.write(&text) {
-                    Ok(()) => {
-                        editor.buffer.mark_saved();
-                        editor.recovered = false;
-                        let path = file.path.display().to_string();
-                        self.notify_user(NotificationLevel::Info, format!("Guardado {path}"));
-                    }
-                    Err(error) => {
-                        self.notify_user(
-                            NotificationLevel::Error,
-                            format!("No se pudo guardar: {error}"),
-                        );
-                    }
-                }
-                cx.notify();
+        let Some(file) = &editor.file else {
+            return self.save_active_as(cx);
+        };
+        let text = editor.buffer.text();
+        let path = file.path.display().to_string();
+        match file.write(&text) {
+            Ok(()) => {
+                editor.buffer.mark_saved();
+                editor.recovered = false;
+                editor.invalidate_git();
+                self.notify_user(NotificationLevel::Info, format!("Guardado {path}"));
             }
-            None => self.save_active_as(cx),
+            Err(error) => {
+                self.notify_user(
+                    NotificationLevel::Error,
+                    format!("No se pudo guardar: {error}"),
+                );
+            }
         }
+        cx.notify();
     }
 
     fn save_active_as(&mut self, cx: &mut Context<Self>) {
@@ -2473,8 +2644,10 @@ impl ForgeWindow {
             .is_some_and(|editor| editor.on_minimap(event.position))
         {
             if let Some(editor) = self.active_tab_mut().editor_mut() {
+                // A click jumps there; holding the button then drags the
+                // slider at document speed.
                 editor.scroll_to_minimap(event.position.y);
-                editor.dragging_minimap = true;
+                editor.begin_minimap_drag(event.position.y);
             }
             cx.notify();
             return;
@@ -2522,7 +2695,7 @@ impl ForgeWindow {
             .is_some_and(|editor| editor.dragging_minimap)
         {
             if let Some(editor) = self.active_tab_mut().editor_mut() {
-                editor.scroll_to_minimap(position.y);
+                editor.drag_minimap(position.y);
             }
             cx.notify();
             return;
@@ -2554,6 +2727,32 @@ impl ForgeWindow {
         if let Some(editor) = self.active_tab_mut().editor_mut() {
             editor.drag_anchor = None;
             editor.dragging_minimap = false;
+            editor.minimap_drag = None;
+        }
+    }
+
+    /// Polls every editor for a due gutter diff; called each tick.
+    pub fn refresh_git_diffs(&mut self) {
+        let events = self.event_tx.clone();
+        for tab in &mut self.tabs {
+            let id = tab.id;
+            if let Some(editor) = tab.editor_mut() {
+                editor.refresh_git(id, &events);
+            }
+        }
+    }
+
+    pub fn on_git_diff(
+        &mut self,
+        tab_id: u64,
+        version: u64,
+        result: GitDiffResult,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self.tab_mut(tab_id).and_then(Tab::editor_mut)
+            && editor.git_ready(version, result)
+        {
+            cx.notify();
         }
     }
 

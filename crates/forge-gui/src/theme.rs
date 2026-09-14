@@ -37,6 +37,10 @@ pub struct ThemeColors {
     /// Background of the selected search match.
     pub search_current: HexColor,
     pub syntax: SyntaxColors,
+    /// Gutter marks of lines added / modified / deleted since `HEAD`.
+    pub git_added: HexColor,
+    pub git_modified: HexColor,
+    pub git_deleted: HexColor,
 }
 
 /// Colours of the editor's syntax tokens.
@@ -99,6 +103,9 @@ pub struct ThemeFile {
     pub search_match: Option<HexColor>,
     pub search_current: Option<HexColor>,
     pub syntax: SyntaxFile,
+    pub git_added: Option<HexColor>,
+    pub git_modified: Option<HexColor>,
+    pub git_deleted: Option<HexColor>,
 }
 
 pub const FORGE_DARK: &str = "forge-dark";
@@ -139,6 +146,9 @@ impl ThemeColors {
                 property: HexColor::new(0x8f, 0xbc, 0xbb),
                 tag: HexColor::new(0xeb, 0xcb, 0x8b),
             },
+            git_added: HexColor::new(0x58, 0x7c, 0x0c),
+            git_modified: HexColor::new(0x0c, 0x7d, 0x9d),
+            git_deleted: HexColor::new(0x94, 0x15, 0x1b),
         }
     }
 
@@ -175,6 +185,9 @@ impl ThemeColors {
                 property: HexColor::new(0x3b, 0x7a, 0x7a),
                 tag: HexColor::new(0xb8, 0x86, 0x1a),
             },
+            git_added: HexColor::new(0x58, 0x7c, 0x0c),
+            git_modified: HexColor::new(0x1b, 0x81, 0xa8),
+            git_deleted: HexColor::new(0xc7, 0x3a, 0x3a),
         }
     }
 
@@ -208,6 +221,9 @@ impl ThemeColors {
             search_match,
             search_current,
             syntax,
+            git_added,
+            git_modified,
+            git_deleted,
         } = file;
         set(&mut self.background, *background);
         set(&mut self.foreground, *foreground);
@@ -237,6 +253,9 @@ impl ThemeColors {
         set(&mut self.syntax.attribute, syntax.attribute);
         set(&mut self.syntax.property, syntax.property);
         set(&mut self.syntax.tag, syntax.tag);
+        set(&mut self.git_added, *git_added);
+        set(&mut self.git_modified, *git_modified);
+        set(&mut self.git_deleted, *git_deleted);
         self.selection_opacity = self.selection_opacity.clamp(0.0, 1.0);
         self
     }

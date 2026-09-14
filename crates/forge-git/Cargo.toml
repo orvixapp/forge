@@ -1,0 +1,13 @@
+[package]
+name = "forge-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Git awareness for the Forge editor: repository discovery, HEAD blobs and gutter diffs"
+
+[dependencies]
+gix = { version = "0.87", default-features = false, features = ["sha1", "max-performance-safe"] }
+imara-diff = "0.2"
+
+[lints]
+workspace = true
