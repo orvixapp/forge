@@ -84,7 +84,7 @@ pub fn render_window(
             root.child(text_prompt(view, prompt))
         })
         .when_some(view.picker.as_ref(), |root, picker| {
-            root.child(picker_overlay(view, picker))
+            root.child(picker_overlay(view, picker, cx))
         })
         .children(resize_handles())
         .into_any_element()
@@ -1146,27 +1146,45 @@ fn context_menu(
     menu: &crate::window::ContextMenu,
     cx: &mut Context<ForgeWindow>,
 ) -> impl IntoElement {
+    // Wide enough for the longest translated title plus its chord; the
+    // menu is then moved back inside the window when it would spill out.
+    const MENU_WIDTH: f32 = 420.0;
+    const ITEM_HEIGHT: f32 = 24.0;
     let theme = view.theme;
+    let height = ITEM_HEIGHT * u16::try_from(menu.items.len()).map_or(f32::MAX, f32::from) + 8.0;
+    let window_size = view.factory.window_size;
+    let left =
+        f32::from(menu.position.x).min((f32::from(window_size.width) - MENU_WIDTH - 4.0).max(0.0));
+    let top =
+        f32::from(menu.position.y).min((f32::from(window_size.height) - height - 4.0).max(0.0));
     div()
         .id("context-menu")
         .absolute()
-        .left(menu.position.x)
-        .top(menu.position.y)
-        .w(px(260.0))
+        .left(px(left))
+        .top(px(top))
+        .w(px(MENU_WIDTH))
         .py(px(4.0))
         .rounded(px(6.0))
         .bg(color(theme.chrome))
         .border_1()
         .border_color(color(theme.chrome_active_border))
         .text_size(px(12.0))
+        // Clicks inside the menu must not reach the window handler, which
+        // would close the menu on mouse down before the item's click fires.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
         .children(menu.items.iter().enumerate().map(|(index, command)| {
             let selected = index == menu.index;
             div()
                 .id(("context-menu-item", index))
+                .h(px(ITEM_HEIGHT))
                 .px(px(10.0))
-                .py(px(4.0))
                 .flex()
+                .items_center()
                 .justify_between()
+                .gap(px(24.0))
+                .whitespace_nowrap()
+                .overflow_hidden()
                 .cursor_pointer()
                 .bg(color(if selected {
                     theme.highlight
@@ -1174,12 +1192,23 @@ fn context_menu(
                     theme.chrome
                 }))
                 .hover(move |style| style.bg(color(theme.highlight)))
-                .on_click(cx.listener(move |view, _, window, cx| {
-                    view.context_menu_pick(index, window, cx);
-                }))
-                .child(tr(command.title()))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _, window, cx| {
+                        view.context_menu_pick(index, window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .child(tr(command.title())),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
                         .text_color(color(theme.muted))
                         .child(view.keymap.chord_for(*command).unwrap_or_default()),
                 )
@@ -1233,9 +1262,14 @@ fn text_prompt(view: &ForgeWindow, prompt: &crate::window::TextPrompt) -> impl I
         )
 }
 
-fn picker_overlay(view: &ForgeWindow, picker: &crate::window::Picker) -> impl IntoElement {
+fn picker_overlay(
+    view: &ForgeWindow,
+    picker: &crate::window::Picker,
+    cx: &mut Context<ForgeWindow>,
+) -> impl IntoElement {
     let theme = view.theme;
     overlay_box(view, "picker")
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(
             div()
                 .text_size(px(14.0))
@@ -1245,9 +1279,19 @@ fn picker_overlay(view: &ForgeWindow, picker: &crate::window::Picker) -> impl In
         .children(picker.items.iter().enumerate().map(|(index, item)| {
             let selected = index == picker.index;
             div()
+                .id(("picker-item", index))
                 .px(px(8.0))
                 .py(px(5.0))
                 .rounded(px(4.0))
+                .cursor_pointer()
+                .hover(move |style| style.bg(color(theme.highlight)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _, _, cx| {
+                        view.picker_pick(index, cx);
+                        cx.stop_propagation();
+                    }),
+                )
                 .bg(color(if selected {
                     theme.highlight
                 } else {

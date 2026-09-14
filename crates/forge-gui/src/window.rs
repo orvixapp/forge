@@ -1859,10 +1859,29 @@ impl ForgeWindow {
             }
             "up" => picker.index = picker.index.saturating_sub(1),
             "down" => picker.index = (picker.index + 1).min(picker.items.len().saturating_sub(1)),
-            "enter" => {
-                let index = picker.index;
-                let kind = picker.kind;
-                self.picker = None;
+            "enter" => self.picker_confirm(cx),
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// A mouse click on a picker row: select it and confirm.
+    pub fn picker_pick(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(picker) = &mut self.picker {
+            picker.index = index.min(picker.items.len().saturating_sub(1));
+        }
+        self.picker_confirm(cx);
+        cx.notify();
+    }
+
+    fn picker_confirm(&mut self, cx: &mut Context<Self>) {
+        let Some(picker) = self.picker.take() else {
+            return;
+        };
+        let index = picker.index;
+        let kind = picker.kind;
+        {
+            {
                 match kind {
                     PickerKind::Profile => {
                         if let Some(profile) = self.config.profiles.get(index).cloned() {
@@ -1890,9 +1909,7 @@ impl ForgeWindow {
                     }
                 }
             }
-            _ => {}
         }
-        cx.notify();
     }
 
     fn split_active(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
