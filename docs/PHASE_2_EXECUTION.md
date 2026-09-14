@@ -49,8 +49,10 @@ y [`2026-09-13-flood-input.md`](../bench/results/2026-09-13-flood-input.md).
 - [x] Animar blink en intervalos de 500 ms; sólo solicitar frames mientras
   existen celdas parpadeantes para conservar el presupuesto idle.
 - [ ] Conformance interactiva con `vim`, `htop`, `tmux`, `fzf`, Codex y Claude.
-- [ ] Segunda implementación o adaptador de benchmark Alacritty para comparar
-  detrás del mismo `VtEngine`.
+- [x] Segunda implementación detrás del mismo `VtEngine`: `alacritty_terminal`
+  (`--features alacritty`, `--engine alacritty`) pasa la suite de integración
+  completa; comparación en
+  [`2026-09-13-engine-comparison.md`](../bench/results/2026-09-13-engine-comparison.md).
 
 ## 2.4 — Búsqueda de scrollback
 
@@ -123,10 +125,41 @@ y [`2026-09-13-flood-input.md`](../bench/results/2026-09-13-flood-input.md).
 - [x] Cierre limpio: cerrar pestaña → `ShutdownSession`; cerrar ventana deja
   las sesiones vivas en el daemon para reatachar.
 
-## Resto de Fase 2
+## 2.7 — Plataformas y cierre
 
-- [ ] Comparación Ghostty/Alacritty (`VtEngine` ya desacoplado).
-- [ ] ConPTY y transporte equivalente en Windows.
-- [ ] Renderer completo: atlas, wide chars, emoji, estilos y redraw incremental.
-- [ ] Entrada xterm/Kitty, mouse, selección, copiar/pegar y protección.
-- [ ] Conformance (`vttest`/`esctest`), benchmarks finales y CI verde.
+- [x] Windows: `proto-termd` escucha en un named pipe (`\\.\pipe\forge-prototype`,
+  una instancia nueva por cliente) y usa ConPTY a través de `portable-pty`;
+  la GUI conecta con el mismo nombre y reintenta mientras el pipe está
+  ocupado. Las señales se degradan (Ctrl+C como byte; el resto termina el
+  proceso). Verificado con `cargo check/clippy --target x86_64-pc-windows-gnu`
+  para el daemon; la GUI no se puede cross-compilar aquí (`ring` necesita
+  un toolchain MinGW), la valida el job de Windows de CI cuando se suba.
+- [ ] Windows: ejecutar `forge-gui` + daemon en una máquina Windows real y
+  construir `ghostty-vt.dll` (`scripts/bootstrap-ghostty.sh` es Unix).
+- [x] Adaptador Alacritty (`VtEngine`), benchmark relativo y pruebas con
+  ambos motores (`FORGE_TEST_ENGINE=alacritty`).
+- [x] Procedimiento de conformidad `vttest`/`esctest` en
+  [`CONFORMANCE.md`](CONFORMANCE.md); el registro se rellena en el bloque de
+  validación manual.
+- [x] Benchmarks finales de la fase en DEV-1 registrados
+  ([`2026-09-13-engine-comparison.md`](../bench/results/2026-09-13-engine-comparison.md));
+  los de la GUI de esa sesión son orientativos por carga de fondo y los
+  valores de referencia siguen siendo los de `2026-09-13-grid-full.md`.
+- [ ] CI: el pipeline queda como estaba (por decisión del usuario no se
+  gasta cuota); al retomar, el job de Windows debe compilar `forge-gui` y el
+  de Linux añadir `--features alacritty` a los tests del daemon.
+
+## Pendiente para cerrar la fase (validación manual, bloque 1)
+
+- [ ] Matar la GUI con `kill -9`, reabrir y comprobar pantalla, cursor y
+  10.000 líneas (2.1).
+- [ ] `vim`, `htop`, `tmux`, `fzf`, Codex y Claude sin glitches (2.3).
+- [ ] Puerta de 200 sesiones y `vtebench` ≥ 0,8× Alacritty en R1 (2.2).
+- [ ] `vttest`/`esctest` según `CONFORMANCE.md` y registrar el resultado.
+- [ ] Windows real: daemon + GUI con ConPTY.
+- [ ] Dos semanas de uso diario del equipo (criterio de aceptación §29).
+
+Protocolo IPC: versión 7 (`Search`/`SearchResults` con error inline,
+`ClipboardWrite`, `Signal`, `ScrollToPrompt`, `env` en `CreateSession`,
+`hyperlink` por celda, `prompt` por fila, `bracketed_paste` en
+`SessionInfo`).

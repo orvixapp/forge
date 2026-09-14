@@ -108,6 +108,15 @@ async fn ipc_round_trip(iterations: usize) -> Result<BenchmarkResult> {
     Ok(summarize("ipc_round_trip", samples, &[], None))
 }
 
+/// `FORGE_BENCH_ENGINE=alacritty` benchmarks the alternative `VtEngine`
+/// (the daemon must be built with `--features alacritty`).
+fn engine_args() -> Vec<String> {
+    std::env::var("FORGE_BENCH_ENGINE")
+        .ok()
+        .map(|engine| vec!["--engine".to_owned(), engine])
+        .unwrap_or_default()
+}
+
 fn gui_scenario(scenario: &str, iterations: usize, args: &[&str]) -> Result<BenchmarkResult> {
     let executable = forge_gui_executable();
     if !executable.is_file() {
@@ -217,6 +226,7 @@ mod key_echo {
             .arg(&socket)
             .arg("--ghostty-lib")
             .arg(&ghostty)
+            .args(crate::engine_args())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true)
@@ -518,6 +528,7 @@ mod termd_idle {
             .arg(&socket)
             .arg("--ghostty-lib")
             .arg(&ghostty)
+            .args(crate::engine_args())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true)

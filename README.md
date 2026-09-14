@@ -137,6 +137,13 @@ per tab by default (`terminal.clipboard_write = "ask" | "allow" | "deny"`).
 Pasting several lines into a program without bracketed paste, or text that
 could escape a bracketed paste, asks first.
 
+Engines: `forge-termd` runs `libghostty-vt`; built with
+`--features alacritty` it also accepts `--engine alacritty`
+(`FORGE_BENCH_ENGINE`/`FORGE_TEST_ENGINE` select it in benchmarks and tests)
+for parser comparisons. On Windows the daemon listens on a named pipe and
+spawns shells through ConPTY (build-only so far; see
+`docs/PHASE_2_EXECUTION.md`). VT conformance procedure: `docs/CONFORMANCE.md`.
+
 Diagnostics: `FORGE_LOG=debug` prints tracing/GPUI logs; `FORGE_TRACE_FILE=trace.json`
 writes a Chrome trace of the startup spans that Perfetto can open.
 
