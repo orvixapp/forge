@@ -381,7 +381,7 @@ fn pane_leaf(
             )
         }
         TabContent::Agent(agent) => (
-            agent_panel(agent, theme).into_any_element(),
+            agent_panel(agent, tab.id, theme, cx).into_any_element(),
             agent.status.clone(),
             None,
         ),
@@ -603,7 +603,9 @@ fn process_explorer(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> impl I
 
 fn agent_panel(
     agent: &crate::agent::AgentTab,
+    tab_id: u64,
     theme: forge_gui::theme::ThemeColors,
+    cx: &mut Context<ForgeWindow>,
 ) -> impl IntoElement {
     let visible = agent.visible_range();
     div()
@@ -636,6 +638,21 @@ fn agent_panel(
                 }),
             ))
         })
+        .children(
+            agent
+                .pending_permissions
+                .iter()
+                .map(|pending| agent_permission_card(pending, tab_id, theme, cx)),
+        )
+        .children(
+            agent
+                .proposed_edits
+                .iter()
+                .enumerate()
+                .map(|(edit_idx, proposed)| {
+                    agent_proposed_edit_view(proposed, tab_id, edit_idx, theme, cx)
+                }),
+        )
         .child(
             div()
                 .flex_1()
@@ -680,6 +697,374 @@ fn agent_panel(
                     agent.timeline.len()
                 )),
         )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agent_perm_button(
+    id: SharedString,
+    label: &'static str,
+    bg: forge_gui::config::HexColor,
+    text: forge_gui::config::HexColor,
+    tab_id: u64,
+    req_id: serde_json::Value,
+    decision: proto_acp::PermissionDecision,
+    ttl: proto_acp::PermissionTtl,
+    cx: &mut Context<ForgeWindow>,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .px(px(10.0))
+        .py(px(4.0))
+        .rounded(px(4.0))
+        .bg(color(bg))
+        .text_color(color(text))
+        .text_size(px(11.0))
+        .cursor_pointer()
+        .child(label)
+        .on_click(cx.listener(move |window, _, _, cx| {
+            window.agent_resolve_permission(tab_id, &req_id, decision, ttl, cx);
+        }))
+}
+
+fn agent_permission_buttons(
+    pending: &crate::agent::PendingPermissionRequest,
+    tab_id: u64,
+    theme: forge_gui::theme::ThemeColors,
+    cx: &mut Context<ForgeWindow>,
+) -> impl IntoElement {
+    let req_id = pending.id.clone();
+
+    div()
+        .flex()
+        .gap(px(8.0))
+        .mt(px(4.0))
+        .child(agent_perm_button(
+            SharedString::from(format!("perm-once-{tab_id}-{}", pending.id)),
+            "Permitir una vez",
+            theme.accent,
+            theme.chrome,
+            tab_id,
+            req_id.clone(),
+            proto_acp::PermissionDecision::Allow,
+            proto_acp::PermissionTtl::Once,
+            cx,
+        ))
+        .child(agent_perm_button(
+            SharedString::from(format!("perm-sess-{tab_id}-{}", pending.id)),
+            "Permitir en esta sesión",
+            theme.chrome_active,
+            theme.foreground,
+            tab_id,
+            req_id.clone(),
+            proto_acp::PermissionDecision::Allow,
+            proto_acp::PermissionTtl::Session,
+            cx,
+        ))
+        .child(agent_perm_button(
+            SharedString::from(format!("perm-always-{tab_id}-{}", pending.id)),
+            "Permitir siempre",
+            theme.chrome_active,
+            theme.foreground,
+            tab_id,
+            req_id.clone(),
+            proto_acp::PermissionDecision::Allow,
+            proto_acp::PermissionTtl::Always,
+            cx,
+        ))
+        .child(agent_perm_button(
+            SharedString::from(format!("perm-deny-{tab_id}-{}", pending.id)),
+            "Rechazar",
+            theme.danger,
+            theme.foreground,
+            tab_id,
+            req_id,
+            proto_acp::PermissionDecision::Deny,
+            proto_acp::PermissionTtl::Once,
+            cx,
+        ))
+}
+
+fn agent_permission_card(
+    pending: &crate::agent::PendingPermissionRequest,
+    tab_id: u64,
+    theme: forge_gui::theme::ThemeColors,
+    cx: &mut Context<ForgeWindow>,
+) -> AnyElement {
+    div()
+        .px(px(12.0))
+        .py(px(8.0))
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(color(theme.accent))
+        .bg(color(theme.chrome))
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .items_center()
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(color(theme.accent))
+                        .child(format!("Solicitud de permiso · {}", pending.title)),
+                )
+                .child(
+                    div()
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .rounded(px(3.0))
+                        .bg(color(theme.chrome_active))
+                        .text_size(px(10.0))
+                        .child(format!("{:?}", pending.capability)),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(color(theme.foreground))
+                .child(if !pending.detail.is_empty() {
+                    pending.detail.clone()
+                } else if pending.scope.is_empty() {
+                    format!("El agente solicita ejecutar {}", pending.tool_name)
+                } else {
+                    format!("Objetivo: {}", pending.scope)
+                }),
+        )
+        .child(agent_permission_buttons(pending, tab_id, theme, cx))
+        .into_any_element()
+}
+
+fn agent_hunk_action_buttons(
+    tab_id: u64,
+    edit_idx: usize,
+    hunk_id: usize,
+    theme: forge_gui::theme::ThemeColors,
+    cx: &mut Context<ForgeWindow>,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .gap(px(6.0))
+        .mt(px(2.0))
+        .child(
+            div()
+                .id(SharedString::from(format!(
+                    "accept-hunk-{tab_id}-{edit_idx}-{hunk_id}"
+                )))
+                .px(px(6.0))
+                .py(px(2.0))
+                .rounded(px(3.0))
+                .bg(color(theme.accent))
+                .text_color(color(theme.chrome))
+                .text_size(px(10.0))
+                .cursor_pointer()
+                .child("Aceptar")
+                .on_click(cx.listener(move |window, _, _, cx| {
+                    window.agent_accept_hunk(tab_id, edit_idx, hunk_id, cx);
+                })),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!(
+                    "reject-hunk-{tab_id}-{edit_idx}-{hunk_id}"
+                )))
+                .px(px(6.0))
+                .py(px(2.0))
+                .rounded(px(3.0))
+                .bg(color(theme.chrome))
+                .text_color(color(theme.foreground))
+                .text_size(px(10.0))
+                .cursor_pointer()
+                .child("Rechazar")
+                .on_click(cx.listener(move |window, _, _, cx| {
+                    window.agent_reject_hunk(tab_id, edit_idx, hunk_id, cx);
+                })),
+        )
+}
+
+fn agent_proposed_hunk_card(
+    hunk: &forge_buffer::ProposedHunk,
+    tab_id: u64,
+    edit_idx: usize,
+    theme: forge_gui::theme::ThemeColors,
+    cx: &mut Context<ForgeWindow>,
+) -> AnyElement {
+    let hunk_id = hunk.id;
+    let status_badge = match &hunk.status {
+        forge_buffer::HunkStatus::Pending => {
+            div().text_color(color(theme.accent)).child("Pendiente")
+        }
+        forge_buffer::HunkStatus::Accepted => {
+            div().text_color(color(theme.git_added)).child("Aceptado")
+        }
+        forge_buffer::HunkStatus::Rejected => {
+            div().text_color(color(theme.muted)).child("Rechazado")
+        }
+        forge_buffer::HunkStatus::Conflict(msg) => div()
+            .text_color(color(theme.danger))
+            .child(format!("Conflicto: {msg}")),
+    };
+
+    div()
+        .p(px(8.0))
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(color(theme.chrome_active_border))
+        .bg(color(theme.chrome_active))
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .items_center()
+                .text_size(px(11.0))
+                .child(format!(
+                    "Hunk #{} · Líneas {}-{}",
+                    hunk.id + 1,
+                    hunk.buffer_lines.start + 1,
+                    hunk.buffer_lines.end
+                ))
+                .child(status_badge),
+        )
+        .when(!hunk.old_text.is_empty(), |h| {
+            h.child(
+                div()
+                    .p(px(4.0))
+                    .rounded(px(2.0))
+                    .text_size(px(11.0))
+                    .text_color(color(theme.git_deleted))
+                    .child(format!("- {}", hunk.old_text.trim_end())),
+            )
+        })
+        .when(!hunk.new_text.is_empty(), |h| {
+            h.child(
+                div()
+                    .p(px(4.0))
+                    .rounded(px(2.0))
+                    .text_size(px(11.0))
+                    .text_color(color(theme.git_added))
+                    .child(format!("+ {}", hunk.new_text.trim_end())),
+            )
+        })
+        .when(
+            matches!(
+                hunk.status,
+                forge_buffer::HunkStatus::Pending | forge_buffer::HunkStatus::Conflict(_)
+            ),
+            |h| {
+                h.child(agent_hunk_action_buttons(
+                    tab_id, edit_idx, hunk_id, theme, cx,
+                ))
+            },
+        )
+        .into_any_element()
+}
+
+fn agent_proposed_edit_view(
+    proposed: &forge_buffer::ProposedEdit,
+    tab_id: u64,
+    edit_idx: usize,
+    theme: forge_gui::theme::ThemeColors,
+    cx: &mut Context<ForgeWindow>,
+) -> AnyElement {
+    let pending_cnt = proposed.pending_count();
+    let conflict_cnt = proposed.conflict_count();
+    let total_hunks = proposed.hunks.len();
+
+    div()
+        .px(px(12.0))
+        .py(px(8.0))
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(color(theme.chrome_border))
+        .bg(color(theme.chrome))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .items_center()
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(8.0))
+                        .items_center()
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .text_color(color(theme.foreground))
+                                .child(format!("Edición propuesta · {}", proposed.path.display())),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(color(theme.muted))
+                                .child(format!(
+                                    "({total_hunks} hunks, {pending_cnt} pendientes, {conflict_cnt} conflictos)"
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("accept-all-{tab_id}-{edit_idx}")))
+                                .px(px(8.0))
+                                .py(px(2.0))
+                                .rounded(px(4.0))
+                                .bg(color(theme.accent))
+                                .text_color(color(theme.chrome))
+                                .text_size(px(11.0))
+                                .cursor_pointer()
+                                .child("Aceptar todo")
+                                .on_click(cx.listener(move |window, _, _, cx| {
+                                    window.agent_accept_all_hunks(tab_id, edit_idx, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("reject-all-{tab_id}-{edit_idx}")))
+                                .px(px(8.0))
+                                .py(px(2.0))
+                                .rounded(px(4.0))
+                                .bg(color(theme.chrome_active))
+                                .text_color(color(theme.foreground))
+                                .text_size(px(11.0))
+                                .cursor_pointer()
+                                .child("Rechazar todo")
+                                .on_click(cx.listener(move |window, _, _, cx| {
+                                    window.agent_reject_all_hunks(tab_id, edit_idx, cx);
+                                })),
+                        ),
+                ),
+        )
+        .when(conflict_cnt > 0, |v| {
+            v.child(
+                div()
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(4.0))
+                    .bg(color(theme.danger))
+                    .text_color(color(theme.foreground))
+                    .text_size(px(11.0))
+                    .child("⚠ Conflicto detectado: modificaciones concurrentes en el buffer. Revisa los cambios antes de aceptar."),
+            )
+        })
+        .children(
+            proposed
+                .hunks
+                .iter()
+                .map(|hunk| agent_proposed_hunk_card(hunk, tab_id, edit_idx, theme, cx)),
+        )
+        .into_any_element()
 }
 
 fn agent_timeline_item(item: &TimelineItem, theme: forge_gui::theme::ThemeColors) -> AnyElement {

@@ -54,10 +54,10 @@ Pruebas manuales de las entregas ya utilizables: [`PHASE_4_TESTING.md`](PHASE_4_
   `forge-termd`, visibles como pestañas.
 
 ## 4.4 — Permisos y diff review
-- [ ] `PermissionBroker`: política por agente/herramienta, tarjetas de
-  permiso, decisiones recordadas por sesión.
-- [ ] Overlay de ediciones propuestas + diff review por hunk + rebase
-  sobre ediciones concurrentes (§17.5).
+- [x] `PermissionBroker`: política por agente/herramienta, tarjetas de
+  permiso, decisiones recordadas por sesión y persistencia en `.forge/permissions.json`.
+- [x] Overlay de ediciones propuestas + diff review por hunk + rebase
+  sobre ediciones concurrentes (§17.5) aplicadas como `forge-buffer::Transaction`.
 
 ## 4.5 — Proveedores, router y acciones contextuales
 - [ ] Perfiles de proveedor inyectados a Codex/OpenCode/Claude Code y

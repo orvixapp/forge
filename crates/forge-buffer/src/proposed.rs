@@ -124,9 +124,9 @@ impl ProposedEdit {
     /// Returns `true` if all hunks have been either accepted or rejected.
     #[must_use]
     pub fn is_all_resolved(&self) -> bool {
-        self.hunks.iter().all(|h| {
-            matches!(h.status, HunkStatus::Accepted | HunkStatus::Rejected)
-        })
+        self.hunks
+            .iter()
+            .all(|h| matches!(h.status, HunkStatus::Accepted | HunkStatus::Rejected))
     }
 
     /// Rebases pending hunks against concurrent changes made to `buffer`.
@@ -323,11 +323,7 @@ impl ProposedEdit {
     }
 }
 
-fn compute_hunks(
-    buffer: &Buffer,
-    base_text: &str,
-    proposed_text: &str,
-) -> Vec<ProposedHunk> {
+fn compute_hunks(buffer: &Buffer, base_text: &str, proposed_text: &str) -> Vec<ProposedHunk> {
     let input = InternedInput::new(lines(base_text), lines(proposed_text));
     let diff = Diff::compute(Algorithm::Myers, &input);
 
@@ -363,10 +359,15 @@ fn compute_hunks(
         let old_text = buffer.slice(char_start..char_end);
 
         let new_text = if after_start < after_end {
-            let lines_slice = &proposed_lines[after_start.min(proposed_lines.len())..after_end.min(proposed_lines.len())];
+            let lines_slice = &proposed_lines
+                [after_start.min(proposed_lines.len())..after_end.min(proposed_lines.len())];
             let mut joined = lines_slice.join("\n");
             // Add trailing newline if the replaced hunk ended with newline or proposal has trailing newline
-            if (old_text.ends_with('\n') || after_end < proposed_lines.len() || proposed_text.ends_with('\n')) && !joined.ends_with('\n') {
+            if (old_text.ends_with('\n')
+                || after_end < proposed_lines.len()
+                || proposed_text.ends_with('\n'))
+                && !joined.ends_with('\n')
+            {
                 joined.push('\n');
             }
             joined
@@ -481,13 +482,15 @@ mod tests {
 
         // User edits line 2 concurrently!
         let hunk_chars = proposed_edit.hunks[0].buffer_chars.clone();
-        let _ = buffer.edit(
-            vec![Edit {
-                range: hunk_chars.start..hunk_chars.start + 4,
-                text: "LINE".into(),
-            }],
-            false,
-        ).unwrap();
+        let _ = buffer
+            .edit(
+                vec![Edit {
+                    range: hunk_chars.start..hunk_chars.start + 4,
+                    text: "LINE".into(),
+                }],
+                false,
+            )
+            .unwrap();
 
         // Rebase detects conflict
         assert!(proposed_edit.rebase(&buffer));

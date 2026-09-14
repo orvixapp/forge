@@ -32,7 +32,11 @@ impl ClientHandler for ForgeClientBridge {
     ) -> Pin<Box<dyn Future<Output = Option<JsonRpcMessage>> + Send + 'a>> {
         Box::pin(async move {
             match message.method.as_deref() {
-                Some(method) if method.starts_with("fs/") || method.starts_with("terminal/") => {
+                Some(method)
+                    if method.starts_with("fs/")
+                        || method.starts_with("terminal/")
+                        || method == "session/request_permission" =>
+                {
                     let (response, receiver) = tokio::sync::oneshot::channel();
                     self.events
                         .send(UiEvent::AgentRequest {
@@ -94,11 +98,25 @@ pub struct PromptContext {
     pub content: String,
 }
 
+pub use forge_buffer::ProposedEdit;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProposedEdit {
-    pub path: PathBuf,
-    pub original: String,
-    pub proposed: String,
+pub struct PendingPermissionOption {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+}
+
+pub struct PendingPermissionRequest {
+    pub id: serde_json::Value,
+    pub tool_name: String,
+    pub title: String,
+    pub detail: String,
+    pub capability: proto_acp::PermissionCapability,
+    pub scope: String,
+    pub options: Vec<PendingPermissionOption>,
+    pub raw_options: Vec<serde_json::Value>,
+    pub response: Option<tokio::sync::oneshot::Sender<proto_acp::JsonRpcMessage>>,
 }
 
 pub struct AgentTab {
@@ -109,6 +127,7 @@ pub struct AgentTab {
     pub timeline: Vec<TimelineItem>,
     pub context: Vec<PromptContext>,
     pub proposed_edits: Vec<ProposedEdit>,
+    pub pending_permissions: Vec<PendingPermissionRequest>,
     pub scroll_item: usize,
     pub visible_items: usize,
     following_tail: bool,
@@ -128,6 +147,7 @@ impl AgentTab {
             timeline: Vec::new(),
             context: Vec::new(),
             proposed_edits: Vec::new(),
+            pending_permissions: Vec::new(),
             scroll_item: 0,
             visible_items: 40,
             following_tail: true,
@@ -145,6 +165,52 @@ impl AgentTab {
         if let Some(commands) = &self.commands {
             let _ = commands.send(AgentCommand::Cancel);
         }
+    }
+
+    pub fn resolve_permission(
+        &mut self,
+        request_id: &serde_json::Value,
+        decision: proto_acp::PermissionDecision,
+        ttl: proto_acp::PermissionTtl,
+    ) -> Option<(proto_acp::PermissionCapability, String)> {
+        let index = self
+            .pending_permissions
+            .iter()
+            .position(|p| &p.id == request_id)?;
+        let mut pending = self.pending_permissions.remove(index);
+        let option_id = proto_acp::select_option_id(&pending.raw_options, decision, ttl)
+            .or_else(|| pending.options.first().map(|opt| opt.id.clone()));
+        if let Some(sender) = pending.response.take() {
+            let reply = proto_acp::JsonRpcMessage::response(
+                pending.id.clone(),
+                serde_json::json!({
+                    "outcome": {
+                        "outcome": "selected",
+                        "optionId": option_id,
+                    }
+                }),
+            );
+            let _ = sender.send(reply);
+        }
+        let perm_id = format!("perm-{}", pending.id);
+        if let Some(TimelineItem::ToolCall { state, detail, .. }) = self
+            .timeline
+            .iter_mut()
+            .find(|item| matches!(item, TimelineItem::ToolCall { id, .. } if id == &perm_id))
+        {
+            match decision {
+                proto_acp::PermissionDecision::Allow => {
+                    *state = ToolState::Running;
+                    *detail = format!("Permiso concedido ({ttl:?})");
+                }
+                proto_acp::PermissionDecision::Deny => {
+                    *state = ToolState::Failed;
+                    *detail = "Permiso denegado por el usuario".into();
+                }
+                proto_acp::PermissionDecision::Ask => {}
+            }
+        }
+        Some((pending.capability, pending.scope))
     }
 
     pub fn submit_prompt(&mut self) -> Option<String> {
@@ -512,5 +578,82 @@ mod tests {
         assert_eq!(tab.context.len(), 1);
         assert_eq!(tab.context[0].content, "contexto");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolves_permission_requests_with_correct_decision_and_ttl() {
+        use tokio::sync::oneshot;
+        let mut tab = AgentTab::new("Codex", PathBuf::from("."));
+        let (tx, rx) = oneshot::channel();
+        let request_id = json!("perm-test-1");
+        tab.pending_permissions.push(PendingPermissionRequest {
+            id: request_id.clone(),
+            tool_name: "fs/write_text_file".into(),
+            title: "Write file".into(),
+            detail: "src/main.rs".into(),
+            capability: proto_acp::PermissionCapability::FsWrite,
+            scope: "src/main.rs".into(),
+            options: vec![
+                PendingPermissionOption {
+                    id: "allow_once".into(),
+                    name: "Allow once".into(),
+                    kind: "allow_once".into(),
+                },
+                PendingPermissionOption {
+                    id: "deny".into(),
+                    name: "Deny".into(),
+                    kind: "deny".into(),
+                },
+            ],
+            raw_options: vec![
+                json!({"id": "allow_once", "kind": "allow_once"}),
+                json!({"id": "deny", "kind": "deny"}),
+            ],
+            response: Some(tx),
+        });
+
+        assert_eq!(tab.pending_permissions.len(), 1);
+        let resolved = tab.resolve_permission(
+            &request_id,
+            proto_acp::PermissionDecision::Allow,
+            proto_acp::PermissionTtl::Once,
+        );
+        assert_eq!(
+            resolved,
+            Some((
+                proto_acp::PermissionCapability::FsWrite,
+                "src/main.rs".to_owned()
+            ))
+        );
+        assert!(tab.pending_permissions.is_empty());
+
+        let response_msg = rx.blocking_recv().expect("response should be received");
+        let outcome = response_msg.result.as_ref().expect("result");
+        assert_eq!(outcome["outcome"]["outcome"], "selected");
+        assert_eq!(outcome["outcome"]["optionId"], "allow_once");
+    }
+
+    #[test]
+    fn proposed_edits_track_hunks_and_apply_to_buffer() {
+        let mut buffer = forge_buffer::Buffer::new("line1\nline2\nline3\n");
+        let proposed = forge_buffer::ProposedEdit::from_proposal(
+            PathBuf::from("test.txt"),
+            "Agent",
+            "line1\nline2\nline3\n".into(),
+            &buffer,
+            "line1\nmodified line2\nline3\n".into(),
+        );
+        assert_eq!(proposed.hunks.len(), 1);
+        assert_eq!(proposed.pending_count(), 1);
+        assert!(!proposed.is_all_resolved());
+
+        let mut tab = AgentTab::new("Codex", PathBuf::from("."));
+        tab.proposed_edits.push(proposed);
+
+        let edit = &mut tab.proposed_edits[0];
+        let _tx = edit.apply_hunk(0, &mut buffer).expect("apply hunk");
+        assert_eq!(buffer.text(), "line1\nmodified line2\nline3\n");
+        assert_eq!(edit.pending_count(), 0);
+        assert!(edit.is_all_resolved());
     }
 }

@@ -2,7 +2,7 @@
 //! keyboard/mouse plumbing that turns shell commands into state changes.
 
 use crate::{
-    agent::{AgentTab, PromptContext, ProposedEdit, spawn_agent_worker},
+    agent::{AgentTab, PromptContext, spawn_agent_worker},
     chrome,
     editor::EditorTab,
     grid_element::{CellMetrics, Palette, SearchHighlights, TerminalSurface},
@@ -235,7 +235,14 @@ impl Tab {
         }
     }
 
-    fn agent_mut(&mut self) -> Option<&mut AgentTab> {
+    pub fn agent(&self) -> Option<&AgentTab> {
+        match &self.content {
+            TabContent::Agent(agent) => Some(agent),
+            TabContent::Terminal(_) | TabContent::Editor(_) => None,
+        }
+    }
+
+    pub fn agent_mut(&mut self) -> Option<&mut AgentTab> {
         match &mut self.content {
             TabContent::Agent(agent) => Some(agent),
             TabContent::Terminal(_) | TabContent::Editor(_) => None,
@@ -405,6 +412,7 @@ pub struct ForgeWindow {
     /// IME composition in progress, shown in the status line.
     pub marked_text: Option<String>,
     daemon_instance: Option<u64>,
+    pub permission_broker: proto_acp::PermissionBroker,
 }
 
 impl ForgeWindow {
@@ -413,6 +421,7 @@ impl ForgeWindow {
         Self::spawn_housekeeping(events, cx);
         let (theme, theme_name) = load_theme(&factory);
         let keymap = ShellKeymap::default().with_overrides(&factory.config.keybindings);
+        let permission_broker = proto_acp::PermissionBroker::new(factory.cwd.clone());
         let mut window = Self {
             tabs: Vec::new(),
             active_tab: 0,
@@ -443,6 +452,7 @@ impl ForgeWindow {
             notifications: Vec::new(),
             marked_text: None,
             daemon_instance: None,
+            permission_broker,
         };
         // Tabs must exist before the first draw, which happens inside
         // `open_window`, so the saved layout is applied here.
@@ -724,6 +734,10 @@ impl ForgeWindow {
             TabContent::Agent(agent) => Some(agent),
             TabContent::Terminal(_) | TabContent::Editor(_) => None,
         }
+    }
+
+    pub fn tab(&self, id: u64) -> Option<&Tab> {
+        self.tabs.iter().find(|tab| tab.id == id)
     }
 
     pub(crate) fn tab_mut(&mut self, id: u64) -> Option<&mut Tab> {
@@ -1496,6 +1510,10 @@ impl ForgeWindow {
         let Some(id) = message.id.clone() else { return };
         let params = message.params.as_ref().unwrap_or(&serde_json::Value::Null);
         let result = match message.method.as_deref() {
+            Some("session/request_permission") => {
+                self.acp_request_permission(agent_id, id, params, response, cx);
+                return;
+            }
             Some("fs/read_text_file") => self.acp_read_file(params),
             Some("fs/write_text_file") => self.acp_propose_file(agent_id, &id, params),
             Some("terminal/create") => self.acp_terminal_create(agent_id, id.clone(), params, cx),
@@ -1597,6 +1615,197 @@ impl ForgeWindow {
         Ok(serde_json::json!({"content": selected}))
     }
 
+    fn parse_permission_options(
+        raw_options: &[serde_json::Value],
+    ) -> Vec<crate::agent::PendingPermissionOption> {
+        let mut options = Vec::new();
+        for opt in raw_options {
+            if let Some(opt_id) = opt
+                .get("optionId")
+                .or_else(|| opt.get("id"))
+                .and_then(serde_json::Value::as_str)
+            {
+                let name = opt
+                    .get("name")
+                    .or_else(|| opt.get("title"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(opt_id);
+                let kind = opt
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("allow");
+                options.push(crate::agent::PendingPermissionOption {
+                    id: opt_id.to_owned(),
+                    name: name.to_owned(),
+                    kind: kind.to_owned(),
+                });
+            }
+        }
+        if options.is_empty() {
+            vec![
+                crate::agent::PendingPermissionOption {
+                    id: "allow_once".into(),
+                    name: "Permitir una vez".into(),
+                    kind: "allow_once".into(),
+                },
+                crate::agent::PendingPermissionOption {
+                    id: "allow_session".into(),
+                    name: "Permitir en esta sesión".into(),
+                    kind: "allow_always".into(),
+                },
+                crate::agent::PendingPermissionOption {
+                    id: "allow_always".into(),
+                    name: "Permitir siempre".into(),
+                    kind: "allow_always".into(),
+                },
+                crate::agent::PendingPermissionOption {
+                    id: "deny".into(),
+                    name: "Rechazar".into(),
+                    kind: "deny".into(),
+                },
+            ]
+        } else {
+            options
+        }
+    }
+
+    fn send_automated_permission_response(
+        id: serde_json::Value,
+        raw_options: &[serde_json::Value],
+        decision: proto_acp::PermissionDecision,
+        response: oneshot::Sender<proto_acp::JsonRpcMessage>,
+    ) {
+        let option_id =
+            proto_acp::select_option_id(raw_options, decision, proto_acp::PermissionTtl::Session);
+        let reply = proto_acp::JsonRpcMessage::response(
+            id,
+            serde_json::json!({
+                "outcome": {
+                    "outcome": "selected",
+                    "optionId": option_id,
+                }
+            }),
+        );
+        let _ = response.send(reply);
+    }
+
+    fn acp_request_permission(
+        &mut self,
+        agent_id: u64,
+        id: serde_json::Value,
+        params: &serde_json::Value,
+        response: oneshot::Sender<proto_acp::JsonRpcMessage>,
+        cx: &mut Context<Self>,
+    ) {
+        let agent_name = self
+            .tab(agent_id)
+            .and_then(Tab::agent)
+            .map_or_else(|| "Agente".to_owned(), |a| a.agent_name.clone());
+
+        let tool_call = params.get("toolCall").unwrap_or(params);
+        let tool_name = tool_call
+            .get("name")
+            .or_else(|| tool_call.get("title"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("herramienta")
+            .to_owned();
+        let title = tool_call
+            .get("title")
+            .or_else(|| tool_call.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(&tool_name)
+            .to_owned();
+        let detail = tool_call
+            .get("detail")
+            .or_else(|| tool_call.get("content"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+
+        let scope = tool_call
+            .get("arguments")
+            .and_then(|args| {
+                args.get("command")
+                    .or_else(|| args.get("path"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .or_else(|| tool_call.get("command").and_then(serde_json::Value::as_str))
+            .unwrap_or(&detail)
+            .to_owned();
+
+        let capability = proto_acp::PermissionCapability::from_tool_name(&tool_name);
+        let decision = self
+            .permission_broker
+            .evaluate(&agent_name, &capability, &scope);
+
+        let raw_options: Vec<serde_json::Value> = params
+            .get("options")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        match decision {
+            proto_acp::PermissionDecision::Allow | proto_acp::PermissionDecision::Deny => {
+                Self::send_automated_permission_response(id, &raw_options, decision, response);
+            }
+            proto_acp::PermissionDecision::Ask => {
+                let options = Self::parse_permission_options(&raw_options);
+                if let Some(agent) = self.tab_mut(agent_id).and_then(Tab::agent_mut) {
+                    agent.timeline.push(crate::agent::TimelineItem::ToolCall {
+                        id: format!("perm-{id}"),
+                        title: format!("Permiso requerido · {title}"),
+                        state: crate::agent::ToolState::WaitingPermission,
+                        detail: if scope.is_empty() {
+                            format!("{tool_name} solicita autorización")
+                        } else {
+                            format!("{tool_name} solicita autorización para: {scope}")
+                        },
+                    });
+                    agent
+                        .pending_permissions
+                        .push(crate::agent::PendingPermissionRequest {
+                            id,
+                            tool_name,
+                            title,
+                            detail,
+                            capability,
+                            scope,
+                            options,
+                            raw_options,
+                            response: Some(response),
+                        });
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn agent_resolve_permission(
+        &mut self,
+        agent_id: u64,
+        request_id: &serde_json::Value,
+        decision: proto_acp::PermissionDecision,
+        ttl: proto_acp::PermissionTtl,
+        cx: &mut Context<Self>,
+    ) {
+        let agent_name = self
+            .tab(agent_id)
+            .and_then(Tab::agent)
+            .map_or_else(String::new, |a| a.agent_name.clone());
+        if let Some(agent) = self.tab_mut(agent_id).and_then(Tab::agent_mut)
+            && let Some((capability, scope)) = agent.resolve_permission(request_id, decision, ttl)
+        {
+            self.permission_broker.record_decision(
+                &agent_name,
+                capability,
+                proto_acp::PermissionScope::CommandPattern(scope),
+                decision,
+                ttl,
+            );
+        }
+        cx.notify();
+    }
+
     fn acp_propose_file(
         &mut self,
         agent_id: u64,
@@ -1609,36 +1818,198 @@ impl ForgeWindow {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| "se requiere content".to_owned())?
             .to_owned();
-        let original = self
-            .tabs
-            .iter()
-            .filter_map(Tab::editor)
-            .find_map(|editor| {
-                editor
-                    .path()
+        let original = std::fs::read_to_string(&path).unwrap_or_default();
+        let agent_name = self
+            .tab(agent_id)
+            .and_then(Tab::agent)
+            .map_or_else(|| "Agente".to_owned(), |a| a.agent_name.clone());
+
+        let (proposed_edit, hunks_count) = if let Some(editor) =
+            self.tabs.iter().filter_map(Tab::editor).find(|e| {
+                e.path()
                     .and_then(|open| open.canonicalize().ok())
-                    .filter(|open| open == &path)
-                    .map(|_| editor.buffer.text())
-            })
-            .or_else(|| std::fs::read_to_string(&path).ok())
-            .unwrap_or_default();
+                    .as_ref()
+                    .is_some_and(|open| open == &path)
+            }) {
+            let edit = forge_buffer::ProposedEdit::from_proposal(
+                path.clone(),
+                format!("Agente · {agent_name}"),
+                original,
+                &editor.buffer,
+                proposed,
+            );
+            let count = edit.hunks.len();
+            (edit, count)
+        } else {
+            let temp_buffer = forge_buffer::Buffer::new(&original);
+            let edit = forge_buffer::ProposedEdit::from_proposal(
+                path.clone(),
+                format!("Agente · {agent_name}"),
+                original,
+                &temp_buffer,
+                proposed,
+            );
+            let count = edit.hunks.len();
+            (edit, count)
+        };
+
         let agent = self
             .tab_mut(agent_id)
             .and_then(Tab::agent_mut)
             .ok_or_else(|| "la sesión agente ya no existe".to_owned())?;
         agent.proposed_edits.retain(|edit| edit.path != path);
-        agent.proposed_edits.push(ProposedEdit {
-            path: path.clone(),
-            original,
-            proposed,
-        });
+        agent.proposed_edits.push(proposed_edit);
         agent.timeline.push(crate::agent::TimelineItem::ToolCall {
             id: format!("fs-write-{id}"),
             title: format!("Edición propuesta · {}", path.display()),
             state: crate::agent::ToolState::Succeeded,
-            detail: "Pendiente de revisión; el buffer y el disco no se modificaron".into(),
+            detail: format!("{hunks_count} hunks propuestos; pendiente de revisión"),
         });
         Ok(serde_json::json!({}))
+    }
+
+    pub fn agent_accept_hunk(
+        &mut self,
+        agent_id: u64,
+        edit_index: usize,
+        hunk_id: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent_idx) = self.tabs.iter().position(|t| t.id == agent_id) else {
+            return;
+        };
+        let Some(agent) = self.tabs[agent_idx].agent() else {
+            return;
+        };
+        let Some(proposed) = agent.proposed_edits.get(edit_index) else {
+            return;
+        };
+        let path = proposed.path.clone();
+
+        let editor_idx = self.tabs.iter().position(|t| {
+            if let TabContent::Editor(e) = &t.content {
+                e.path()
+                    .and_then(|open| open.canonicalize().ok())
+                    .as_ref()
+                    .is_some_and(|open| open == &path)
+            } else {
+                false
+            }
+        });
+
+        if let Some(editor_idx) = editor_idx {
+            if agent_idx == editor_idx {
+                return;
+            }
+            let (agent_tab, editor_tab) = if agent_idx < editor_idx {
+                let (left, right) = self.tabs.split_at_mut(editor_idx);
+                (&mut left[agent_idx], &mut right[0])
+            } else {
+                let (left, right) = self.tabs.split_at_mut(agent_idx);
+                (&mut right[0], &mut left[editor_idx])
+            };
+            if let (Some(agent), Some(editor)) = (agent_tab.agent_mut(), editor_tab.editor_mut())
+                && let Some(proposed) = agent.proposed_edits.get_mut(edit_index)
+            {
+                let _ = proposed.apply_hunk(hunk_id, &mut editor.buffer);
+            }
+        } else {
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            let mut buffer = forge_buffer::Buffer::new(&content);
+            if let Some(agent) = self.tabs[agent_idx].agent_mut()
+                && let Some(proposed) = agent.proposed_edits.get_mut(edit_index)
+                && proposed.apply_hunk(hunk_id, &mut buffer).is_ok()
+            {
+                let _ = std::fs::write(&path, buffer.text());
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn agent_reject_hunk(
+        &mut self,
+        agent_id: u64,
+        edit_index: usize,
+        hunk_id: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(agent) = self.tab_mut(agent_id).and_then(Tab::agent_mut)
+            && let Some(proposed) = agent.proposed_edits.get_mut(edit_index)
+        {
+            proposed.reject_hunk(hunk_id);
+        }
+        cx.notify();
+    }
+
+    pub fn agent_accept_all_hunks(
+        &mut self,
+        agent_id: u64,
+        edit_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent_idx) = self.tabs.iter().position(|t| t.id == agent_id) else {
+            return;
+        };
+        let Some(agent) = self.tabs[agent_idx].agent() else {
+            return;
+        };
+        let Some(proposed) = agent.proposed_edits.get(edit_index) else {
+            return;
+        };
+        let path = proposed.path.clone();
+
+        let editor_idx = self.tabs.iter().position(|t| {
+            if let TabContent::Editor(e) = &t.content {
+                e.path()
+                    .and_then(|open| open.canonicalize().ok())
+                    .as_ref()
+                    .is_some_and(|open| open == &path)
+            } else {
+                false
+            }
+        });
+
+        if let Some(editor_idx) = editor_idx {
+            if agent_idx == editor_idx {
+                return;
+            }
+            let (agent_tab, editor_tab) = if agent_idx < editor_idx {
+                let (left, right) = self.tabs.split_at_mut(editor_idx);
+                (&mut left[agent_idx], &mut right[0])
+            } else {
+                let (left, right) = self.tabs.split_at_mut(agent_idx);
+                (&mut right[0], &mut left[editor_idx])
+            };
+            if let (Some(agent), Some(editor)) = (agent_tab.agent_mut(), editor_tab.editor_mut())
+                && let Some(proposed) = agent.proposed_edits.get_mut(edit_index)
+            {
+                let _ = proposed.apply_all_pending(&mut editor.buffer);
+            }
+        } else {
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            let mut buffer = forge_buffer::Buffer::new(&content);
+            if let Some(agent) = self.tabs[agent_idx].agent_mut()
+                && let Some(proposed) = agent.proposed_edits.get_mut(edit_index)
+                && let Ok(Some(_tx)) = proposed.apply_all_pending(&mut buffer)
+            {
+                let _ = std::fs::write(&path, buffer.text());
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn agent_reject_all_hunks(
+        &mut self,
+        agent_id: u64,
+        edit_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(agent) = self.tab_mut(agent_id).and_then(Tab::agent_mut)
+            && let Some(proposed) = agent.proposed_edits.get_mut(edit_index)
+        {
+            proposed.reject_all_pending();
+        }
+        cx.notify();
     }
 
     fn acp_terminal_create(
@@ -2183,6 +2554,35 @@ impl ForgeWindow {
         cx.notify();
     }
 
+    fn run_agent_shell_command(&mut self, command: ShellCommand, cx: &mut Context<Self>) {
+        match command {
+            ShellCommand::NewAgentSession => {
+                self.create_agent_tab(cx);
+            }
+            ShellCommand::AgentAcceptAllHunks => {
+                let tab_id = self.active_tab().id;
+                let edits_count = self
+                    .active_tab()
+                    .agent()
+                    .map_or(0, |a| a.proposed_edits.len());
+                for edit_idx in 0..edits_count {
+                    self.agent_accept_all_hunks(tab_id, edit_idx, cx);
+                }
+            }
+            ShellCommand::AgentRejectAllHunks => {
+                let tab_id = self.active_tab().id;
+                let edits_count = self
+                    .active_tab()
+                    .agent()
+                    .map_or(0, |a| a.proposed_edits.len());
+                for edit_idx in 0..edits_count {
+                    self.agent_reject_all_hunks(tab_id, edit_idx, cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn run_shell_command(
         &mut self,
         command: ShellCommand,
@@ -2198,8 +2598,10 @@ impl ForgeWindow {
             ShellCommand::NewTerminalTab => {
                 self.create_terminal_tab(None, cx);
             }
-            ShellCommand::NewAgentSession => {
-                self.create_agent_tab(cx);
+            ShellCommand::NewAgentSession
+            | ShellCommand::AgentAcceptAllHunks
+            | ShellCommand::AgentRejectAllHunks => {
+                self.run_agent_shell_command(command, cx);
             }
             ShellCommand::NewTerminalTabInDirectory => Self::prompt_for_directory(cx),
             ShellCommand::CloseWindow if self.tabs.len() > 1 => {

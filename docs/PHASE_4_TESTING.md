@@ -27,15 +27,33 @@ Después:
    en la línea de tiempo.
 5. Hacer un cambio sin guardar en `README.md` y pedir que lea ese archivo. El
    agente debe recibir el texto del buffer, no la versión del disco.
-6. Pedir una edición. Debe aparecer como propuesta y no modificar el archivo ni
-   el buffer directamente.
-7. Cuando el agente ejecute el comando, debe abrirse una pestaña
-   `Agente · printf`; `terminal/output` devuelve su salida y la pestaña permanece
-   visible al terminar. `terminal/release` la cierra.
-
-La revisión visual y aceptación por hunk todavía pertenece a 4.4. Por eso una
-edición puede probarse como propuesta no destructiva, pero aún no aceptarse por
-hunks desde la UI.
+6. Pedir una edición (`fs/write_text_file`). Debe aparecer como propuesta en el panel
+   del agente y abrir el visor de diff con los hunks calculados mediante Myers diff.
+   Verificar que no modifica el archivo en disco ni el buffer directamente.
+7. En la tarjeta de revisión de diff:
+   - Revisar cada hunk individualmente con sus líneas afectadas (`+` y `-`).
+   - Aceptar un hunk con "Aceptar": se aplica como `Transaction` en el buffer del editor
+     (admitiendo deshacer con `Ctrl+Z`) y el hunk pasa a estado "Aceptado".
+   - Rechazar un hunk con "Rechazar": el hunk pasa a estado "Rechazado" sin modificar el buffer.
+   - Usar "Aceptar todo" (`agent.acceptAllHunks`) o "Rechazar todo" (`agent.rejectAllHunks`)
+     desde los botones o desde la paleta de comandos (`Ctrl+Shift+P`).
+8. Si se modifica el buffer concurrentemente mientras hay una propuesta pendiente:
+   - Los hunks no afectados se rebasan limpiamente recalculando offsets.
+   - Los hunks cuyas líneas coincidan con la edición concurrente se marcan con
+     `Conflicto: El contenido del buffer no coincide con la versión base`, impidiendo
+     su aplicación hasta resolver el conflicto.
+9. Cuando el agente solicita ejecutar comandos o herramientas que requieren permiso
+   (`session/request_permission`):
+   - Aparece una tarjeta de permiso en el panel del agente con botones:
+     "Permitir una vez", "Permitir en esta sesión", "Permitir siempre", "Rechazar".
+   - La solicitud espera la decisión del usuario antes de responder al agente.
+   - "Permitir en esta sesión" recuerda la decisión para la herramienta/comando en la
+     sesión activa sin volver a preguntar.
+   - "Permitir siempre" persiste la regla en `.forge/permissions.json` del workspace.
+   - "Rechazar" responde negativamente al agente con la opción de denegación.
+10. Cuando el agente ejecute el comando autorizado, se abre la pestaña
+    `Agente · <comando>`; `terminal/output` devuelve su salida y la pestaña permanece
+    visible al terminar. `terminal/release` la cierra.
 
 ## Token Harbor como proveedor opcional
 

@@ -396,7 +396,8 @@ mod tests {
 
     #[test]
     fn persists_always_rules_to_disk() {
-        let temp_dir = std::env::temp_dir().join(format!("forge-perm-persist-{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("forge-perm-persist-{}", std::process::id()));
         let mut broker = PermissionBroker::new(temp_dir.clone());
 
         broker.record_decision(
@@ -432,7 +433,11 @@ mod tests {
             Some("allow_once".into())
         );
         assert_eq!(
-            select_option_id(options_arr, PermissionDecision::Allow, PermissionTtl::Always),
+            select_option_id(
+                options_arr,
+                PermissionDecision::Allow,
+                PermissionTtl::Always
+            ),
             Some("allow_always".into())
         );
         assert_eq!(
