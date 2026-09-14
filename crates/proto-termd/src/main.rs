@@ -1102,7 +1102,18 @@ mod unix {
                 query,
                 regex,
                 case_sensitive,
-            } => search(daemon, out_tx, session_id, request_id, query, regex, case_sensitive).await?,
+            } => {
+                search(
+                    daemon,
+                    out_tx,
+                    session_id,
+                    request_id,
+                    query,
+                    regex,
+                    case_sensitive,
+                )
+                .await?
+            }
             ClientMessage::Signal { session_id, signal } => {
                 daemon.session(session_id).await?.signal(signal)?;
             }
@@ -1136,14 +1147,15 @@ mod unix {
         regex: bool,
         case_sensitive: bool,
     ) -> Result<()> {
-        let (matches, error) = match daemon
-            .session(session_id)
-            .await?
-            .search(&query, regex, case_sensitive)
-        {
-            Ok(matches) => (matches, None),
-            Err(error) => (Vec::new(), Some(format!("{error:#}"))),
-        };
+        let (matches, error) =
+            match daemon
+                .session(session_id)
+                .await?
+                .search(&query, regex, case_sensitive)
+            {
+                Ok(matches) => (matches, None),
+                Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+            };
         out_tx
             .send((
                 FrameKind::Response,

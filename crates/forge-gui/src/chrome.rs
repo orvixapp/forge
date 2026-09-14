@@ -4,7 +4,7 @@
 
 use crate::{
     grid_element::{TerminalGridElement, color},
-    window::{ForgeWindow, NotificationLevel},
+    window::{ConfirmationKind, ForgeWindow, NotificationLevel},
 };
 use forge_gui::{
     config::Language,
@@ -77,6 +77,9 @@ pub fn render_window(
         })
         .when(view.palette.open, |root| root.child(palette(view)))
         .when(view.search.open, |root| root.child(search_bar(view, cx)))
+        .when_some(view.confirmation.as_ref(), |root, confirmation| {
+            root.child(confirmation_dialog(view, confirmation))
+        })
         .children(resize_handles())
         .into_any_element()
 }
@@ -541,6 +544,61 @@ fn process_explorer(view: &ForgeWindow, cx: &mut Context<ForgeWindow>) -> impl I
                 .mt(px(4.0))
                 .child(format!("{} · {cols}×{rows} · {}", tab.title(), tab.status))
         }))
+}
+
+/// Modal question centred over the panes; answered from the keyboard
+/// (`Enter`/`y`, `Esc`/`n`, `a` for "always in this tab").
+fn confirmation_dialog(
+    view: &ForgeWindow,
+    confirmation: &crate::window::Confirmation,
+) -> impl IntoElement {
+    let theme = view.theme;
+    let english = view.config.ui.language == Language::English;
+    let remember = matches!(confirmation.kind, ConfirmationKind::Clipboard { .. });
+    let hint = match (english, remember) {
+        (true, true) => "Enter/Y allow · A allow for this tab · Esc/N deny",
+        (true, false) => "Enter/Y paste · Esc/N cancel",
+        (false, true) => "Enter/Y permitir · A permitir en esta pestaña · Esc/N denegar",
+        (false, false) => "Enter/Y pegar · Esc/N cancelar",
+    };
+    div()
+        .id("confirmation")
+        .absolute()
+        .top(px(TOPBAR_HEIGHT + 60.0))
+        .left(px(48.0))
+        .right(px(48.0))
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .w(px(520.0))
+                .p(px(14.0))
+                .rounded(px(8.0))
+                .bg(color(theme.chrome))
+                .border_1()
+                .border_color(color(theme.chrome_active_border))
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(color(theme.foreground))
+                        .child(confirmation.title.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(color(theme.muted))
+                        .child(confirmation.body.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(color(theme.accent))
+                        .child(hint),
+                ),
+        )
 }
 
 /// Find bar over the top-right corner of the pane area. Enter walks towards

@@ -860,7 +860,9 @@ unsafe extern "C" fn clipboard_write_trampoline(
         2 => ClipboardLocation::Primary,
         _ => ClipboardLocation::Standard,
     };
-    let text = chosen.map_or_else(String::new, |content| unsafe { content.data.to_string_lossy() });
+    let text = chosen.map_or_else(String::new, |content| unsafe {
+        content.data.to_string_lossy()
+    });
     let program = unsafe { write.name.to_string_lossy() };
     callback(location, text, program);
     if let Some(reply) = write.reply {
@@ -1066,7 +1068,11 @@ impl GhosttyTerminal {
         // SAFETY: the pointer stays valid until the terminal drops
         // `self.userdata`; the trampoline signature matches the header.
         let result = unsafe {
-            (self.api.terminal_set)(self.raw, TERMINAL_OPT_USERDATA, userdata.cast_const().cast())
+            (self.api.terminal_set)(
+                self.raw,
+                TERMINAL_OPT_USERDATA,
+                userdata.cast_const().cast(),
+            )
         };
         if let Err(error) = check("terminal_set(userdata)", result) {
             // SAFETY: not yet owned by anyone else.
@@ -1467,7 +1473,8 @@ impl GhosttyTerminal {
     /// iterator is on; the hint skips the per-cell hyperlink lookups.
     fn row_flags(&self, iterator: RawRowIterator) -> Result<(u8, bool), GhosttyError> {
         let mut row: u64 = 0;
-        let result = unsafe { (self.api.row_get)(iterator, RENDER_ROW_DATA_RAW, (&raw mut row).cast()) };
+        let result =
+            unsafe { (self.api.row_get)(iterator, RENDER_ROW_DATA_RAW, (&raw mut row).cast()) };
         check("render_state_row_get(raw)", result)?;
         let mut prompt: i32 = 0;
         let result = unsafe {
@@ -1496,7 +1503,11 @@ impl GhosttyTerminal {
         check("render_state_row_cells_get(raw)", result)?;
         let mut has_hyperlink = false;
         let result = unsafe {
-            (self.api.screen_cell_get)(cell, CELL_DATA_HAS_HYPERLINK, (&raw mut has_hyperlink).cast())
+            (self.api.screen_cell_get)(
+                cell,
+                CELL_DATA_HAS_HYPERLINK,
+                (&raw mut has_hyperlink).cast(),
+            )
         };
         check("cell_get(has hyperlink)", result)?;
         if !has_hyperlink {
@@ -1505,10 +1516,7 @@ impl GhosttyTerminal {
         let point = GhosttyPoint {
             tag: POINT_TAG_VIEWPORT,
             value: GhosttyPointValue {
-                coordinate: GhosttyPointCoordinate {
-                    x,
-                    y: u32::from(y),
-                },
+                coordinate: GhosttyPointCoordinate { x, y: u32::from(y) },
             },
         };
         let mut grid_ref = GhosttyGridRef {
@@ -1526,7 +1534,12 @@ impl GhosttyTerminal {
         check("terminal_grid_ref", result)?;
         let mut required = 0;
         let query = unsafe {
-            (self.api.grid_ref_hyperlink_uri)(&raw const grid_ref, ptr::null_mut(), 0, &raw mut required)
+            (self.api.grid_ref_hyperlink_uri)(
+                &raw const grid_ref,
+                ptr::null_mut(),
+                0,
+                &raw mut required,
+            )
         };
         if required == 0 && query == GHOSTTY_SUCCESS {
             return Ok(None);

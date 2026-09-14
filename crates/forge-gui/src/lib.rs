@@ -153,7 +153,13 @@ impl TerminalGrid {
         self.row(y).map(|cells| {
             cells
                 .iter()
-                .map(|cell| if cell.text.is_empty() { " " } else { cell.text.as_str() })
+                .map(|cell| {
+                    if cell.text.is_empty() {
+                        " "
+                    } else {
+                        cell.text.as_str()
+                    }
+                })
                 .collect()
         })
     }

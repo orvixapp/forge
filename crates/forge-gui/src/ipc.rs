@@ -5,7 +5,9 @@
 //! in-flight reads on every keystroke and desynchronize the framed stream
 //! under heavy output.
 
-use proto_ipc::{KeyEvent, MouseEvent, ProcessSignal, PromptDirection, ScrollRequest, ServerMessage};
+use proto_ipc::{
+    KeyEvent, MouseEvent, ProcessSignal, PromptDirection, ScrollRequest, ServerMessage,
+};
 use std::{path::PathBuf, sync::mpsc::Sender};
 use tokio::sync::mpsc as async_mpsc;
 
@@ -66,7 +68,7 @@ pub struct SessionSpec {
     /// reflowing the shell's first prompt from the historical 80x24 default.
     pub cols: u16,
     pub rows: u16,
-    /// Extra environment for the shell (shell integration, TERM_PROGRAM).
+    /// Extra environment for the shell (shell integration, `TERM_PROGRAM`).
     pub env: Vec<(String, String)>,
     /// Daemon session from the saved layout; a new one is created when the
     /// daemon no longer has it.

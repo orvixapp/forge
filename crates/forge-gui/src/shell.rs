@@ -28,10 +28,13 @@ pub enum ShellCommand {
     SearchPrevious,
     PreviousPrompt,
     NextPrompt,
+    SignalInterrupt,
+    SignalTerminate,
+    SignalKill,
 }
 
 impl ShellCommand {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 19] = [
         Self::NewTerminalTab,
         Self::NewTerminalTabInDirectory,
         Self::CloseWindow,
@@ -48,6 +51,9 @@ impl ShellCommand {
         Self::SearchPrevious,
         Self::PreviousPrompt,
         Self::NextPrompt,
+        Self::SignalInterrupt,
+        Self::SignalTerminate,
+        Self::SignalKill,
     ];
 
     #[must_use]
@@ -69,6 +75,9 @@ impl ShellCommand {
             Self::SearchPrevious => "terminal.searchPrevious",
             Self::PreviousPrompt => "terminal.previousPrompt",
             Self::NextPrompt => "terminal.nextPrompt",
+            Self::SignalInterrupt => "terminal.signal.interrupt",
+            Self::SignalTerminate => "terminal.signal.terminate",
+            Self::SignalKill => "terminal.signal.kill",
         }
     }
 
@@ -91,6 +100,9 @@ impl ShellCommand {
             Self::SearchPrevious => "Search: previous match (newer)",
             Self::PreviousPrompt => "Scroll to previous prompt",
             Self::NextPrompt => "Scroll to next prompt",
+            Self::SignalInterrupt => "Send SIGINT to the terminal's processes",
+            Self::SignalTerminate => "Send SIGTERM to the terminal's processes",
+            Self::SignalKill => "Send SIGKILL to the terminal's processes",
         }
     }
 
@@ -329,6 +341,77 @@ fn binding(
         context,
         command,
     }
+}
+
+/// Arguments and environment that make bash, zsh or fish load Forge's
+/// shell integration from `dir` without touching the user's dotfiles.
+/// Shells started with custom `args` are left alone: the user chose them.
+#[must_use]
+pub fn integration_launch(
+    shell: &str,
+    args: Vec<String>,
+    dir: Option<&Path>,
+    enabled: bool,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut env = vec![
+        ("TERM_PROGRAM".to_owned(), "forge".to_owned()),
+        (
+            "TERM_PROGRAM_VERSION".to_owned(),
+            env!("CARGO_PKG_VERSION").to_owned(),
+        ),
+    ];
+    let Some(dir) = dir.filter(|_| enabled) else {
+        return (args, env);
+    };
+    env.push((
+        "FORGE_SHELL_INTEGRATION".to_owned(),
+        dir.to_string_lossy().into_owned(),
+    ));
+    if !args.is_empty() {
+        return (args, env);
+    }
+    let name = Path::new(shell)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut args = args;
+    match name.as_str() {
+        "bash" => {
+            // `--rcfile` skips ~/.bashrc; the script sources it itself.
+            args.push("--rcfile".into());
+            args.push(
+                dir.join("bash")
+                    .join("forge.bash")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            env.push(("FORGE_BASH_INJECTED".into(), "1".into()));
+        }
+        "zsh" => {
+            if let Some(original) = std::env::var_os("ZDOTDIR") {
+                env.push((
+                    "FORGE_ZDOTDIR_ORIGINAL".into(),
+                    original.to_string_lossy().into_owned(),
+                ));
+            }
+            env.push((
+                "ZDOTDIR".into(),
+                dir.join("zsh").to_string_lossy().into_owned(),
+            ));
+        }
+        "fish" => {
+            let existing = std::env::var("XDG_DATA_DIRS")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+            env.push((
+                "XDG_DATA_DIRS".into(),
+                format!("{}:{existing}", dir.to_string_lossy()),
+            ));
+        }
+        _ => {}
+    }
+    (args, env)
 }
 
 /// Axis-aligned rectangle in logical pixels.
@@ -707,6 +790,38 @@ mod tests {
         for command in ShellCommand::ALL {
             assert_eq!(ShellCommand::from_id(command.id()), Some(command));
         }
+    }
+
+    #[test]
+    fn shell_integration_only_touches_known_shells_without_custom_args() {
+        let dir = Path::new("/opt/forge/shell-integration");
+        let (args, env) = integration_launch("/bin/bash", Vec::new(), Some(dir), true);
+        assert_eq!(
+            args,
+            ["--rcfile", "/opt/forge/shell-integration/bash/forge.bash"]
+        );
+        assert!(
+            env.iter()
+                .any(|(key, value)| key == "TERM_PROGRAM" && value == "forge")
+        );
+        assert!(env.iter().any(|(key, _)| key == "FORGE_BASH_INJECTED"));
+        let (args, env) = integration_launch("/usr/bin/zsh", Vec::new(), Some(dir), true);
+        assert!(args.is_empty());
+        assert!(
+            env.iter()
+                .any(|(key, value)| key == "ZDOTDIR" && value.ends_with("/zsh"))
+        );
+        let (_, env) = integration_launch("fish", Vec::new(), Some(dir), true);
+        assert!(env.iter().any(|(key, value)| key == "XDG_DATA_DIRS"
+            && value.starts_with("/opt/forge/shell-integration:")));
+        // Custom args, unknown shells and the switch leave things alone.
+        let (args, env) = integration_launch("bash", vec!["-l".into()], Some(dir), true);
+        assert_eq!(args, ["-l"]);
+        assert!(!env.iter().any(|(key, _)| key == "FORGE_BASH_INJECTED"));
+        let (args, env) = integration_launch("nu", Vec::new(), Some(dir), true);
+        assert!(args.is_empty() && env.len() == 3);
+        let (_, env) = integration_launch("bash", Vec::new(), Some(dir), false);
+        assert_eq!(env.len(), 2);
     }
 
     #[test]

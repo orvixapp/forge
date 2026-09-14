@@ -9,11 +9,12 @@ use crate::{
 };
 use forge_gui::{
     CellPos, Selection, TerminalGrid,
-    config::{Config, ConfigSources, resolve_font_family},
+    config::{ClipboardPolicy, Config, ConfigSources, resolve_font_family},
     key_event,
+    links::{self, LinkTarget, PasteRisk},
     shell::{
         PaneTree, ShellCommand, ShellContext, ShellKeymap, ShellKeystroke, SplitDirection,
-        WindowSession, search_commands,
+        WindowSession, integration_launch, search_commands,
     },
     theme::{self, ThemeColors},
 };
@@ -24,8 +25,8 @@ use gpui::{
     WindowBounds, WindowDecorations, WindowHandle, WindowOptions, prelude::*, px, size,
 };
 use proto_ipc::{
-    KeyAction, KeyMods, MouseAction, MouseButton as TerminalMouseButton, MouseEvent, ScrollRequest,
-    ServerMessage, TerminalKey,
+    ClipboardTarget, KeyAction, KeyMods, MouseAction, MouseButton as TerminalMouseButton,
+    MouseEvent, ProcessSignal, PromptDirection, ScrollRequest, ServerMessage, TerminalKey,
 };
 use std::{
     borrow::Cow,
@@ -71,6 +72,20 @@ pub struct WindowFactory {
     pub restore_session: bool,
 }
 
+/// Where the shell integration scripts live: `$FORGE_SHELL_INTEGRATION`,
+/// else the repository's `assets/` during development.
+pub fn shell_integration_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("FORGE_SHELL_INTEGRATION") {
+        return Some(PathBuf::from(dir)).filter(|dir| dir.is_dir());
+    }
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()?
+        .parent()?
+        .join("assets")
+        .join("shell-integration");
+    repo.is_dir().then_some(repo)
+}
+
 impl WindowFactory {
     pub fn session_path(&self) -> Option<PathBuf> {
         self.config_path
@@ -81,13 +96,21 @@ impl WindowFactory {
     fn spec(&self, cwd: PathBuf, attach: Option<u64>, daemon_instance: Option<u64>) -> SessionSpec {
         let chrome_height = chrome::TOPBAR_HEIGHT + chrome::STATUS_HEIGHT;
         let (cols, rows) = crate::grid_dimensions(self.window_size, self.metrics, chrome_height);
+        let command = self.config.shell();
+        let (args, env) = integration_launch(
+            &command,
+            self.config.terminal.args.clone(),
+            shell_integration_dir().as_deref(),
+            self.config.terminal.shell_integration,
+        );
         SessionSpec {
             socket: self.socket.clone(),
-            command: self.config.shell(),
-            args: self.config.terminal.args.clone(),
+            command,
+            args,
             cwd,
             cols,
             rows,
+            env,
             attach,
             daemon_instance,
         }
@@ -138,6 +161,8 @@ pub struct TerminalTab {
     pub info: SessionInfo,
     /// Daemon session id once attached; persisted for reattach.
     pub session_id: Option<u64>,
+    /// The user allowed OSC 52 writes from this tab for its lifetime.
+    clipboard_allowed: bool,
     drag_anchor: Option<CellPos>,
     /// Last `(cols, rows)` sent to the daemon; a pane resends only on change.
     viewport: Option<(u16, u16)>,
@@ -149,6 +174,26 @@ pub struct SessionInfo {
     pub pwd: Option<PathBuf>,
     pub mouse_tracking: bool,
     pub alternate_screen: bool,
+    pub bracketed_paste: bool,
+}
+
+/// A question shown inside the window; Enter/`y` accepts, Esc/`n` declines
+/// and, for clipboard writes, `a` accepts for the rest of the tab.
+pub struct Confirmation {
+    pub title: String,
+    pub body: String,
+    pub kind: ConfirmationKind,
+}
+
+pub enum ConfirmationKind {
+    /// Paste `text` into the active tab as-is.
+    Paste(String),
+    /// Apply an OSC 52 write requested by tab `tab_id`.
+    Clipboard {
+        tab_id: u64,
+        target: ClipboardTarget,
+        text: String,
+    },
 }
 
 impl TerminalTab {
@@ -207,6 +252,7 @@ pub struct ForgeWindow {
     pub keymap: ShellKeymap,
     pub palette: PaletteState,
     pub search: SearchState,
+    pub confirmation: Option<Confirmation>,
     pub process_explorer: bool,
     pub split: Option<PaneTree>,
     pub notifications: Vec<Notification>,
@@ -236,6 +282,7 @@ impl ForgeWindow {
             keymap,
             palette: PaletteState::default(),
             search: SearchState::default(),
+            confirmation: None,
             process_explorer: false,
             split: None,
             notifications: Vec::new(),
@@ -540,6 +587,7 @@ impl ForgeWindow {
             input,
             info: SessionInfo::default(),
             session_id: None,
+            clipboard_allowed: false,
             drag_anchor: None,
             viewport: None,
         });
@@ -820,6 +868,7 @@ impl ForgeWindow {
                         pwd,
                         mouse_tracking,
                         alternate_screen,
+                        bracketed_paste,
                         ..
                     },
             } => {
@@ -829,9 +878,20 @@ impl ForgeWindow {
                         pwd: pwd.map(PathBuf::from),
                         mouse_tracking,
                         alternate_screen,
+                        bracketed_paste,
                     };
                 }
             }
+            UiEvent::Message {
+                tab_id,
+                message:
+                    ServerMessage::ClipboardWrite {
+                        target,
+                        text,
+                        program,
+                        ..
+                    },
+            } => self.on_clipboard_write(tab_id, target, text, &program, cx),
             UiEvent::Message {
                 tab_id,
                 message:
@@ -925,6 +985,10 @@ impl ForgeWindow {
         cx.stop_propagation();
         let keystroke = &event.keystroke;
         let modifiers = key_mods(keystroke.modifiers);
+        if self.confirmation.is_some() {
+            self.confirmation_key(keystroke.key.as_str(), cx);
+            return;
+        }
         if self.palette.open {
             self.palette_key(
                 keystroke.key.as_str(),
@@ -964,10 +1028,12 @@ impl ForgeWindow {
             }
             "v" if copy_paste => {
                 self.paste(cx.read_from_clipboard());
+                cx.notify();
                 return;
             }
             "insert" if scrollback => {
                 self.paste(read_primary(cx));
+                cx.notify();
                 return;
             }
             "pageup" if scrollback => {
@@ -1157,6 +1223,182 @@ impl ForgeWindow {
             ShellCommand::SearchScrollback => self.open_search(cx),
             ShellCommand::SearchNext => self.search_step(SearchDirection::Older, cx),
             ShellCommand::SearchPrevious => self.search_step(SearchDirection::Newer, cx),
+            ShellCommand::PreviousPrompt => {
+                let _ = self
+                    .active_tab()
+                    .input
+                    .send(IpcCommand::ScrollToPrompt(PromptDirection::Previous));
+            }
+            ShellCommand::NextPrompt => {
+                let _ = self
+                    .active_tab()
+                    .input
+                    .send(IpcCommand::ScrollToPrompt(PromptDirection::Next));
+            }
+            ShellCommand::SignalInterrupt => self.signal(ProcessSignal::Interrupt),
+            ShellCommand::SignalTerminate => self.signal(ProcessSignal::Terminate),
+            ShellCommand::SignalKill => self.signal(ProcessSignal::Kill),
+        }
+    }
+
+    /// Signals the process group behind the active tab, for programs that
+    /// swallowed Ctrl+C or hung.
+    fn signal(&mut self, signal: ProcessSignal) {
+        let _ = self.active_tab().input.send(IpcCommand::Signal(signal));
+        self.notify_user(
+            NotificationLevel::Info,
+            format!("Señal enviada: {signal:?}"),
+        );
+    }
+
+    // ----- confirmations: paste protection and OSC 52 ---------------------
+
+    fn confirmation_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        let accept = matches!(key, "enter" | "y");
+        let always = key == "a";
+        let decline = matches!(key, "escape" | "n");
+        if !(accept || always || decline) {
+            return;
+        }
+        let Some(confirmation) = self.confirmation.take() else {
+            return;
+        };
+        if accept || always {
+            match confirmation.kind {
+                ConfirmationKind::Paste(text) => self.send_paste(text),
+                ConfirmationKind::Clipboard {
+                    tab_id,
+                    target,
+                    text,
+                } => {
+                    if always && let Some(tab) = self.tab_mut(tab_id) {
+                        tab.clipboard_allowed = true;
+                    }
+                    write_clipboard(cx, target, text);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// OSC 52 from an application: the daemon never touches a clipboard,
+    /// so the policy lives here, per tab.
+    fn on_clipboard_write(
+        &mut self,
+        tab_id: u64,
+        target: ClipboardTarget,
+        text: String,
+        program: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let policy = self.config.terminal.clipboard_write;
+        let allowed = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .is_some_and(|tab| tab.clipboard_allowed);
+        match policy {
+            ClipboardPolicy::Deny => {
+                self.notify_user(
+                    NotificationLevel::Info,
+                    "Un programa intentó escribir el portapapeles (OSC 52); denegado por configuración",
+                );
+            }
+            ClipboardPolicy::Allow => write_clipboard(cx, target, text),
+            ClipboardPolicy::Ask if allowed => write_clipboard(cx, target, text),
+            ClipboardPolicy::Ask => {
+                let who = if program.is_empty() {
+                    "Un programa de la terminal".to_owned()
+                } else {
+                    format!("«{program}»")
+                };
+                self.confirmation = Some(Confirmation {
+                    title: "¿Permitir escribir el portapapeles?".into(),
+                    body: format!(
+                        "{who} quiere copiar {} caracteres: {}",
+                        text.chars().count(),
+                        single_line(&text, 80)
+                    ),
+                    kind: ConfirmationKind::Clipboard {
+                        tab_id,
+                        target,
+                        text,
+                    },
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    // ----- links --------------------------------------------------------
+
+    /// What lies under `cell` in the active tab: an OSC 8 hyperlink, else a
+    /// URL or `path:line` recognised in the row text.
+    fn link_at(&self, cell: CellPos) -> Option<(Range<u16>, LinkTarget)> {
+        let grid = &self.active_tab().terminal.grid;
+        if let Some(uri) = grid.cell(cell.x, cell.y).and_then(|c| c.hyperlink.clone()) {
+            let row = grid.row(cell.y)?;
+            let same = |x: u16| row[usize::from(x)].hyperlink.as_deref() == Some(uri.as_str());
+            let mut start = cell.x;
+            while start > 0 && same(start - 1) {
+                start -= 1;
+            }
+            let mut end = cell.x + 1;
+            while usize::from(end) < row.len() && same(end) {
+                end += 1;
+            }
+            return Some((start..end, LinkTarget::Url(uri)));
+        }
+        let text = grid.row_text_padded(cell.y)?;
+        let link = links::link_at(&text, usize::from(cell.x))?;
+        let range = u16::try_from(link.range.start).ok()?..u16::try_from(link.range.end).ok()?;
+        Some((range, link.target))
+    }
+
+    fn open_link(&mut self, target: LinkTarget, cx: &mut Context<Self>) {
+        match target {
+            LinkTarget::Url(url) => cx.open_url(&url),
+            LinkTarget::File { path, line, column } => {
+                let base = self
+                    .active_tab()
+                    .info
+                    .pwd
+                    .clone()
+                    .unwrap_or_else(|| self.factory.cwd.clone());
+                let expanded = if let Some(rest) = path.strip_prefix("~/") {
+                    std::env::var_os("HOME").map_or_else(
+                        || PathBuf::from(&path),
+                        |home| PathBuf::from(home).join(rest),
+                    )
+                } else {
+                    PathBuf::from(&path)
+                };
+                let resolved = if expanded.is_absolute() {
+                    expanded
+                } else {
+                    base.join(expanded)
+                };
+                if !resolved.exists() {
+                    self.notify_user(
+                        NotificationLevel::Warning,
+                        format!("No existe {}", resolved.display()),
+                    );
+                    return;
+                }
+                let (program, args) = open_file_command(
+                    &self.config.terminal.open_file_command,
+                    &resolved,
+                    line,
+                    column,
+                );
+                match std::process::Command::new(&program).args(&args).spawn() {
+                    Ok(_) => tracing::debug!(%program, ?args, "opened file reference"),
+                    Err(error) => self.notify_user(
+                        NotificationLevel::Error,
+                        format!("No se pudo ejecutar {program}: {error}"),
+                    ),
+                }
+            }
         }
     }
 
@@ -1212,10 +1454,34 @@ impl ForgeWindow {
     }
 
     /// The daemon applies bracketed paste when the application asked for it.
-    fn paste(&self, item: Option<ClipboardItem>) {
-        if let Some(text) = item.and_then(|item| item.text()) {
-            let _ = self.active_tab().input.send(IpcCommand::Paste(text));
+    /// Multi-line text outside bracketed paste, or text that could escape
+    /// the bracket, is confirmed first: a pasted newline runs a command.
+    fn paste(&mut self, item: Option<ClipboardItem>) {
+        let Some(text) = item.and_then(|item| item.text()) else {
+            return;
+        };
+        let bracketed = self.active_tab().info.bracketed_paste;
+        match links::paste_risk(&text, bracketed) {
+            None => self.send_paste(text),
+            Some(risk) => {
+                let lines = text.lines().count();
+                let body = match risk {
+                    PasteRisk::Multiline => format!(
+                        "El texto tiene {lines} líneas y la aplicación no usa bracketed paste: cada salto de línea se ejecutará como Enter."
+                    ),
+                    PasteRisk::BracketEscape => "El texto contiene la secuencia de fin de bracketed paste (ESC [201~), que puede inyectar comandos.".into(),
+                };
+                self.confirmation = Some(Confirmation {
+                    title: "¿Pegar de todas formas?".into(),
+                    body,
+                    kind: ConfirmationKind::Paste(text),
+                });
+            }
         }
+    }
+
+    fn send_paste(&self, text: String) {
+        let _ = self.active_tab().input.send(IpcCommand::Paste(text));
     }
 
     pub fn on_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
@@ -1245,6 +1511,13 @@ impl ForgeWindow {
         if event.button != MouseButton::Left {
             return;
         }
+        if event.modifiers.control {
+            tab.drag_anchor = None;
+            if let Some((_, target)) = self.link_at(cell) {
+                self.open_link(target, cx);
+            }
+            return;
+        }
         tab.terminal.selection = match event.click_count {
             2 => Some(tab.terminal.grid.word_at(cell)),
             n if n >= 3 => Some(tab.terminal.grid.line_at(cell.y)),
@@ -1267,6 +1540,20 @@ impl ForgeWindow {
                 }));
             }
             return;
+        }
+        // Ctrl+hover underlines what a Ctrl+click would open.
+        let hover = if event.modifiers.control && event.pressed_button.is_none() {
+            self.active_tab()
+                .terminal
+                .cell_at(event.position)
+                .filter(|_| self.active_tab().terminal.contains(event.position))
+                .and_then(|cell| self.link_at(cell).map(|(range, _)| (cell.y, range)))
+        } else {
+            None
+        };
+        if self.active_tab().terminal.hover_link != hover {
+            self.active_tab_mut().terminal.hover_link = hover;
+            cx.notify();
         }
         let Some(anchor) = self.active_tab().drag_anchor else {
             return;
@@ -1472,6 +1759,47 @@ fn write_primary(cx: &App, item: ClipboardItem) {
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 fn write_primary(_cx: &App, _item: ClipboardItem) {}
 
+/// Writes an application-requested clipboard payload to the target it named.
+fn write_clipboard(cx: &mut App, target: ClipboardTarget, text: String) {
+    let item = ClipboardItem::new_string(text);
+    match target {
+        ClipboardTarget::Clipboard => cx.write_to_clipboard(item),
+        ClipboardTarget::Primary => write_primary(cx, item),
+    }
+}
+
+/// Program and arguments that open `file` at `line:column`: the configured
+/// template, else the desktop opener.
+fn open_file_command(
+    template: &[String],
+    file: &Path,
+    line: Option<u32>,
+    column: Option<u32>,
+) -> (String, Vec<String>) {
+    let file = file.to_string_lossy();
+    if let Some((program, args)) = template.split_first() {
+        let line = line.map_or_else(|| "1".to_owned(), |line| line.to_string());
+        let column = column.map_or_else(|| "1".to_owned(), |column| column.to_string());
+        let args = args
+            .iter()
+            .map(|arg| {
+                arg.replace("{file}", &file)
+                    .replace("{line}", &line)
+                    .replace("{column}", &column)
+            })
+            .collect();
+        return (program.clone(), args);
+    }
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    (opener.into(), vec![file.into_owned()])
+}
+
 /// Theme from the factory's config, with config colour overrides applied.
 /// An unknown theme falls back to `forge-dark` and says so on stderr.
 fn load_theme(factory: &WindowFactory) -> (ThemeColors, String) {
@@ -1532,6 +1860,21 @@ pub fn initial_cwd(session_cwd: Option<&Path>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_file_template_substitutes_placeholders() {
+        let template = vec![
+            "code".to_owned(),
+            "-g".to_owned(),
+            "{file}:{line}:{column}".to_owned(),
+        ];
+        let (program, args) = open_file_command(&template, Path::new("/tmp/a.rs"), Some(4), None);
+        assert_eq!(program, "code");
+        assert_eq!(args, ["-g", "/tmp/a.rs:4:1"]);
+        let (program, args) = open_file_command(&[], Path::new("/tmp/a.rs"), None, None);
+        assert!(!program.is_empty());
+        assert_eq!(args, ["/tmp/a.rs"]);
+    }
 
     #[test]
     fn notifications_collapse_to_one_line() {

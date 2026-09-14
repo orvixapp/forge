@@ -66,7 +66,9 @@ pub fn link_at(text: &str, col: usize) -> Option<Link> {
 fn classify(token: &str) -> Option<LinkTarget> {
     if let Some((scheme, rest)) = token.split_once("://")
         && !scheme.is_empty()
-        && scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
         && !rest.is_empty()
     {
         return Some(LinkTarget::Url(token.to_owned()));
@@ -113,9 +115,11 @@ fn file_reference(token: &str) -> Option<LinkTarget> {
     let looks_like_path = path.contains('/')
         || path.starts_with('~')
         || path.starts_with('.')
-        || path
-            .rsplit_once('.')
-            .is_some_and(|(stem, ext)| !stem.is_empty() && ext.chars().all(char::is_alphanumeric) && (1..=5).contains(&ext.len()));
+        || path.rsplit_once('.').is_some_and(|(stem, ext)| {
+            !stem.is_empty()
+                && ext.chars().all(char::is_alphanumeric)
+                && (1..=5).contains(&ext.len())
+        });
     looks_like_path.then(|| LinkTarget::File {
         path: path.to_owned(),
         line,

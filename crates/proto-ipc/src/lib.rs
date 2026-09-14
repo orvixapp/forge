@@ -255,7 +255,7 @@ pub enum ClientMessage {
         cwd: std::path::PathBuf,
         cols: u16,
         rows: u16,
-        /// Extra environment for the program (shell integration, TERM_PROGRAM).
+        /// Extra environment for the program (shell integration, `TERM_PROGRAM`).
         #[serde(default)]
         env: Vec<(String, String)>,
     },

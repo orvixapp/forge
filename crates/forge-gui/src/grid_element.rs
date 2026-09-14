@@ -121,6 +121,8 @@ pub struct TerminalSurface {
     pub palette: Palette,
     pub selection: Option<Selection>,
     pub search: SearchHighlights,
+    /// Row and columns of the link under a Ctrl+hover, underlined.
+    pub hover_link: Option<(u16, Range<u16>)>,
     glyphs: GlyphCache,
     scratch: PaintScratch,
     /// Where the grid was last painted, in window coordinates; mouse events
@@ -140,6 +142,7 @@ impl TerminalSurface {
             palette,
             selection: None,
             search: SearchHighlights::default(),
+            hover_link: None,
             glyphs: GlyphCache::default(),
             scratch: PaintScratch::default(),
             last_bounds: None,
@@ -558,6 +561,7 @@ fn paint_grid(surface: &mut TerminalSurface, bounds: Bounds<Pixels>, window: &mu
     let metrics = surface.metrics;
     let palette = surface.palette;
     let selection = surface.selection;
+    let hover_link = surface.hover_link.clone();
     surface.last_bounds = Some(bounds);
     let TerminalSurface {
         grid,
@@ -633,6 +637,10 @@ fn paint_grid(surface: &mut TerminalSurface, bounds: Bounds<Pixels>, window: &mu
                 blink_visible,
                 window,
             );
+            paint_prompt_marks(grid, &frame, palette.accent, window);
+            if let Some((y, cols)) = hover_link {
+                paint_link_underline(&frame, y, cols, metrics, palette.accent, window);
+            }
         });
     });
 }
@@ -837,6 +845,50 @@ fn paint_decorations(
             }
         }
     }
+}
+
+/// A short bar in the left margin of every OSC 133 prompt row, so the eye
+/// finds command boundaries in long output.
+fn paint_prompt_marks(grid: &TerminalGrid, frame: &GridFrame, color: Rgba, window: &mut Window) {
+    if frame.cols.start != 0 {
+        return;
+    }
+    for y in frame.rows.clone() {
+        if grid.prompt_mark(y) != 1 {
+            continue;
+        }
+        let origin = frame.cell_origin(0, y) - point(px(4.0), px(0.0));
+        window.paint_quad(fill(
+            Bounds::new(origin, size(px(2.0), frame.cell.height)),
+            color,
+        ));
+    }
+}
+
+fn paint_link_underline(
+    frame: &GridFrame,
+    y: u16,
+    cols: Range<u16>,
+    metrics: CellMetrics,
+    color: Rgba,
+    window: &mut Window,
+) {
+    if !frame.rows.contains(&y) {
+        return;
+    }
+    let start = cols.start.max(frame.cols.start);
+    let end = cols.end.min(frame.cols.end);
+    if start >= end {
+        return;
+    }
+    let origin = frame.cell_origin(start, y) + point(px(0.0), px(metrics.height - 2.0));
+    window.paint_quad(fill(
+        Bounds::new(
+            origin,
+            size(frame.cell.width * f32::from(end - start), px(1.0)),
+        ),
+        color,
+    ));
 }
 
 /// GPUI sorts every sprite of the frame by (layer order, atlas tile) before
