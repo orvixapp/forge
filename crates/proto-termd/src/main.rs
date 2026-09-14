@@ -15,7 +15,7 @@ mod unix {
     use proto_ipc::{
         CellStyle, ClientMessage, CursorStyle, FrameKind, KeyAction, KeyEvent, KeyMods,
         MouseAction, MouseButton, MouseEvent, PROTOCOL_VERSION, Rgb, ScreenCell, ScreenCursor,
-        ScreenRow, ScrollRequest, ServerMessage, TerminalKey, Viewport, read_message,
+        ScreenRow, ScrollRequest, SearchMatch, ServerMessage, TerminalKey, Viewport, read_message,
         write_message,
     };
     use std::{
@@ -319,6 +319,59 @@ mod unix {
                     ScrollRequest::Row(row) => ScrollViewport::Row(row),
                 });
             self.emit_screen()
+        }
+
+        fn search(
+            &self,
+            query: &str,
+            use_regex: bool,
+            case_sensitive: bool,
+        ) -> Result<Vec<SearchMatch>> {
+            if query.is_empty() {
+                return Ok(Vec::new());
+            }
+            let matcher = use_regex
+                .then(|| {
+                    regex::RegexBuilder::new(query)
+                        .case_insensitive(!case_sensitive)
+                        .build()
+                        .context("expresión regular inválida")
+                })
+                .transpose()?;
+            let literal = (!case_sensitive && !use_regex).then(|| query.to_lowercase());
+            let mut engine = self.terminal.lock().expect("terminal mutex poisoned");
+            let original = engine.viewport()?;
+            let page = original.len.max(1);
+            let mut matches = Vec::new();
+            let mut offset = 0_u64;
+            while offset < original.total && matches.len() < 10_000 {
+                engine.scroll(ScrollViewport::Row(offset));
+                let snapshot = engine.full_snapshot()?;
+                for row in snapshot.dirty_rows {
+                    let text: String = row.cells.into_iter().map(|cell| cell.text).collect();
+                    let haystack = literal.as_ref().map_or_else(|| text.clone(), |_| text.to_lowercase());
+                    let ranges: Vec<(usize, usize)> = if let Some(regex) = &matcher {
+                        regex.find_iter(&text).map(|found| (found.start(), found.end())).collect()
+                    } else {
+                        let needle = literal.as_deref().unwrap_or(query);
+                        haystack.match_indices(needle).map(|(start, value)| (start, start + value.len())).collect()
+                    };
+                    for (start, end) in ranges {
+                        matches.push(SearchMatch {
+                            row: offset + u64::from(row.y),
+                            start: u16::try_from(text[..start].chars().count()).unwrap_or(u16::MAX),
+                            end: u16::try_from(text[..end].chars().count()).unwrap_or(u16::MAX),
+                            preview: text.trim_end().to_owned(),
+                        });
+                        if matches.len() == 10_000 {
+                            break;
+                        }
+                    }
+                }
+                offset = offset.saturating_add(page);
+            }
+            engine.scroll(ScrollViewport::Row(original.offset));
+            Ok(matches)
         }
     }
 
@@ -987,6 +1040,29 @@ mod unix {
             }
             ClientMessage::Scroll { session_id, scroll } => {
                 daemon.session(session_id).await?.scroll(scroll)?;
+            }
+            ClientMessage::Search {
+                session_id,
+                request_id,
+                query,
+                regex,
+                case_sensitive,
+            } => {
+                let matches = daemon
+                    .session(session_id)
+                    .await?
+                    .search(&query, regex, case_sensitive)?;
+                out_tx
+                    .send((
+                        FrameKind::Response,
+                        ServerMessage::SearchResults {
+                            session_id,
+                            request_id,
+                            query,
+                            matches,
+                        },
+                    ))
+                    .await?;
             }
             ClientMessage::ListSessions => {
                 let sessions = daemon.sessions.read().await;

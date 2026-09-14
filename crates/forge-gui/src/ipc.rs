@@ -125,9 +125,57 @@ mod unix {
         sync::mpsc as async_mpsc,
     };
 
+    /// Tabs initialize on separate worker threads. Serialize protocol recovery
+    /// so two tabs cannot unlink the replacement socket at the same time.
+    static PROTOCOL_RECOVERY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[derive(Debug)]
+    struct ProtocolMismatch(String);
+
+    impl std::fmt::Display for ProtocolMismatch {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(&self.0)
+        }
+    }
+
+    impl std::error::Error for ProtocolMismatch {}
+
     /// Connects (starting the daemon if needed), creates the session and
     /// attaches. Returns the framed reader, the writer and the session id.
     async fn handshake(
+        spec: SessionSpec,
+    ) -> Result<(
+        FrameReader<tokio::net::unix::OwnedReadHalf>,
+        tokio::net::unix::OwnedWriteHalf,
+        u64,
+        u64,
+        Option<DaemonGuard>,
+    )> {
+        match handshake_once(spec.clone()).await {
+            Ok(connection) => return Ok(connection),
+            Err(error) if error.downcast_ref::<ProtocolMismatch>().is_some() => {}
+            Err(error) => return Err(error),
+        }
+
+        let _recovery = PROTOCOL_RECOVERY.lock().await;
+        // Another tab may have completed recovery while this worker waited.
+        match handshake_once(spec.clone()).await {
+            Ok(connection) => return Ok(connection),
+            Err(error) if error.downcast_ref::<ProtocolMismatch>().is_some() => {}
+            Err(error) => return Err(error),
+        }
+
+        match std::fs::remove_file(&spec.socket) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("retirar socket de daemon incompatible"),
+        }
+        handshake_once(spec)
+            .await
+            .context("reiniciar forge-termd después de actualizar el protocolo")
+    }
+
+    async fn handshake_once(
         spec: SessionSpec,
     ) -> Result<(
         FrameReader<tokio::net::unix::OwnedReadHalf>,
@@ -153,6 +201,9 @@ mod unix {
                 protocol_version,
                 daemon_instance,
             } if protocol_version == PROTOCOL_VERSION => daemon_instance,
+            ServerMessage::Error { message } if message.contains("protocol mismatch") => {
+                return Err(ProtocolMismatch(message).into());
+            }
             message => bail!("respuesta initialize inesperada: {message:?}"),
         };
         let existing = match spec

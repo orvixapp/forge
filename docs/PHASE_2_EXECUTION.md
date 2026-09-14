@@ -43,9 +43,11 @@ y [`2026-09-13-flood-input.md`](../bench/results/2026-09-13-flood-input.md).
 - [x] Cursor bar/block/underline/hollow y colores FG/BG llegan al renderer.
 - [x] `ScreenCell` transporta bold, italic, faint, blink, inverse, invisible,
   strikethrough, overline y variantes de underline desde Ghostty por IPC.
-- [x] El renderer aplica faint, inverse, invisible, underline simple/doble,
-  strikethrough y overline.
-- [ ] Aplicar variantes tipográficas bold/italic y animación blink en GPUI.
+- [x] El renderer aplica bold/italic mediante variantes de fuente cacheadas,
+  además de faint, inverse, invisible, underline simple/doble, strikethrough
+  y overline.
+- [x] Animar blink en intervalos de 500 ms; sólo solicitar frames mientras
+  existen celdas parpadeantes para conservar el presupuesto idle.
 - [ ] Conformance interactiva con `vim`, `htop`, `tmux`, `fzf`, Codex y Claude.
 - [ ] Segunda implementación o adaptador de benchmark Alacritty para comparar
   detrás del mismo `VtEngine`.

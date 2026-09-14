@@ -23,6 +23,7 @@ gpui = "0.2.2"
 libloading = "0.8"
 memmap2 = "0.9"
 portable-pty = "0.9"
+regex = "1"
 rmp-serde = "1"
 ropey = "1"
 serde = { version = "1", features = ["derive"] }

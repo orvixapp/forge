@@ -18,7 +18,11 @@ use gpui::{
     Window, WindowTextSystem, black, fill, outline, point, px, rgb, size,
 };
 use proto_ipc::{CursorStyle, Rgb};
-use std::{collections::HashMap, ops::Range};
+use std::{
+    collections::HashMap,
+    ops::Range,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 /// Colours the grid paints itself; everything else comes from the cells.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -530,6 +534,16 @@ fn paint_grid(surface: &mut TerminalSurface, bounds: Bounds<Pixels>, window: &mu
     glyphs.prepare(&font, metrics, &text_system);
 
     let (cols, rows) = grid.dimensions();
+    let has_blinking_cells = (0..rows).any(|y| {
+        grid.row(y)
+            .is_some_and(|row| row.iter().any(|cell| cell.style.blink))
+    });
+    let blink_visible = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .is_ok_and(|elapsed| (elapsed.as_millis() / 500) % 2 == 0);
+    if has_blinking_cells {
+        window.request_animation_frame();
+    }
     let cell = size(px(metrics.width), px(metrics.height));
     let visible = window.content_mask().bounds.intersect(&bounds);
     let (col_range, row_range) = visible_cells(bounds, visible, cell, cols, rows);
@@ -554,7 +568,15 @@ fn paint_grid(surface: &mut TerminalSurface, bounds: Bounds<Pixels>, window: &mu
                 paint_selection(selection, &frame, palette.selection, window);
             }
             paint_cursor(grid, &frame, metrics, palette.cursor, window);
-            collect_glyph_cells(grid, &frame, glyphs, scratch, &palette, &text_system);
+            collect_glyph_cells(
+                grid,
+                &frame,
+                glyphs,
+                scratch,
+                &palette,
+                blink_visible,
+                &text_system,
+            );
             paint_glyphs(
                 &frame,
                 glyphs,
@@ -563,7 +585,15 @@ fn paint_grid(surface: &mut TerminalSurface, bounds: Bounds<Pixels>, window: &mu
                 bounds,
                 window,
             );
-            paint_decorations(grid, &frame, metrics, &mut scratch.colors, &palette, window);
+            paint_decorations(
+                grid,
+                &frame,
+                metrics,
+                &mut scratch.colors,
+                &palette,
+                blink_visible,
+                window,
+            );
         });
     });
 }
@@ -635,6 +665,7 @@ fn collect_glyph_cells(
     glyphs: &mut GlyphCache,
     scratch: &mut PaintScratch,
     palette: &Palette,
+    blink_visible: bool,
     text_system: &WindowTextSystem,
 ) {
     let default_foreground: Hsla = palette.foreground.into();
@@ -649,7 +680,11 @@ fn collect_glyph_cells(
         let mut last_color: Option<(Option<Rgb>, Hsla)> = None;
         for x in frame.cols.clone() {
             let data = &cells[usize::from(x)];
-            if data.text.is_empty() || data.text == " " || data.style.invisible {
+            if data.text.is_empty()
+                || data.text == " "
+                || data.style.invisible
+                || (data.style.blink && !blink_visible)
+            {
                 continue;
             }
             let color = if block_cursor == Some((x, y)) {
@@ -692,13 +727,14 @@ fn paint_decorations(
     metrics: CellMetrics,
     colors: &mut ColorCache,
     palette: &Palette,
+    blink_visible: bool,
     window: &mut Window,
 ) {
     for y in frame.rows.clone() {
         let Some(cells) = grid.row(y) else { continue };
         for x in frame.cols.clone() {
             let cell = &cells[usize::from(x)];
-            if cell.style.invisible {
+            if cell.style.invisible || (cell.style.blink && !blink_visible) {
                 continue;
             }
             let color = cell

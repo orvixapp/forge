@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const HEADER_BYTES: usize = 8;
 
@@ -297,6 +297,14 @@ pub enum ClientMessage {
         session_id: u64,
         scroll: ScrollRequest,
     },
+    /// Searches text represented by the daemon-owned VT scrollback.
+    Search {
+        session_id: u64,
+        request_id: u64,
+        query: String,
+        regex: bool,
+        case_sensitive: bool,
+    },
     /// Sessions the daemon still holds, so a restarted client can reattach.
     ListSessions,
 }
@@ -575,6 +583,12 @@ pub enum ServerMessage {
         mouse_tracking: bool,
         alternate_screen: bool,
     },
+    SearchResults {
+        session_id: u64,
+        request_id: u64,
+        query: String,
+        matches: Vec<SearchMatch>,
+    },
     Exited {
         session_id: u64,
         exit_code: Option<u32>,
@@ -582,6 +596,15 @@ pub enum ServerMessage {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchMatch {
+    /// Absolute row from the beginning of the retained scrollback.
+    pub row: u64,
+    pub start: u16,
+    pub end: u16,
+    pub preview: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
