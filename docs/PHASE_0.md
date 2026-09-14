@@ -18,7 +18,7 @@ máquina y artefacto.
 | Apuesta | Evidencia actual | Estado | Cierre que falta |
 |---|---|---|---|
 | A — renderer GPUI | [`2026-09-13-grid-full.md`](../bench/results/2026-09-13-grid-full.md) mide el grid 200×60 enteramente sucio. | Parcial | Repetir en máquinas de referencia y decidir si el p95 cumple o se usa el fallback. |
-| B — `forge-termd` | IPC, PTY, attach/detach y VT están en el prototipo. [`2026-09-13-key-echo.md`](../bench/results/2026-09-13-key-echo.md): tecla→patch 0,14 ms mediana / 0,2 ms p95 en DEV-1. | Parcial (latencia ✓) | Publicar recuperación tras `kill -9` y carga con 50 terminales; repetir en R1. |
+| B — `forge-termd` | IPC, PTY, attach/detach y VT están en el prototipo. [`2026-09-13-key-echo.md`](../bench/results/2026-09-13-key-echo.md): tecla→patch 0,14 ms mediana / 0,2 ms p95. Reattach automatizado recupera 10.002 filas; [`2026-09-13-termd-idle-50.md`](../bench/results/2026-09-13-termd-idle-50.md): 7.878 KiB PSS con 50 sesiones. | Parcial (latencia, reattach y carga ✓) | Validar `kill -9` de la GUI real, `vtebench` y repetir puertas finales en R1. |
 | C — ACP | Existen primitivas JSON-RPC/JSONL para el spike. | Parcial | Registrar la matriz de capacidades contra los tres agentes indicados en la arquitectura. |
 | D — extensiones VS Code | `tools/vscode-api-scan` está implementado y documentado. | Preparado | Ejecutar y conservar un snapshot de Open VSX; priorizar con el CSV, sin llamar a ello compatibilidad. |
 | Máquinas y baselines | [`bench/MACHINES.md`](../bench/MACHINES.md) define el formato. | Pendiente | Registrar R1/R2/R3 y publicar los baselines comparables. |

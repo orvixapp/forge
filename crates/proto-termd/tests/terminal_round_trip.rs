@@ -423,6 +423,13 @@ async fn wait_for<T>(reader: &mut OwnedReadHalf, pick: impl Fn(&ServerMessage) -
                         dirty_rows.len()
                     ),
                     ServerMessage::Output { data, .. } => eprintln!("output {data:?}"),
+                    ServerMessage::Attached {
+                        session_id,
+                        backlog,
+                    } => eprintln!(
+                        "attached session={session_id} backlog={} bytes",
+                        backlog.len()
+                    ),
                     other => eprintln!("{other:?}"),
                 }
             }
@@ -438,17 +445,17 @@ async fn wait_for<T>(reader: &mut OwnedReadHalf, pick: impl Fn(&ServerMessage) -
     .expect("timed out waiting for a daemon message")
 }
 
-/// A client that attaches after output was produced gets the whole screen.
+/// A replacement client reattaches after the first one disappears and can
+/// recover both the live screen and 10k lines of daemon-owned scrollback.
 #[tokio::test]
-async fn late_attach_receives_the_full_screen() {
+#[allow(clippy::too_many_lines)] // The full reconnect protocol is clearer as one scenario.
+async fn reattach_recovers_screen_and_ten_thousand_lines() {
     let Some(ghostty_lib) = ghostty_library() else {
         eprintln!("skipping Ghostty integration test; set FORGE_GHOSTTY_LIB");
         return;
     };
-    let socket = std::env::temp_dir().join(format!(
-        "forge-termd-attach-{}.sock",
-        std::process::id()
-    ));
+    let socket =
+        std::env::temp_dir().join(format!("forge-termd-attach-{}.sock", std::process::id()));
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_proto-termd"))
         .arg("--socket")
         .arg(&socket)
@@ -481,7 +488,10 @@ async fn late_attach_receives_the_full_screen() {
         &ClientMessage::CreateSession {
             request_id: 1,
             command: "/bin/sh".into(),
-            args: vec!["-c".into(), "echo LATE-ATTACH-MARK; cat".into()],
+            args: vec![
+                "-c".into(),
+                "seq 1 10000; echo LATE-ATTACH-MARK; cat".into(),
+            ],
             cwd: std::env::current_dir().unwrap(),
             cols: 40,
             rows: 10,
@@ -497,12 +507,35 @@ async fn late_attach_receives_the_full_screen() {
         ServerMessage::SessionCreated { session_id, .. } => session_id,
         other => panic!("unexpected response: {other:?}"),
     };
-    // Let the program print before anyone is attached.
+    // The first GUI disappears. The daemon and PTY must remain alive.
+    drop(reader);
+    drop(writer);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    write_message(&mut writer, FrameKind::Request, &ClientMessage::ListSessions)
+    let stream = timeout(Duration::from_secs(5), connect_when_ready(&socket))
         .await
-        .unwrap();
+        .expect("daemon reconnect timed out")
+        .expect("reconnect to daemon");
+    let (mut reader, mut writer) = stream.into_split();
+    write_message(
+        &mut writer,
+        FrameKind::Request,
+        &ClientMessage::Initialize {
+            protocol_version: PROTOCOL_VERSION,
+            client_name: "replacement-client".into(),
+        },
+    )
+    .await
+    .unwrap();
+    read_message::<_, ServerMessage>(&mut reader).await.unwrap();
+
+    write_message(
+        &mut writer,
+        FrameKind::Request,
+        &ClientMessage::ListSessions,
+    )
+    .await
+    .unwrap();
     let listed = wait_for(&mut reader, |message| match message {
         ServerMessage::Sessions { sessions } => Some(sessions.clone()),
         _ => None,
@@ -538,10 +571,36 @@ async fn late_attach_receives_the_full_screen() {
     .await;
     assert_eq!(screen.len(), 10, "{screen:?}");
     assert!(
-        screen[0].starts_with("LATE-ATTACH-MARK"),
-        "first row was {:?}",
-        screen[0]
+        screen.iter().any(|row| row.contains("LATE-ATTACH-MARK")),
+        "live marker missing from {screen:?}"
     );
+
+    write_message(
+        &mut writer,
+        FrameKind::Notification,
+        &ClientMessage::Scroll {
+            session_id,
+            scroll: proto_ipc::ScrollRequest::Top,
+        },
+    )
+    .await
+    .unwrap();
+    let top = wait_for(&mut reader, |message| match message {
+        ServerMessage::ScreenPatch {
+            viewport,
+            dirty_rows,
+            ..
+        } if viewport.offset == 0 && viewport.total >= 10_000 => Some(
+            dirty_rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .map(|cell| cell.text.as_str())
+                .collect::<String>(),
+        ),
+        _ => None,
+    })
+    .await;
+    assert!(top.starts_with('1'), "scrollback starts with {top:?}");
     daemon.kill().await.expect("stop daemon");
     let _ = std::fs::remove_file(socket);
 }

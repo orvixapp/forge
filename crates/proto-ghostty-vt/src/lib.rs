@@ -81,6 +81,8 @@ type WritePtyFn = unsafe extern "C" fn(RawTerminal, *mut c_void, *const u8, usiz
 
 const TERMINAL_OPT_USERDATA: i32 = 0;
 const TERMINAL_OPT_WRITE_PTY: i32 = 1;
+const TERMINAL_OPT_SCROLLBACK_MAX_BYTES: i32 = 27;
+const TERMINAL_OPT_SCROLLBACK_MAX_LINES: i32 = 28;
 const TERMINAL_DATA_ACTIVE_SCREEN: i32 = 6;
 const TERMINAL_DATA_SCROLLBAR: i32 = 9;
 const TERMINAL_DATA_MOUSE_TRACKING: i32 = 11;
@@ -739,6 +741,44 @@ pub struct MouseInput {
 unsafe impl Send for GhosttyTerminal {}
 
 impl GhosttyTerminal {
+    /// Sets the maximum memory retained by Ghostty for scrollback. This limit
+    /// is enforced together with the line limit; whichever is reached first
+    /// triggers pruning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when libghostty rejects the option.
+    pub fn set_scrollback_max_bytes(&mut self, bytes: usize) -> Result<(), GhosttyError> {
+        // SAFETY: Ghostty reads a `size_t` synchronously during this call.
+        let result = unsafe {
+            (self.api.terminal_set)(
+                self.raw,
+                TERMINAL_OPT_SCROLLBACK_MAX_BYTES,
+                (&raw const bytes).cast(),
+            )
+        };
+        check("terminal_set(scrollback_max_bytes)", result)
+    }
+
+    /// Sets the maximum number of physical lines retained in scrollback.
+    /// Ghostty prunes at page granularity, so the actual count can be slightly
+    /// higher than this limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when libghostty rejects the option.
+    pub fn set_scrollback_max_lines(&mut self, lines: usize) -> Result<(), GhosttyError> {
+        // SAFETY: Ghostty reads a `size_t` synchronously during this call.
+        let result = unsafe {
+            (self.api.terminal_set)(
+                self.raw,
+                TERMINAL_OPT_SCROLLBACK_MAX_LINES,
+                (&raw const lines).cast(),
+            )
+        };
+        check("terminal_set(scrollback_max_lines)", result)
+    }
+
     pub fn write(&mut self, data: &[u8]) {
         // SAFETY: `raw` is owned and valid; the slice pointer lives for the call.
         unsafe { (self.api.terminal_write)(self.raw, data.as_ptr(), data.len()) };

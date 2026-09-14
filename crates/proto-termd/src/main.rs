@@ -564,6 +564,12 @@ mod unix {
                 .ghostty
                 .terminal(cols, rows)
                 .context("create Ghostty terminal")?;
+            terminal
+                .set_scrollback_max_bytes(64 * 1024 * 1024)
+                .context("configure terminal scrollback bytes")?;
+            terminal
+                .set_scrollback_max_lines(100_000)
+                .context("configure terminal scrollback lines")?;
             // Replies to the application's queries (DA, DSR, mode reports)
             // go straight back to the PTY.
             let replies = input_tx.clone();

@@ -46,8 +46,9 @@ async fn main() -> Result<()> {
         )?,
         "idle" => gui_scenario("idle", 1, &["--benchmark-idle-ms", "60000"])?,
         "key_echo" => key_echo::run(options.iterations).await?,
+        "termd_idle" => termd_idle::run(options.iterations).await?,
         _ => bail!(
-            "unknown scenario {scenario}; use ipc_round_trip, startup_empty, idle, grid_full, panes_20, or key_echo"
+            "unknown scenario {scenario}; use ipc_round_trip, startup_empty, idle, grid_full, panes_20, key_echo, or termd_idle"
         ),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -357,6 +358,137 @@ mod key_echo {
 
     pub async fn run(_iterations: usize) -> Result<BenchmarkResult> {
         bail!("key_echo needs the Unix daemon")
+    }
+}
+
+/// PSS of a private daemon after creating N idle PTYs. Child shell processes
+/// are intentionally excluded so this measures Forge's per-session overhead.
+#[cfg(unix)]
+mod termd_idle {
+    use super::{BenchmarkResult, profile_directory, summarize};
+    use anyhow::{Context, Result, bail};
+    use proto_ipc::{
+        ClientMessage, FrameKind, FrameReader, PROTOCOL_VERSION, ServerMessage, write_message,
+    };
+    use std::{path::PathBuf, process::Stdio, time::Duration};
+    use tokio::{net::UnixStream, process::Command, time::timeout};
+
+    async fn connect(socket: &PathBuf) -> Result<UnixStream> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match UnixStream::connect(socket).await {
+                    Ok(stream) => return stream,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .context("daemon did not open its socket")
+    }
+
+    fn process_pss_kib(pid: u32) -> Result<u64> {
+        let path = format!("/proc/{pid}/smaps_rollup");
+        let contents = std::fs::read_to_string(&path)
+            .with_context(|| format!("read daemon memory from {path}"))?;
+        contents
+            .lines()
+            .find_map(|line| line.strip_prefix("Pss:"))
+            .and_then(|value| value.split_whitespace().next())
+            .context("smaps_rollup contains no Pss")?
+            .parse()
+            .context("invalid Pss value")
+    }
+
+    pub async fn run(session_count: usize) -> Result<BenchmarkResult> {
+        let ghostty = std::env::var_os("FORGE_GHOSTTY_LIB").map_or_else(
+            || {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/ghostty/lib/libghostty-vt.so")
+            },
+            PathBuf::from,
+        );
+        if !ghostty.is_file() {
+            bail!(
+                "{} not found; run scripts/bootstrap-ghostty.sh",
+                ghostty.display()
+            );
+        }
+        let executable = profile_directory().join("proto-termd");
+        if !executable.is_file() {
+            bail!(
+                "{} not found; build proto-termd first",
+                executable.display()
+            );
+        }
+        let socket = std::env::temp_dir().join(format!(
+            "forge-bench-termd-idle-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let mut daemon = Command::new(&executable)
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--ghostty-lib")
+            .arg(&ghostty)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("spawn {}", executable.display()))?;
+        let pid = daemon.id().context("daemon exited before measurement")?;
+        let stream = connect(&socket).await?;
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = FrameReader::new(reader);
+        write_message(
+            &mut writer,
+            FrameKind::Request,
+            &ClientMessage::Initialize {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "forge-bench".into(),
+            },
+        )
+        .await?;
+        reader.read_message::<ServerMessage>().await?;
+
+        for request_id in 1..=session_count as u64 {
+            write_message(
+                &mut writer,
+                FrameKind::Request,
+                &ClientMessage::CreateSession {
+                    request_id,
+                    command: "/bin/sh".into(),
+                    args: vec!["-c".into(), "sleep 600".into()],
+                    cwd: std::env::current_dir()?,
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .await?;
+            match reader.read_message::<ServerMessage>().await?.1 {
+                ServerMessage::SessionCreated { .. } => {}
+                other => bail!("unexpected create-session response {other:?}"),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let pss = process_pss_kib(pid)?;
+        daemon.kill().await?;
+        let _ = std::fs::remove_file(&socket);
+        Ok(summarize(
+            "termd_idle",
+            vec![0.0; session_count],
+            &[pss],
+            None,
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+mod termd_idle {
+    use super::BenchmarkResult;
+    use anyhow::{Result, bail};
+
+    pub async fn run(_session_count: usize) -> Result<BenchmarkResult> {
+        bail!("termd_idle needs the Unix daemon")
     }
 }
 
