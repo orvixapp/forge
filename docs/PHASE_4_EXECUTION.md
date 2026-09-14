@@ -6,6 +6,8 @@ Fase 0 en `crates/proto-acp` (cliente ACP mínimo que habló con
 `claude-code-acp`, Codex y Gemini CLI: `session/new` → `prompt` →
 `fs/read_text_file` y `request_permission`).
 
+Pruebas manuales de las entregas ya utilizables: [`PHASE_4_TESTING.md`](PHASE_4_TESTING.md).
+
 ## Estado heredado de las fases 1–3 (lo que ya existe y hay que reutilizar)
 
 - Buffers del editor: `forge-buffer` (`Buffer`, `Transaction`, `replay`,
