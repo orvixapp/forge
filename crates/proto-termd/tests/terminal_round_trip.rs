@@ -60,7 +60,7 @@ async fn command_output_crosses_the_daemon_boundary() {
             command: "/bin/sh".into(),
             args: vec![
                 "-lc".into(),
-                "printf '\\033[31mforge-terminal-ok\\033[0m'; sleep 0.2".into(),
+                "printf '\\033[1;4;31mforge-terminal-ok\\033[0m'; sleep 0.2".into(),
             ],
             cwd: std::env::current_dir().unwrap(),
             cols: 80,
@@ -96,17 +96,18 @@ async fn command_output_crosses_the_daemon_boundary() {
     .await
     .unwrap();
 
-    let (output, screen, screen_meta, colored, cursor_seen) =
+    let (output, screen, screen_meta, colored, styled, cursor_seen) =
         timeout(Duration::from_secs(5), collect_output(&mut reader))
             .await
             .expect("terminal command timed out");
 
-    assert_eq!(output, b"\x1b[31mforge-terminal-ok\x1b[0m");
+    assert_eq!(output, b"\x1b[1;4;31mforge-terminal-ok\x1b[0m");
     assert_eq!(screen, "forge-terminal-ok");
     let (revision, cols, rows) = screen_meta.expect("Ghostty render frame");
     assert!(revision > 0);
     assert_eq!((cols, rows), (100, 30));
     assert!(colored, "ANSI foreground color was not resolved by Ghostty");
+    assert!(styled, "bold and underline attributes did not cross IPC");
     assert!(cursor_seen, "Ghostty cursor state did not cross IPC");
     daemon.kill().await.expect("stop daemon");
     let _ = std::fs::remove_file(socket);
@@ -114,11 +115,12 @@ async fn command_output_crosses_the_daemon_boundary() {
 
 async fn collect_output(
     reader: &mut OwnedReadHalf,
-) -> (Vec<u8>, String, Option<(u64, u16, u16)>, bool, bool) {
+) -> (Vec<u8>, String, Option<(u64, u16, u16)>, bool, bool, bool) {
     let mut output = Vec::new();
     let mut screen = String::new();
     let mut screen_meta = None;
     let mut colored = false;
+    let mut styled = false;
     let mut cursor_seen = false;
     loop {
         match read_message::<_, ServerMessage>(reader).await.unwrap().1 {
@@ -137,6 +139,12 @@ async fn collect_output(
                     .iter()
                     .flat_map(|row| &row.cells)
                     .any(|cell| !cell.text.is_empty() && cell.foreground.is_some());
+                styled |= dirty_rows
+                    .iter()
+                    .flat_map(|row| &row.cells)
+                    .any(|cell| {
+                        !cell.text.is_empty() && cell.style.bold && cell.style.underline == 1
+                    });
                 screen = dirty_rows
                     .into_iter()
                     .flat_map(|row| row.cells)
@@ -146,7 +154,7 @@ async fn collect_output(
             }
             ServerMessage::Exited { exit_code, .. } => {
                 assert_eq!(exit_code, Some(0));
-                return (output, screen, screen_meta, colored, cursor_seen);
+                return (output, screen, screen_meta, colored, styled, cursor_seen);
             }
             ServerMessage::Error { message } => panic!("daemon error: {message}"),
             _ => {}
