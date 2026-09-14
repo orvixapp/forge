@@ -1,0 +1,19 @@
+[package]
+name = "forge-buffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Text buffer of the Forge editor: rope, transactions, undo, selections and crash journal"
+
+[dependencies]
+encoding_rs = "0.8"
+ropey.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true
