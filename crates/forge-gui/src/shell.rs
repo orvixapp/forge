@@ -370,10 +370,10 @@ impl Default for ShellKeymap {
             FocusPreviousPane, MoveTabLeft, MoveTabRight, NewAgentSession, NewFile, NewTerminalTab,
             NextPrompt, OpenFile, OpenProjectFile, OpenSettings, PreviousPrompt, RenameTab,
             SaveFile, SearchNext, SearchPrevious, SearchProject, SearchScrollback,
-            ShowCommandPalette, ShowContextMenu, SplitHorizontal, SplitVertical, ToggleWordWrap,
-            ZoomIn, ZoomOut, ZoomPane, ZoomReset,
+            ShowCommandPalette, ShowContextMenu, SplitHorizontal, SplitVertical, TerminalCopy,
+            ToggleWordWrap, ZoomIn, ZoomOut, ZoomPane, ZoomReset,
         };
-        use ShellContext::{Editor, Terminal, Window};
+        use ShellContext::{Agent, Editor, Terminal, Window};
         Self {
             bindings: vec![
                 binding("t", true, false, false, Window, NewTerminalTab),
@@ -393,6 +393,7 @@ impl Default for ShellKeymap {
                 binding("y", true, false, false, Editor, EditorRedo),
                 binding("a", true, false, false, Editor, EditorSelectAll),
                 binding("c", true, false, false, Editor, EditorCopy),
+                binding("c", true, false, false, Agent, TerminalCopy),
                 binding("x", true, false, false, Editor, EditorCut),
                 binding("v", true, false, false, Editor, EditorPaste),
                 binding("d", true, false, false, Editor, EditorSelectNextMatch),

@@ -3,10 +3,10 @@
 //! batched and tested without a GPUI window.
 
 use forge_gui::i18n::{tr, trf};
+use gpui::ScrollHandle;
 use serde_json::Value;
 use std::{
     future::Future,
-    ops::Range,
     path::PathBuf,
     pin::Pin,
     sync::{Arc, mpsc::Sender},
@@ -144,6 +144,9 @@ pub struct AgentTab {
     pub proposed_edits: Vec<ProposedEdit>,
     pub pending_permissions: Vec<PendingPermissionRequest>,
     turn_active: bool,
+    pub scroll_handle: ScrollHandle,
+    selection_anchor: Option<usize>,
+    selection_head: Option<usize>,
     pub scroll_item: usize,
     pub visible_items: usize,
     following_tail: bool,
@@ -169,6 +172,9 @@ impl AgentTab {
             proposed_edits: Vec::new(),
             pending_permissions: Vec::new(),
             turn_active: false,
+            scroll_handle: ScrollHandle::new(),
+            selection_anchor: None,
+            selection_head: None,
             scroll_item: 0,
             visible_items: 40,
             following_tail: true,
@@ -316,17 +322,54 @@ impl AgentTab {
         let maximum = self.timeline.len().saturating_sub(self.visible_items);
         self.scroll_item = self.scroll_item.saturating_add_signed(delta).min(maximum);
         self.following_tail = self.scroll_item == maximum;
+        self.scroll_handle.scroll_to_top_of_item(self.scroll_item);
     }
 
     pub fn scroll_to_end(&mut self) {
         self.scroll_item = self.timeline.len().saturating_sub(self.visible_items);
         self.following_tail = true;
+        self.scroll_handle.scroll_to_bottom();
+    }
+
+    pub fn stop_following_tail(&mut self) {
+        self.following_tail = false;
+    }
+
+    pub fn start_selection(&mut self, index: usize) {
+        self.selection_anchor = Some(index);
+        self.selection_head = Some(index);
+    }
+
+    pub fn extend_selection(&mut self, index: usize) {
+        if self.selection_anchor.is_some() {
+            self.selection_head = Some(index);
+        }
     }
 
     #[must_use]
-    pub fn visible_range(&self) -> Range<usize> {
-        let start = self.scroll_item.min(self.timeline.len());
-        start..(start + self.visible_items).min(self.timeline.len())
+    pub fn item_selected(&self, index: usize) -> bool {
+        let (Some(anchor), Some(head)) = (self.selection_anchor, self.selection_head) else {
+            return false;
+        };
+        let range = anchor.min(head)..=anchor.max(head);
+        range.contains(&index)
+    }
+
+    #[must_use]
+    pub fn selected_text(&self) -> Option<String> {
+        let (Some(anchor), Some(head)) = (self.selection_anchor, self.selection_head) else {
+            return None;
+        };
+        let start = anchor.min(head);
+        let end = anchor.max(head).min(self.timeline.len().saturating_sub(1));
+        let text = self
+            .timeline
+            .get(start..=end)?
+            .iter()
+            .map(timeline_text)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!text.is_empty()).then_some(text)
     }
 
     /// Applies one tolerant `session/update`. Unknown update shapes are logged
@@ -508,12 +551,13 @@ impl AgentTab {
             });
         }
     }
+}
 
-    #[must_use]
-    pub fn visible_timeline(&self, range: Range<usize>) -> &[TimelineItem] {
-        let start = range.start.min(self.timeline.len());
-        let end = range.end.min(self.timeline.len()).max(start);
-        &self.timeline[start..end]
+fn timeline_text(item: &TimelineItem) -> String {
+    match item {
+        TimelineItem::Message { text, .. } | TimelineItem::Thought { text, .. } => text.clone(),
+        TimelineItem::ToolCall { title, detail, .. } => format!("{title}\n{detail}"),
+        TimelineItem::Plan { title, entries } => format!("{title}\n{}", entries.join("\n")),
     }
 }
 
@@ -723,6 +767,28 @@ mod tests {
         assert!(!tab.turn_active());
         assert_eq!(tab.status, tr("Ready"));
         assert_eq!(tab.submit_prompt().as_deref(), Some("segundo"));
+    }
+
+    #[test]
+    fn selecting_timeline_items_produces_copyable_text() {
+        let mut tab = AgentTab::new("OpenCode", PathBuf::from("."));
+        tab.timeline.push(TimelineItem::Message {
+            role: MessageRole::User,
+            text: "pregunta".into(),
+        });
+        tab.timeline.push(TimelineItem::Message {
+            role: MessageRole::Agent,
+            text: "respuesta".into(),
+        });
+
+        tab.start_selection(1);
+        tab.extend_selection(0);
+        assert!(tab.item_selected(0));
+        assert!(tab.item_selected(1));
+        assert_eq!(
+            tab.selected_text().as_deref(),
+            Some("pregunta\n\nrespuesta")
+        );
     }
 
     #[test]

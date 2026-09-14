@@ -541,6 +541,7 @@ impl ForgeWindow {
                 Timer::after(Duration::from_millis(16)).await;
                 let mut changed = false;
                 while let Ok(event) = events.try_recv() {
+                    let streamed_agent_update = matches!(&event, UiEvent::AgentEvent { .. });
                     if this
                         .update(cx, |view, cx| view.handle_event(event, cx))
                         .is_err()
@@ -548,6 +549,12 @@ impl ForgeWindow {
                         return;
                     }
                     changed = true;
+                    // A provider may flush a whole turn as a tight burst.
+                    // Paint each ACP update before consuming the next one so
+                    // streaming and the live cursor remain perceptible.
+                    if streamed_agent_update {
+                        break;
+                    }
                 }
                 if last_tick.elapsed() >= HOUSEKEEPING {
                     last_tick = Instant::now();
@@ -3115,17 +3122,10 @@ impl ForgeWindow {
 
     pub fn on_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
         if matches!(self.active_tab().content, TabContent::Agent(_)) {
-            let lines = match event.delta {
-                ScrollDelta::Lines(delta) => delta.y * 3.0,
-                ScrollDelta::Pixels(delta) => f32::from(delta.y) / self.factory.metrics.height,
-            };
-            #[allow(clippy::cast_possible_truncation)]
-            let rows = lines.round() as isize;
-            if rows != 0
-                && let Some(agent) = self.active_agent_mut()
-            {
-                agent.scroll_by(-rows);
-                cx.notify();
+            // The timeline owns a real pixel scroll container. This listener
+            // only disables tail-following; GPUI applies the wheel delta.
+            if let Some(agent) = self.active_agent_mut() {
+                agent.stop_following_tail();
             }
             return;
         }
@@ -3510,6 +3510,7 @@ impl ForgeWindow {
                 ShellCommand::OpenSettings,
             ],
             (MenuTarget::Pane, TabContent::Agent(_)) => vec![
+                ShellCommand::TerminalCopy,
                 ShellCommand::NewAgentSession,
                 ShellCommand::AgentForward,
                 ShellCommand::AgentAcceptAllHunks,
@@ -3771,6 +3772,9 @@ impl ForgeWindow {
     // ----- clipboard and mouse selection --------------------------------
 
     fn selected_text(&self) -> Option<String> {
+        if let Some(agent) = self.active_tab().agent() {
+            return agent.selected_text();
+        }
         let terminal = &self.active_terminal()?.terminal;
         let text = terminal.grid.selected_text(terminal.selection?);
         (!text.is_empty()).then_some(text)
@@ -3958,6 +3962,12 @@ impl ForgeWindow {
     pub fn on_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
         if self.active_tab().editor().is_some() {
             self.editor_mouse_up();
+            return;
+        }
+        if self.active_tab().agent().is_some() {
+            if let Some(text) = self.selected_text() {
+                write_primary(cx, ClipboardItem::new_string(text));
+            }
             return;
         }
         let Some(tab) = self.active_terminal() else {

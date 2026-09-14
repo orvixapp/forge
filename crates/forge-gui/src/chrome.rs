@@ -615,8 +615,6 @@ fn agent_panel(
     theme: forge_gui::theme::ThemeColors,
     cx: &mut Context<ForgeWindow>,
 ) -> impl IntoElement {
-    let visible = agent.visible_range();
-    let visible_start = visible.start;
     let turn_active = agent.turn_active();
     let session = agent
         .session_id
@@ -708,18 +706,27 @@ fn agent_panel(
             div()
                 .flex_1()
                 .min_h(px(0.0))
+                .id(("agent-timeline", tab_id))
                 .px(px(18.0))
                 .py(px(16.0))
-                .overflow_hidden()
+                .overflow_y_scroll()
+                .overflow_x_hidden()
+                .track_scroll(&agent.scroll_handle)
                 .flex()
                 .flex_col()
                 .gap(px(16.0))
-                .children(agent.visible_timeline(visible).iter().enumerate().map(
-                    |(index, item)| {
-                        let last = visible_start + index + 1 == agent.timeline.len();
-                        agent_timeline_item(item, turn_active && last, tab_id, theme)
-                    },
-                )),
+                .children(agent.timeline.iter().enumerate().map(|(index, item)| {
+                    let last = index + 1 == agent.timeline.len();
+                    agent_timeline_item(
+                        item,
+                        index,
+                        agent.item_selected(index),
+                        turn_active && last,
+                        tab_id,
+                        theme,
+                        cx,
+                    )
+                })),
         )
         .child(
             div()
@@ -758,10 +765,13 @@ fn agent_panel(
                                     if turn_active {
                                         tr("The agent is working…").to_owned()
                                     } else {
-                                        tr("Ask about the code or request a change…").to_owned()
+                                        format!(
+                                            "{} ▏",
+                                            tr("Ask about the code or request a change…")
+                                        )
                                     }
                                 } else {
-                                    agent.prompt.clone()
+                                    format!("{} ▏", agent.prompt)
                                 }),
                         ),
                 )
@@ -1179,11 +1189,15 @@ fn agent_proposed_edit_view(
         .into_any_element()
 }
 
+#[allow(clippy::too_many_lines)]
 fn agent_timeline_item(
     item: &TimelineItem,
+    index: usize,
+    selected: bool,
     streaming: bool,
     tab_id: u64,
     theme: forge_gui::theme::ThemeColors,
+    cx: &mut Context<ForgeWindow>,
 ) -> AnyElement {
     let (label, body, tint) = match item {
         TimelineItem::Message { role, text } => {
@@ -1227,34 +1241,38 @@ fn agent_timeline_item(
             theme.accent,
         ),
     };
-    let user = matches!(
-        item,
-        TimelineItem::Message {
-            role: MessageRole::User,
-            ..
-        }
-    );
     let thought = matches!(item, TimelineItem::Thought { .. });
-    let rail = if user {
-        theme.accent
-    } else {
-        theme.chrome_active_border
-    };
     div()
+        .id(("agent-message", index))
         .w_full()
-        .flex()
-        .gap(px(10.0))
-        .child(
-            div()
-                .w(px(2.0))
-                .flex_none()
-                .rounded(px(2.0))
-                .bg(with_alpha(color(rail), if thought { 0.35 } else { 0.85 })),
+        .px(px(8.0))
+        .py(px(5.0))
+        .rounded(px(3.0))
+        .cursor(CursorStyle::IBeam)
+        .when(selected, |row| {
+            row.bg(with_alpha(color(theme.selection), theme.selection_opacity))
+        })
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |view, _, _, cx| {
+                if let Some(agent) = view.active_tab_mut().agent_mut() {
+                    agent.start_selection(index);
+                    cx.notify();
+                }
+            }),
+        )
+        .on_mouse_move(
+            cx.listener(move |view, event: &gpui::MouseMoveEvent, _, cx| {
+                if event.pressed_button == Some(MouseButton::Left)
+                    && let Some(agent) = view.active_tab_mut().agent_mut()
+                {
+                    agent.extend_selection(index);
+                    cx.notify();
+                }
+            }),
         )
         .child(
             div()
-                .flex_1()
-                .min_w(px(0.0))
                 .child(
                     div()
                         .mb(px(4.0))
