@@ -77,11 +77,15 @@ impl WindowFactory {
     }
 
     fn spec(&self, cwd: PathBuf, attach: Option<u64>) -> SessionSpec {
+        let chrome_height = chrome::TOPBAR_HEIGHT + chrome::STATUS_HEIGHT;
+        let (cols, rows) = crate::grid_dimensions(self.window_size, self.metrics, chrome_height);
         SessionSpec {
             socket: self.socket.clone(),
             command: self.config.shell(),
             args: self.config.terminal.args.clone(),
             cwd,
+            cols,
+            rows,
             attach,
         }
     }
@@ -494,11 +498,17 @@ impl ForgeWindow {
             || format!("Terminal {id}"),
             |name| name.to_string_lossy().into_owned(),
         );
+        let chrome_height = chrome::TOPBAR_HEIGHT + chrome::STATUS_HEIGHT;
+        let (initial_cols, initial_rows) = crate::grid_dimensions(
+            self.factory.window_size,
+            self.factory.metrics,
+            chrome_height,
+        );
         self.tabs.push(TerminalTab {
             id,
             default_title: title,
             terminal: TerminalSurface::new(
-                TerminalGrid::new(80, 24),
+                TerminalGrid::new(initial_cols, initial_rows),
                 self.factory.metrics,
                 Palette::from(&self.theme),
             ),

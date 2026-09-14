@@ -51,6 +51,10 @@ pub struct SessionSpec {
     pub command: String,
     pub args: Vec<String>,
     pub cwd: PathBuf,
+    /// Initial PTY size. Starting at the real window dimensions avoids
+    /// reflowing the shell's first prompt from the historical 80x24 default.
+    pub cols: u16,
+    pub rows: u16,
     /// Daemon session from the saved layout; a new one is created when the
     /// daemon no longer has it.
     pub attach: Option<u64>,
@@ -174,8 +178,8 @@ mod unix {
                     command: spec.command,
                     args: spec.args,
                     cwd: spec.cwd,
-                    cols: 80,
-                    rows: 24,
+                    cols: spec.cols,
+                    rows: spec.rows,
                 },
             )
             .await?;
