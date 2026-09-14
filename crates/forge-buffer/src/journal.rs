@@ -113,7 +113,11 @@ impl Journal {
     pub fn path_for(journal_dir: &Path, file: &Path) -> PathBuf {
         let mut name = String::new();
         for c in file.to_string_lossy().chars() {
-            name.push(if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' });
+            name.push(if c.is_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            });
         }
         if name.len() > 120 {
             let hash = fnv1a(file.to_string_lossy().as_bytes());
@@ -138,7 +142,13 @@ mod tests {
     fn a_journal_replays_unsaved_edits_and_drops_a_torn_tail() {
         let dir = std::env::temp_dir().join(format!("forge-journal-{}", std::process::id()));
         let path = Journal::path_for(&dir, Path::new("/tmp/some file.rs"));
-        assert!(path.file_name().unwrap().to_str().unwrap().ends_with("some_file.rs.journal"));
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with("some_file.rs.journal")
+        );
         let mut buffer = Buffer::new("base\n");
         buffer.attach_journal(Journal::open(&path).unwrap());
         buffer.edit(vec![Edit::insert(5, "one\n")], false).unwrap();
@@ -147,7 +157,8 @@ mod tests {
         // Simulate a crash mid-write of a third line.
         {
             let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-            file.write_all(b"{\"edits\":[{\"range\":{\"start\":0,\"end\":").unwrap();
+            file.write_all(b"{\"edits\":[{\"range\":{\"start\":0,\"end\":")
+                .unwrap();
         }
         let recorded = Journal::read(&path).unwrap();
         assert_eq!(recorded.len(), 2);
@@ -157,7 +168,11 @@ mod tests {
         }
         assert_eq!(recovered.text(), "base\none\ntwo\n");
         buffer.mark_saved();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0, "saving empties the journal");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+            "saving empties the journal"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

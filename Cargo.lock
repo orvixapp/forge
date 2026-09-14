@@ -4089,14 +4089,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "proto-buffer"
-version = "0.0.1"
-dependencies = [
- "ropey",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "proto-ghostty-vt"
 version = "0.0.1"
 dependencies = [

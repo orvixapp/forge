@@ -54,28 +54,27 @@ impl LoadedFile {
     /// Decodes bytes read from `path`.
     #[must_use]
     pub fn decode(path: PathBuf, bytes: &[u8]) -> Self {
-        let (encoding, bom_len) = encoding_rs::Encoding::for_bom(bytes)
-            .unwrap_or((encoding_rs::UTF_8, 0));
+        let (encoding, bom_len) =
+            encoding_rs::Encoding::for_bom(bytes).unwrap_or((encoding_rs::UTF_8, 0));
         let body = &bytes[bom_len..];
         let (text, lossy) = if encoding == encoding_rs::UTF_8 {
-            match std::str::from_utf8(body) {
-                Ok(text) => (text.to_owned(), false),
+            if let Ok(text) = std::str::from_utf8(body) {
+                (text.to_owned(), false)
+            } else {
                 // Not UTF-8: the common Windows legacy encoding is the best
                 // guess; the user can re-open with another one later.
-                Err(_) => {
-                    let (text, _, _) = encoding_rs::WINDOWS_1252.decode(body);
-                    return Self {
-                        path,
-                        line_ending: detect_line_ending(&text),
-                        text: normalize(&text),
-                        encoding: encoding_rs::WINDOWS_1252.name(),
-                        had_bom: false,
-                        lossy: false,
-                    };
-                }
+                let (text, _, _) = encoding_rs::WINDOWS_1252.decode(body);
+                return Self {
+                    path,
+                    line_ending: detect_line_ending(&text),
+                    text: normalize(&text),
+                    encoding: encoding_rs::WINDOWS_1252.name(),
+                    had_bom: false,
+                    lossy: false,
+                };
             }
         } else {
-            let (text, _, had_errors) = encoding.decode_without_bom_handling(body);
+            let (text, had_errors) = encoding.decode_without_bom_handling(body);
             (text.into_owned(), had_errors)
         };
         Self {
@@ -160,8 +159,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".into());
+        .map_or_else(|| "file".into(), |name| name.to_string_lossy().into_owned());
     let temporary = parent.join(format!(".{name}.forge-tmp"));
     std::fs::write(&temporary, bytes)?;
     if let Ok(metadata) = std::fs::metadata(path) {

@@ -111,7 +111,9 @@ pub(crate) fn map_through(edits: &[Edit], position: usize, sticky: bool) -> usiz
             break;
         }
         let inserted = edit.text.chars().count();
-        if position >= edit.range.end && !(edit.range.is_empty() && position == edit.range.start && !sticky) {
+        if position >= edit.range.end
+            && !(edit.range.is_empty() && position == edit.range.start && !sticky)
+        {
             mapped = mapped + inserted - edit.range.len();
         } else if position > edit.range.start || (position == edit.range.start && sticky) {
             // Inside the replaced range (or at an insertion point, sticky).
@@ -121,61 +123,122 @@ pub(crate) fn map_through(edits: &[Edit], position: usize, sticky: bool) -> usiz
     mapped
 }
 
-/// Composes two sorted edit lists into one against the original text. The
-/// second list is in post-`first` coordinates; each of its edits is mapped
-/// back through `first` and spliced in.
-fn compose(first: &[Edit], second: &[Edit]) -> Vec<Edit> {
-    // Materialise both passes over a virtual text of "pieces" is the robust
-    // way; for the undo-group use case (typing, a few edits) a simpler rule
-    // suffices: apply `second` onto the *inserted text* of `first` when it
-    // lands inside it, otherwise translate it to pre-`first` coordinates.
-    let mut result: Vec<Edit> = first.to_vec();
-    for edit in second {
-        // Translate the start of `edit` back through `first`.
-        let mut drift: isize = 0;
-        let mut merged = false;
-        for existing in &mut result {
-            let start_after = usize::try_from(isize::try_from(existing.range.start).unwrap_or(0) + drift).unwrap_or(0);
-            let inserted_len = existing.text.chars().count();
-            let end_after = start_after + inserted_len;
-            if edit.range.start >= start_after && edit.range.end <= end_after {
-                // Entirely inside the text `existing` inserted: edit it.
-                let offset = edit.range.start - start_after;
-                let mut chars: Vec<char> = existing.text.chars().collect();
-                let remove = edit.range.len();
-                chars.splice(offset..offset + remove, edit.text.chars());
-                existing.text = chars.into_iter().collect();
-                merged = true;
-                break;
-            }
-            drift += existing.delta();
+/// One piece of the text after a transaction: a kept slice of the
+/// original text, or inserted text. The last original piece is open-ended
+/// because the original length is not known here.
+#[derive(Debug, Clone)]
+enum Piece {
+    Original(Range<usize>),
+    Inserted(Vec<char>),
+}
+
+impl Piece {
+    fn len(&self) -> usize {
+        match self {
+            Self::Original(range) => range.len(),
+            Self::Inserted(chars) => chars.len(),
         }
-        if merged {
+    }
+
+    /// Splits at `at` chars into the piece.
+    fn split(self, at: usize) -> (Self, Self) {
+        match self {
+            Self::Original(range) => (
+                Self::Original(range.start..range.start + at),
+                Self::Original(range.start + at..range.end),
+            ),
+            Self::Inserted(mut chars) => {
+                let tail = chars.split_off(at);
+                (Self::Inserted(chars), Self::Inserted(tail))
+            }
+        }
+    }
+}
+
+/// Composes two sorted edit lists into one against the original text; the
+/// second list is in post-`first` coordinates. The text after `first` is
+/// modelled as pieces, the second edits cut and splice those pieces, and
+/// the surviving original pieces determine the minimal combined edits.
+fn compose(first: &[Edit], second: &[Edit]) -> Vec<Edit> {
+    let mut pieces = Vec::new();
+    let mut position = 0;
+    for edit in first {
+        if edit.range.start > position {
+            pieces.push(Piece::Original(position..edit.range.start));
+        }
+        if !edit.text.is_empty() {
+            pieces.push(Piece::Inserted(edit.text.chars().collect()));
+        }
+        position = edit.range.end;
+    }
+    pieces.push(Piece::Original(position..usize::MAX));
+    let mut second = second.to_vec();
+    second.sort_by_key(|edit| (edit.range.start, edit.range.end));
+    for edit in second.iter().rev() {
+        pieces = splice_pieces(pieces, edit);
+    }
+    let mut edits = Vec::new();
+    let mut original_position = 0;
+    let mut pending: Vec<char> = Vec::new();
+    for piece in pieces {
+        match piece {
+            Piece::Original(range) => {
+                if range.start > original_position || !pending.is_empty() {
+                    edits.push(Edit {
+                        range: original_position..range.start,
+                        text: std::mem::take(&mut pending).into_iter().collect(),
+                    });
+                }
+                original_position = range.end;
+            }
+            Piece::Inserted(chars) => pending.extend(chars),
+        }
+    }
+    edits
+}
+
+/// Applies one post-`first` edit to the piece list.
+fn splice_pieces(pieces: Vec<Piece>, edit: &Edit) -> Vec<Piece> {
+    let mut out = Vec::with_capacity(pieces.len() + 2);
+    let mut cursor: usize = 0;
+    let mut inserted = false;
+    for piece in pieces {
+        let len = piece.len();
+        let (start, end) = (cursor, cursor.saturating_add(len));
+        cursor = end;
+        if end <= edit.range.start {
+            out.push(piece);
             continue;
         }
-        // Outside every inserted span: translate to original coordinates.
-        let original = |after: usize| -> usize {
-            let mut drift: isize = 0;
-            for existing in &result {
-                let start_after = usize::try_from(isize::try_from(existing.range.start).unwrap_or(0) + drift).unwrap_or(0);
-                let end_after = start_after + existing.text.chars().count();
-                if after < start_after {
-                    break;
-                }
-                if after >= end_after {
-                    drift += existing.delta();
-                }
+        if start >= edit.range.end {
+            if !inserted {
+                out.push(Piece::Inserted(edit.text.chars().collect()));
+                inserted = true;
             }
-            usize::try_from(isize::try_from(after).unwrap_or(0) - drift).unwrap_or(0)
-        };
-        let range = original(edit.range.start)..original(edit.range.end);
-        result.push(Edit {
-            range,
-            text: edit.text.clone(),
-        });
-        result.sort_by_key(|edit| (edit.range.start, edit.range.end));
+            out.push(piece);
+            continue;
+        }
+        // The piece overlaps the edited range: keep its head and tail.
+        let head_len = edit.range.start.saturating_sub(start);
+        let tail_from = edit.range.end.saturating_sub(start).min(len);
+        let (head, rest) = piece.split(head_len);
+        if head_len > 0 {
+            out.push(head);
+        }
+        if !inserted {
+            out.push(Piece::Inserted(edit.text.chars().collect()));
+            inserted = true;
+        }
+        let (_, tail) = rest.split(tail_from - head_len);
+        if tail.len() > 0 {
+            out.push(tail);
+        }
     }
-    result
+    if !inserted {
+        out.push(Piece::Inserted(edit.text.chars().collect()));
+    }
+    out.retain(|piece| piece.len() > 0);
+    out
 }
 
 #[cfg(test)]
@@ -186,10 +249,18 @@ mod tests {
     fn positions_map_through_insertions_and_deletions() {
         let edits = vec![Edit::insert(2, "xx"), Edit::delete(5..8)];
         assert_eq!(map_through(&edits, 1, true), 1);
-        assert_eq!(map_through(&edits, 2, true), 4, "sticky insertion point moves after");
+        assert_eq!(
+            map_through(&edits, 2, true),
+            4,
+            "sticky insertion point moves after"
+        );
         assert_eq!(map_through(&edits, 2, false), 2);
         assert_eq!(map_through(&edits, 4, true), 6);
-        assert_eq!(map_through(&edits, 6, true), 7, "inside a deletion collapses");
+        assert_eq!(
+            map_through(&edits, 6, true),
+            7,
+            "inside a deletion collapses"
+        );
         assert_eq!(map_through(&edits, 6, false), 7);
         assert_eq!(map_through(&edits, 10, true), 9);
     }
@@ -198,6 +269,8 @@ mod tests {
     fn composition_of_typing_equals_sequential_application() {
         let apply = |text: &str, edits: &[Edit]| -> String {
             let mut chars: Vec<char> = text.chars().collect();
+            let mut edits = edits.to_vec();
+            edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
             for edit in edits.iter().rev() {
                 chars.splice(edit.range.clone(), edit.text.chars());
             }
@@ -214,5 +287,37 @@ mod tests {
         let third = vec![Edit::delete(5..6)];
         let composed = compose(&first, &third);
         assert_eq!(apply(text, &composed), "hello world");
+        // Adjacent deletions (undo of typing) collapse into one edit.
+        let composed = compose(&[Edit::delete(1..2)], &[Edit::delete(0..1)]);
+        assert_eq!(apply("abc", &composed), "c");
+        assert_eq!(composed, [Edit::delete(0..2)]);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn composition_matches_sequential_application(
+            text in "[a-c]{0,12}",
+            a in (0usize..14, 0usize..14, "[x-z]{0,3}"),
+            b in (0usize..16, 0usize..16, "[x-z]{0,3}"),
+        ) {
+            let clamp = |len: usize, (s, e, t): (usize, usize, String)| {
+                let (s, e) = (s.min(len), e.min(len));
+                vec![Edit { range: s.min(e)..s.max(e), text: t }]
+            };
+            let apply = |text: &str, edits: &[Edit]| -> String {
+                let mut chars: Vec<char> = text.chars().collect();
+                for edit in edits.iter().rev() {
+                    chars.splice(edit.range.clone(), edit.text.chars());
+                }
+                chars.into_iter().collect()
+            };
+            let first = clamp(text.chars().count(), a);
+            let after_first = apply(&text, &first);
+            let second = clamp(after_first.chars().count(), b);
+            let expected = apply(&after_first, &second);
+            let composed = compose(&first, &second);
+            let composed = Transaction::sorted(composed, text.chars().count()).unwrap();
+            proptest::prop_assert_eq!(apply(&text, &composed), expected);
+        }
     }
 }

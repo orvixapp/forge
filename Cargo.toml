@@ -2,7 +2,6 @@
 members = [
     "crates/proto-acp",
     "crates/proto-bench",
-    "crates/proto-buffer",
     "crates/proto-ghostty-vt",
     "crates/proto-ipc",
     "crates/proto-term-client",

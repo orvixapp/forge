@@ -52,7 +52,9 @@ struct HistoryEntry {
     mergeable: bool,
 }
 
-#[derive(Debug, Clone)]
+/// Not `Clone`: the journal is a file handle. Background work takes
+/// [`Buffer::rope`] snapshots instead.
+#[derive(Debug)]
 pub struct Buffer {
     text: Rope,
     version: u64,
@@ -247,8 +249,7 @@ impl Buffer {
             && self.undo.last().is_some_and(|last| {
                 last.mergeable && now.duration_since(last.at) <= UNDO_GROUP_WINDOW
             });
-        if merged {
-            let last = self.undo.last_mut().expect("checked above");
+        if let Some(last) = self.undo.last_mut().filter(|_| merged) {
             last.forward = last.forward.then(&transaction);
             last.inverse = inverse.then(&last.inverse);
             last.at = now;
@@ -368,7 +369,8 @@ impl Buffer {
         for edit in &transaction.edits {
             let start = edit.range.start;
             let removed = self.slice(edit.range.clone());
-            let new_start = usize::try_from(isize::try_from(start).unwrap_or(0) + drift).unwrap_or(0);
+            let new_start =
+                usize::try_from(isize::try_from(start).unwrap_or(0) + drift).unwrap_or(0);
             let inserted_len = edit.text.chars().count();
             inverse_edits.push(Edit {
                 range: new_start..new_start + inserted_len,
@@ -480,7 +482,7 @@ mod tests {
                 vec![
                     Edit {
                         range: 8..9,
-                        text: "".into(),
+                        text: String::new(),
                     },
                     Edit {
                         range: 2..4,
@@ -531,11 +533,14 @@ mod tests {
         assert_eq!(buffer.len_lines(), 3);
         assert_eq!(buffer.line(1).as_deref(), Some("wörld"));
         assert_eq!(buffer.line_len_chars(1), 5);
+        assert_eq!(buffer.position_of(8), Position { line: 1, column: 2 });
         assert_eq!(
-            buffer.position_of(8),
-            Position { line: 1, column: 2 }
+            buffer.char_at(Position {
+                line: 1,
+                column: 99
+            }),
+            11
         );
-        assert_eq!(buffer.char_at(Position { line: 1, column: 99 }), 11);
         assert_eq!(buffer.byte_of(2), 3, "é is two bytes");
         assert_eq!(buffer.char_of(3), 2);
         assert_eq!(buffer.line(5), None);

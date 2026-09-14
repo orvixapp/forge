@@ -154,9 +154,13 @@ impl Selections {
         sorted.sort_by_key(|edit| (edit.range.start, edit.range.end));
         self.map(|selection| {
             let range = selection.range();
-            let replaced = sorted
-                .iter()
-                .any(|edit| edit.range == range || (!range.is_empty() && edit.range.start <= range.start && edit.range.end >= range.end && edit.range.start == range.start));
+            let replaced = sorted.iter().any(|edit| {
+                edit.range == range
+                    || (!range.is_empty()
+                        && edit.range.start <= range.start
+                        && edit.range.end >= range.end
+                        && edit.range.start == range.start)
+            });
             if replaced {
                 let end = map_through(&sorted, range.end, true);
                 return Selection::point(end);
