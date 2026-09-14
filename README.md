@@ -149,7 +149,14 @@ opens files, `Ctrl+N` a new buffer, `Ctrl+S` saves; editor tabs live in the
 same pane tree as terminals and `Ctrl+click` on `path:line` in a terminal
 opens the file in Forge. Editing: multi-cursor (`Ctrl+Alt+↑/↓`, `Alt+click`,
 `Ctrl+D` next occurrence), `Ctrl+Z`/`Ctrl+Shift+Z`, word motions with
-`Ctrl+←/→`, `Home` toggling indent/column 0. Unsaved buffers are journaled
+`Ctrl+←/→`, `Home` toggling indent/column 0, and the VS Code staples:
+auto-closing brackets/quotes (typing the closer steps over it, Backspace
+removes the pair), Enter inside `{}` opens an indented block, `Tab`/`Shift+Tab`
+and `Ctrl+]`/`Ctrl+[` indent lines, `Ctrl+/` toggles line comments,
+`Alt+↑/↓` moves lines, `Shift+Alt+↑/↓` duplicates them, `Ctrl+Shift+K`
+deletes them, `Ctrl+L` selects the line, `Ctrl+Delete`/`Ctrl+Backspace`
+delete words, the cursor's line is highlighted and the wheel scrolls three
+lines per notch. Unsaved buffers are journaled
 under `<config dir>/journal/` and recovered on the next open. `[editor]`
 config: `tab_size`, `indent_with_tabs`, `line_numbers`. Syntax highlighting
 via tree-sitter for Rust, TOML, JSON, Bash, Python, JavaScript, Markdown and

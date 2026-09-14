@@ -8,8 +8,8 @@ use crate::{
     window::{ForgeWindow, NotificationLevel, Tab, TabContent},
 };
 use forge_buffer::{
-    Buffer, Cursor, Edit, Journal, LargeFile, LoadedFile, Motion, Position, Selection, Selections,
-    large,
+    Buffer, BufferError, Cursor, Edit, Journal, LargeFile, LoadedFile, Motion, Position, Selection,
+    Selections, Transaction, large,
 };
 use forge_syntax::{Span, SyntaxState, Token};
 use gpui::{
@@ -62,6 +62,18 @@ pub struct EditorTab {
     pub extending: bool,
     /// When the buffer last changed, for autosave.
     pub last_edit: Instant,
+}
+
+/// Bracket and quote pairs closed automatically while typing.
+const AUTO_PAIRS: &[(char, char)] = &[('(', ')'), ('[', ']'), ('{', '}'), ('"', '"'), ('\'', '\'')];
+
+/// Line-comment prefix per tree-sitter language.
+fn line_comment(language: Option<&str>) -> Option<&'static str> {
+    match language? {
+        "rust" | "c" | "javascript" => Some("//"),
+        "python" | "bash" | "toml" => Some("#"),
+        _ => None,
+    }
 }
 
 /// Longest line prefix painted in large mode.
@@ -357,11 +369,24 @@ fn display_line(text: &str, tab_size: usize) -> (String, Vec<usize>) {
 pub struct EditorElement {
     view: Entity<ForgeWindow>,
     index: usize,
+    /// Set for the active pane: registers the IME input handler over the
+    /// text area, like the terminal grid does.
+    input_focus: Option<gpui::FocusHandle>,
 }
 
 impl EditorElement {
     pub fn new(view: Entity<ForgeWindow>, index: usize) -> Self {
-        Self { view, index }
+        Self {
+            view,
+            index,
+            input_focus: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_input_focus(mut self, focus: gpui::FocusHandle) -> Self {
+        self.input_focus = Some(focus);
+        self
     }
 }
 
@@ -424,6 +449,13 @@ impl Element for EditorElement {
         cx: &mut App,
     ) {
         let index = self.index;
+        if let Some(focus) = &self.input_focus {
+            window.handle_input(
+                focus,
+                gpui::ElementInputHandler::new(bounds, self.view.clone()),
+                cx,
+            );
+        }
         self.view.update(cx, |view, cx| {
             let metrics = view.factory.metrics;
             let theme = view.theme;
@@ -452,6 +484,11 @@ impl Element for EditorElement {
                     Vec::new()
                 },
                 find_current: view.find.current,
+                current_line: {
+                    let mut line: Hsla = color(theme.chrome_active).into();
+                    line.a = 0.6;
+                    line
+                },
             };
             let Some(editor) = view.tabs.get_mut(index).and_then(Tab::editor_mut) else {
                 return;
@@ -476,6 +513,8 @@ struct EditorPaint {
     /// Find-bar matches (char ranges) and the current one, active tab only.
     find: Vec<Range<usize>>,
     find_current: Option<usize>,
+    /// Background of the cursor's line.
+    current_line: Hsla,
 }
 
 impl EditorPaint {
@@ -635,6 +674,15 @@ fn paint_editor(
         window.paint_layer(bounds, |window| {
             for line in first..last {
                 let y = bounds.origin.y + line_height * ((line - first) as f32);
+                if line == primary_line {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(bounds.origin.x, y),
+                            size(bounds.size.width, line_height),
+                        ),
+                        paint.current_line,
+                    ));
+                }
                 let text = editor.buffer.line(line).unwrap_or_default();
                 let (display, offsets) = display_line(&text, paint.tab_size);
                 let runs = paint.runs(&text, &offsets, display.len(), spans_for(line));
@@ -756,6 +804,309 @@ fn paint_line_number(
         window,
         cx,
     );
+}
+
+/// Types `text` at every cursor with VS Code's pairing rules: an opening
+/// bracket/quote inserts its partner after the cursor, and typing the
+/// closing char of an auto-inserted pair steps over it.
+fn type_text(editor: &mut EditorTab, text: &str) -> Result<Transaction, BufferError> {
+    let mut chars = text.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        return editor.buffer.insert(text, true);
+    };
+    let selections = editor.buffer.selections().clone();
+    let all_empty = selections.iter().all(Selection::is_empty);
+    // Step over a closer that is already there.
+    if all_empty
+        && AUTO_PAIRS.iter().any(|(_, close)| *close == c)
+        && selections.iter().all(|selection| {
+            editor.buffer.slice(selection.head..selection.head + 1) == c.to_string()
+        })
+    {
+        let moved = selections.map(|selection| Selection::point(selection.head + 1));
+        editor.buffer.set_selections(moved);
+        return editor.buffer.insert("", true);
+    }
+    let Some((open, close)) = AUTO_PAIRS.iter().find(|(open, _)| *open == c).copied() else {
+        return editor.buffer.insert(text, true);
+    };
+    // Wrap a selection; otherwise pair only before blank space or a closer,
+    // and never double a quote that closes a word (`don't`).
+    let wrap = !all_empty;
+    let should_pair = wrap
+        || selections.iter().all(|selection| {
+            let next = editor.buffer.slice(selection.head..selection.head + 1);
+            let prev = selection
+                .head
+                .checked_sub(1)
+                .map(|at| editor.buffer.slice(at..selection.head))
+                .unwrap_or_default();
+            let next_ok = next.is_empty()
+                || next
+                    .chars()
+                    .all(|n| n.is_whitespace() || ")]};,".contains(n));
+            let prev_ok =
+                open != close || prev.is_empty() || !prev.chars().all(char::is_alphanumeric);
+            next_ok && prev_ok
+        });
+    if !should_pair {
+        return editor.buffer.insert(text, true);
+    }
+    let edits: Vec<Edit> = selections
+        .iter()
+        .map(|selection| {
+            let range = selection.range();
+            let inner = editor.buffer.slice(range.clone());
+            Edit {
+                range,
+                text: format!("{open}{inner}{close}"),
+            }
+        })
+        .collect();
+    // Cursors land after the opener (inside the pair), keeping wrapped text
+    // selected.
+    let mut drift = 0;
+    let after: Vec<Selection> = selections
+        .iter()
+        .map(|selection| {
+            let range = selection.range();
+            let start = range.start + drift + 1;
+            let end = start + range.len();
+            drift += 2;
+            if range.is_empty() {
+                Selection::point(start)
+            } else {
+                Selection::new(start, end)
+            }
+        })
+        .collect();
+    editor.buffer.edit_with_selections(
+        edits,
+        Selections::new(after, selections.primary_index()),
+        true,
+    )
+}
+
+/// Lines covered by the selections, deduplicated and in order.
+fn selected_lines(editor: &EditorTab) -> Vec<usize> {
+    let mut lines: Vec<usize> = editor
+        .buffer
+        .selections()
+        .iter()
+        .flat_map(|selection| {
+            let range = selection.range();
+            let first = editor.buffer.position_of(range.start).line;
+            // A selection ending at column 0 does not include that line.
+            let end = if !range.is_empty() && editor.buffer.position_of(range.end).column == 0 {
+                range.end - 1
+            } else {
+                range.end
+            };
+            first..=editor.buffer.position_of(end).line
+        })
+        .collect();
+    lines.sort_unstable();
+    lines.dedup();
+    lines
+}
+
+fn line_range(editor: &EditorTab, line: usize) -> Range<usize> {
+    let start = editor.buffer.char_at(Position { line, column: 0 });
+    start..start + editor.buffer.line_len_chars(line)
+}
+
+/// Indents or outdents every selected line by one unit.
+fn indent_lines(
+    editor: &mut EditorTab,
+    indent: bool,
+    tab_size: usize,
+    with_tabs: bool,
+) -> Result<Transaction, BufferError> {
+    let unit = if with_tabs {
+        "\t".to_owned()
+    } else {
+        " ".repeat(tab_size)
+    };
+    let edits: Vec<Edit> = selected_lines(editor)
+        .into_iter()
+        .filter_map(|line| {
+            let start = editor.buffer.char_at(Position { line, column: 0 });
+            if indent {
+                Some(Edit::insert(start, unit.clone()))
+            } else {
+                let text = editor.buffer.line(line)?;
+                let remove = if text.starts_with('\t') {
+                    1
+                } else {
+                    text.chars()
+                        .take(tab_size)
+                        .take_while(|c| *c == ' ')
+                        .count()
+                };
+                (remove > 0).then(|| Edit::delete(start..start + remove))
+            }
+        })
+        .collect();
+    if edits.is_empty() {
+        return editor.buffer.insert("", false);
+    }
+    editor.buffer.edit(edits, false)
+}
+
+/// Adds or removes the line-comment prefix on the selected lines, keeping
+/// their indentation; all lines commented means uncomment.
+fn toggle_comment(
+    editor: &mut EditorTab,
+    prefix: Option<&str>,
+) -> Result<Transaction, BufferError> {
+    let Some(prefix) = prefix else {
+        return editor.buffer.insert("", false);
+    };
+    let lines: Vec<(usize, String)> = selected_lines(editor)
+        .into_iter()
+        .filter_map(|line| editor.buffer.line(line).map(|text| (line, text)))
+        .filter(|(_, text)| !text.trim().is_empty())
+        .collect();
+    if lines.is_empty() {
+        return editor.buffer.insert("", false);
+    }
+    let all_commented = lines
+        .iter()
+        .all(|(_, text)| text.trim_start().starts_with(prefix));
+    let min_indent = lines
+        .iter()
+        .map(|(_, text)| text.chars().take_while(|c| *c == ' ' || *c == '\t').count())
+        .min()
+        .unwrap_or(0);
+    let edits: Vec<Edit> = lines
+        .into_iter()
+        .map(|(line, text)| {
+            let start = editor.buffer.char_at(Position { line, column: 0 });
+            if all_commented {
+                let indent = text.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+                let rest: String = text.chars().skip(indent).collect();
+                let removed =
+                    prefix.chars().count() + usize::from(rest[prefix.len()..].starts_with(' '));
+                Edit::delete(start + indent..start + indent + removed)
+            } else {
+                Edit::insert(start + min_indent, format!("{prefix} "))
+            }
+        })
+        .collect();
+    editor.buffer.edit(edits, false)
+}
+
+/// Moves (or, with `duplicate`, copies) the selected lines one line down or up.
+fn move_lines(
+    editor: &mut EditorTab,
+    down: bool,
+    duplicate: bool,
+) -> Result<Transaction, BufferError> {
+    let lines = selected_lines(editor);
+    let (Some(&first), Some(&last)) = (lines.first(), lines.last()) else {
+        return editor.buffer.insert("", false);
+    };
+    let block_start = editor.buffer.char_at(Position {
+        line: first,
+        column: 0,
+    });
+    let block_end = line_range(editor, last).end;
+    let block = editor.buffer.slice(block_start..block_end);
+    let selections = editor.buffer.selections().clone();
+    if duplicate {
+        let text = format!("{block}\n");
+        let shift = if down { text.chars().count() } else { 0 };
+        let after = selections
+            .map(|selection| Selection::new(selection.anchor + shift, selection.head + shift));
+        return editor.buffer.edit_with_selections(
+            vec![Edit::insert(block_start, text)],
+            after,
+            false,
+        );
+    }
+    let total = editor.buffer.len_lines();
+    if (down && last + 1 >= total) || (!down && first == 0) {
+        return editor.buffer.insert("", false);
+    }
+    let neighbour = if down { last + 1 } else { first - 1 };
+    let neighbour_range = line_range(editor, neighbour);
+    let neighbour_text = editor.buffer.slice(neighbour_range.clone());
+    let neighbour_len = isize::try_from(neighbour_text.chars().count() + 1).unwrap_or(0);
+    let (range, text, shift) = if down {
+        (
+            block_start..neighbour_range.end,
+            format!("{neighbour_text}\n{block}"),
+            neighbour_len,
+        )
+    } else {
+        (
+            neighbour_range.start..block_end,
+            format!("{block}\n{neighbour_text}"),
+            -neighbour_len,
+        )
+    };
+    let after = selections.map(|selection| {
+        Selection::new(
+            selection.anchor.saturating_add_signed(shift),
+            selection.head.saturating_add_signed(shift),
+        )
+    });
+    editor
+        .buffer
+        .edit_with_selections(vec![Edit { range, text }], after, false)
+}
+
+/// Deletes the selected lines entirely (`Ctrl+Shift+K`).
+fn delete_lines(editor: &mut EditorTab) -> Result<Transaction, BufferError> {
+    let lines = selected_lines(editor);
+    let (Some(&first), Some(&last)) = (lines.first(), lines.last()) else {
+        return editor.buffer.insert("", false);
+    };
+    let start = editor.buffer.char_at(Position {
+        line: first,
+        column: 0,
+    });
+    let end = if last + 1 < editor.buffer.len_lines() {
+        editor.buffer.char_at(Position {
+            line: last + 1,
+            column: 0,
+        })
+    } else {
+        editor.buffer.len_chars()
+    };
+    let start = if end == editor.buffer.len_chars() && start > 0 {
+        start - 1
+    } else {
+        start
+    };
+    editor.buffer.edit_with_selections(
+        vec![Edit::delete(start..end)],
+        Selections::single(Selection::point(start)),
+        false,
+    )
+}
+
+/// Expands the primary selection to whole lines (`Ctrl+L`).
+fn select_lines(editor: &mut EditorTab) {
+    let selection = editor.buffer.selections().primary();
+    let range = selection.range();
+    let first = editor.buffer.position_of(range.start).line;
+    let last_line = editor.buffer.position_of(range.end).line;
+    let start = editor.buffer.char_at(Position {
+        line: first,
+        column: 0,
+    });
+    let end = if last_line + 1 < editor.buffer.len_lines() {
+        editor.buffer.char_at(Position {
+            line: last_line + 1,
+            column: 0,
+        })
+    } else {
+        editor.buffer.len_chars()
+    };
+    editor
+        .buffer
+        .set_selections(Selections::single(Selection::new(start, end)));
 }
 
 /// `MemAvailable` from `/proc/meminfo`; `None` elsewhere.
@@ -1104,6 +1455,7 @@ impl ForgeWindow {
             cx.notify();
             return;
         }
+        let language = editor.syntax.as_ref().map(SyntaxState::language_name);
         let result = match key {
             "backspace" if modifiers.control => {
                 let edits = editor
@@ -1122,14 +1474,43 @@ impl ForgeWindow {
                     .collect();
                 editor.buffer.edit(edits, true).map(Some)
             }
-            "backspace" => editor.buffer.delete(1, 0).map(Some),
+            "delete" if modifiers.control => {
+                let edits = editor
+                    .buffer
+                    .selections()
+                    .iter()
+                    .map(|selection| {
+                        let range = selection.range();
+                        let end = if range.is_empty() {
+                            editor.buffer.word_boundary_right(range.end)
+                        } else {
+                            range.end
+                        };
+                        Edit::delete(range.start..end)
+                    })
+                    .collect();
+                editor.buffer.edit(edits, true).map(Some)
+            }
+            "backspace" => {
+                // Backspace between an auto-closed pair removes both.
+                let pair = editor.buffer.selections().primary();
+                let inside_pair = pair.is_empty()
+                    && pair.head > 0
+                    && AUTO_PAIRS.iter().any(|(open, close)| {
+                        editor.buffer.slice(pair.head - 1..pair.head) == open.to_string()
+                            && editor.buffer.slice(pair.head..pair.head + 1) == close.to_string()
+                    });
+                if inside_pair && editor.buffer.selections().len() == 1 {
+                    editor.buffer.delete(1, 1).map(Some)
+                } else {
+                    editor.buffer.delete(1, 0).map(Some)
+                }
+            }
             "delete" => editor.buffer.delete(0, 1).map(Some),
             "enter" => {
-                // Inherit the indentation of the line the cursor is on.
-                let line = editor
-                    .buffer
-                    .position_of(editor.buffer.selections().primary().head)
-                    .line;
+                // Inherit the indentation; between `{` and `}` open a block.
+                let head = editor.buffer.selections().primary().head;
+                let line = editor.buffer.position_of(head).line;
                 let indent: String = editor
                     .buffer
                     .line(line)
@@ -1137,12 +1518,46 @@ impl ForgeWindow {
                     .chars()
                     .take_while(|c| *c == ' ' || *c == '\t')
                     .collect();
-                editor
-                    .buffer
-                    .insert(&format!("\n{indent}"), false)
-                    .map(Some)
+                let before = head.checked_sub(1).map(|at| editor.buffer.slice(at..head));
+                let after = editor.buffer.slice(head..head + 1);
+                let unit = if indent_with_tabs {
+                    "\t".to_owned()
+                } else {
+                    " ".repeat(tab_size)
+                };
+                let opens_block = matches!(before.as_deref(), Some("{" | "(" | "["));
+                if opens_block && editor.buffer.selections().len() == 1 {
+                    let closes = matches!(after.as_str(), "}" | ")" | "]");
+                    let text = if closes {
+                        format!("\n{indent}{unit}\n{indent}")
+                    } else {
+                        format!("\n{indent}{unit}")
+                    };
+                    let cursor = head + 1 + indent.chars().count() + unit.chars().count();
+                    editor
+                        .buffer
+                        .edit_with_selections(
+                            vec![Edit::insert(head, text)],
+                            Selections::single(Selection::point(cursor)),
+                            false,
+                        )
+                        .map(Some)
+                } else {
+                    editor
+                        .buffer
+                        .insert(&format!("\n{indent}"), false)
+                        .map(Some)
+                }
             }
-            "tab" if modifiers.shift => Ok(None),
+            "tab"
+                if modifiers.shift
+                    || editor.buffer.selections().iter().any(|selection| {
+                        !selection.is_empty()
+                            && editor.buffer.slice(selection.range()).contains('\n')
+                    }) =>
+            {
+                indent_lines(editor, !modifiers.shift, tab_size, indent_with_tabs).map(Some)
+            }
             "tab" => {
                 let text = if indent_with_tabs {
                     "\t".to_owned()
@@ -1164,8 +1579,20 @@ impl ForgeWindow {
                 }
                 Ok(None)
             }
+            "/" if modifiers.control => toggle_comment(editor, line_comment(language)).map(Some),
+            "up" | "down" if modifiers.alt && !modifiers.control => {
+                move_lines(editor, key == "down", modifiers.shift).map(Some)
+            }
+            "k" if modifiers.control && modifiers.shift => delete_lines(editor).map(Some),
+            "l" if modifiers.control => {
+                select_lines(editor);
+                Ok(None)
+            }
+            "]" | "[" if modifiers.control => {
+                indent_lines(editor, key == "]", tab_size, indent_with_tabs).map(Some)
+            }
             _ if !modifiers.control && !modifiers.alt => match key_char {
-                Some(text) if !text.is_empty() => editor.buffer.insert(text, true).map(Some),
+                Some(text) if !text.is_empty() => type_text(editor, text).map(Some),
                 _ => return,
             },
             _ => return,
@@ -1693,6 +2120,89 @@ pub fn visible_range(editor: &EditorTab) -> Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn editor(text: &str, at: usize) -> EditorTab {
+        let mut editor = EditorTab::new(Buffer::new(text), None);
+        editor
+            .buffer
+            .set_selections(Selections::single(Selection::point(at)));
+        editor
+    }
+
+    #[test]
+    fn brackets_and_quotes_auto_close_and_step_over() {
+        let mut tab = editor("call", 4);
+        type_text(&mut tab, "(").unwrap();
+        assert_eq!(tab.buffer.text(), "call()");
+        assert_eq!(tab.buffer.selections().primary().head, 5);
+        type_text(&mut tab, "x").unwrap();
+        type_text(&mut tab, ")").unwrap();
+        assert_eq!(
+            tab.buffer.text(),
+            "call(x)",
+            "the closer is stepped over, not doubled"
+        );
+        assert_eq!(tab.buffer.selections().primary().head, 7);
+        // A quote after a word closes the word instead of pairing.
+        let mut tab = editor("don", 3);
+        type_text(&mut tab, "'").unwrap();
+        assert_eq!(tab.buffer.text(), "don'");
+        // Pairs are not inserted before text.
+        let mut tab = editor("x", 0);
+        type_text(&mut tab, "(").unwrap();
+        assert_eq!(tab.buffer.text(), "(x");
+        // A selection gets wrapped and stays selected.
+        let mut tab = editor("word", 0);
+        tab.buffer
+            .set_selections(Selections::single(Selection::new(0, 4)));
+        type_text(&mut tab, "\"").unwrap();
+        assert_eq!(tab.buffer.text(), "\"word\"");
+        assert_eq!(tab.buffer.selections().primary(), Selection::new(1, 5));
+    }
+
+    #[test]
+    fn line_operations_follow_vscode() {
+        let mut tab = editor("a\n    b\nc\n", 6);
+        toggle_comment(&mut tab, Some("//")).unwrap();
+        assert_eq!(tab.buffer.text(), "a\n    // b\nc\n");
+        toggle_comment(&mut tab, Some("//")).unwrap();
+        assert_eq!(tab.buffer.text(), "a\n    b\nc\n");
+        indent_lines(&mut tab, true, 4, false).unwrap();
+        assert_eq!(tab.buffer.text(), "a\n        b\nc\n");
+        indent_lines(&mut tab, false, 4, false).unwrap();
+        indent_lines(&mut tab, false, 4, false).unwrap();
+        assert_eq!(tab.buffer.text(), "a\nb\nc\n");
+        move_lines(&mut tab, false, false).unwrap();
+        assert_eq!(tab.buffer.text(), "b\na\nc\n");
+        assert_eq!(
+            tab.buffer
+                .position_of(tab.buffer.selections().primary().head)
+                .line,
+            0
+        );
+        move_lines(&mut tab, true, false).unwrap();
+        assert_eq!(tab.buffer.text(), "a\nb\nc\n");
+        move_lines(&mut tab, true, true).unwrap();
+        assert_eq!(tab.buffer.text(), "a\nb\nb\nc\n");
+        assert_eq!(
+            tab.buffer
+                .position_of(tab.buffer.selections().primary().head)
+                .line,
+            2
+        );
+        delete_lines(&mut tab).unwrap();
+        assert_eq!(tab.buffer.text(), "a\nb\nc\n");
+        select_lines(&mut tab);
+        assert_eq!(
+            tab.buffer.slice(tab.buffer.selections().primary().range()),
+            "c\n",
+            "the cursor stays on the same line number after a delete"
+        );
+        assert!(
+            toggle_comment(&mut tab, None).is_ok(),
+            "no comment syntax is a no-op"
+        );
+    }
 
     #[test]
     fn tabs_expand_to_the_next_stop_and_offsets_map_chars_to_display_bytes() {

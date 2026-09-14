@@ -366,8 +366,12 @@ fn pane_leaf(
                 Some(marked) if active => format!("{} · IME: {marked}", editor.status()),
                 _ => editor.status(),
             };
+            let mut element = crate::editor::EditorElement::new(cx.entity(), index);
+            if active {
+                element = element.with_input_focus(view.focus.clone());
+            }
             (
-                crate::editor::EditorElement::new(cx.entity(), index).into_any_element(),
+                element.into_any_element(),
                 status,
                 (total > viewport.len).then(|| scrollbar(viewport, rect, theme).into_any_element()),
             )

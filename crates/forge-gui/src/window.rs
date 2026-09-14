@@ -1478,26 +1478,39 @@ impl ForgeWindow {
 
     /// Mouse wheel: the application gets it while it tracks the mouse;
     /// otherwise it moves the viewport over the scrollback.
+    /// The visible pane under a window position. Hidden tabs keep the
+    /// bounds they were last painted at, so only the panes of the current
+    /// tree are candidates: otherwise a click on an editor could "hit"
+    /// the terminal that used to be there.
+    fn pane_at(&self, position: Point<Pixels>) -> Option<usize> {
+        self.visible_tree().leaves().into_iter().find(|index| {
+            self.tabs
+                .get(*index)
+                .is_some_and(|tab| tab.contains(position))
+        })
+    }
+
     pub fn on_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
-        let Some(index) = self
-            .tabs
-            .iter()
-            .position(|tab| tab.contains(event.position))
-        else {
+        let Some(index) = self.pane_at(event.position) else {
             return;
         };
         let lines = match event.delta {
             ScrollDelta::Lines(delta) => delta.y,
             ScrollDelta::Pixels(delta) => f32::from(delta.y) / self.factory.metrics.height,
         };
+        if let Some(editor) = self.tabs[index].editor_mut() {
+            // Editors scroll three lines per notch, like VS Code.
+            #[allow(clippy::cast_possible_truncation)]
+            let rows = (lines * 3.0).round() as isize;
+            if rows != 0 {
+                editor.scroll_by(-rows);
+                cx.notify();
+            }
+            return;
+        }
         #[allow(clippy::cast_possible_truncation)]
         let rows = lines.round() as i64;
         if rows == 0 {
-            return;
-        }
-        if let Some(editor) = self.tabs[index].editor_mut() {
-            editor.scroll_by(-isize::try_from(rows).unwrap_or(0));
-            cx.notify();
             return;
         }
         let Some(tab) = self.tabs[index].terminal() else {
@@ -1983,11 +1996,7 @@ impl ForgeWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self
-            .tabs
-            .iter()
-            .position(|tab| tab.contains(event.position))
-        else {
+        let Some(index) = self.pane_at(event.position) else {
             return;
         };
         self.activate_tab(index, cx);

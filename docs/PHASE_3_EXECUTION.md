@@ -47,7 +47,14 @@ sin snippets, sin emulación Vim completa.
 - [x] Journal por archivo bajo `<config>/journal/` mientras el buffer
   está sucio; al abrir un archivo con journal pendiente se reproduce y se
   avisa («recuperado del journal»).
-- [ ] Wrap opcional, scroll horizontal y resaltado de la línea actual.
+- [x] Convenciones VS Code: autocierre de paréntesis/comillas (con salto
+  sobre el cierre y borrado en pareja), Enter dentro de `{}` abre bloque,
+  `Tab`/`Shift+Tab` y `Ctrl+]`/`Ctrl+[` indentan líneas, `Ctrl+/`
+  comenta, `Alt+↑/↓` mueve, `Shift+Alt+↑/↓` duplica, `Ctrl+Shift+K`
+  borra, `Ctrl+L` selecciona la línea, `Ctrl+Delete`, línea actual
+  resaltada, rueda de 3 líneas; el clic sólo alcanza paneles visibles
+  (antes un panel oculto con bounds viejos «robaba» el clic al editor).
+- [ ] Wrap opcional y scroll horizontal.
 - [ ] «Recuperar N archivos» al arrancar para archivos que no se vuelven a
   abrir (hoy sólo al abrirlos).
 
