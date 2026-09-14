@@ -178,8 +178,11 @@ async fn connect_when_ready(socket: &PathBuf) -> std::io::Result<UnixStream> {
     }
 }
 
+/// Tests run in parallel inside one process, so the pid alone is not unique.
 fn unique_socket() -> PathBuf {
-    std::env::temp_dir().join(format!("forge-termd-test-{}.sock", std::process::id()))
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("forge-termd-test-{}-{n}.sock", std::process::id()))
 }
 
 /// Scrollback, key encoding, paste and session info through the socket.

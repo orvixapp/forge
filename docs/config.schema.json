@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Config",
+  "type": "object",
+  "properties": {
+    "font": {
+      "$ref": "#/$defs/FontConfig"
+    },
+    "colors": {
+      "description": "Overrides applied on top of the selected theme.",
+      "$ref": "#/$defs/ColorOverrides"
+    },
+    "terminal": {
+      "$ref": "#/$defs/TerminalConfig"
+    },
+    "ui": {
+      "$ref": "#/$defs/UiConfig"
+    },
+    "keybindings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/UserKeyBinding"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "FontConfig": {
+      "type": "object",
+      "properties": {
+        "family": {
+          "description": "Font family; generic names such as `monospace` resolve to an installed\nmonospace family.",
+          "type": "string",
+          "default": "monospace"
+        },
+        "size": {
+          "description": "Font size in pixels.",
+          "type": "number",
+          "format": "float",
+          "default": 14.0
+        },
+        "line_height": {
+          "description": "Cell height as a multiple of the font size.",
+          "type": "number",
+          "format": "float",
+          "default": 1.2999999523162842
+        }
+      },
+      "additionalProperties": false
+    },
+    "ColorOverrides": {
+      "description": "Per-key colour overrides; unset keys come from the theme.",
+      "type": "object",
+      "properties": {
+        "background": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HexColor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "foreground": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HexColor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HexColor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "selection": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HexColor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "selection_opacity": {
+          "description": "Opacity of the selection overlay, 0–1.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "default": null
+        },
+        "accent": {
+          "description": "Status line text.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HexColor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "HexColor": {
+      "description": "Colour as #rrggbb",
+      "type": "string",
+      "pattern": "^#?[0-9a-fA-F]{6}$"
+    },
+    "TerminalConfig": {
+      "type": "object",
+      "properties": {
+        "shell": {
+          "description": "Program to run; defaults to `$SHELL`, then `/bin/sh`. Ignored in the\nworkspace layer.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "args": {
+          "description": "Ignored in the workspace layer.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "padding": {
+          "description": "Space between the pane edge and the grid, in pixels.",
+          "type": "number",
+          "format": "float",
+          "default": 16.0
+        },
+        "show_status": {
+          "description": "Show the \"Forge · cols×rows · status\" line above the grid.",
+          "type": "boolean",
+          "default": true
+        },
+        "shell_integration": {
+          "description": "Inject Forge's shell integration (OSC 133 prompt marks, OSC 7 cwd)\ninto bash, zsh and fish started without custom `args`.",
+          "type": "boolean",
+          "default": true
+        },
+        "clipboard_write": {
+          "description": "What to do when a program writes the clipboard (OSC 52).",
+          "$ref": "#/$defs/ClipboardPolicy"
+        },
+        "open_file_command": {
+          "description": "Command that opens `file:line` references from Ctrl+click; `{file}`,\n`{line}` and `{column}` are substituted. Empty uses the desktop\nopener (`xdg-open`/`open`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "ClipboardPolicy": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "allow",
+            "deny"
+          ]
+        },
+        {
+          "description": "Show a confirmation the first time per tab.",
+          "type": "string",
+          "const": "ask"
+        }
+      ]
+    },
+    "UiConfig": {
+      "type": "object",
+      "properties": {
+        "language": {
+          "$ref": "#/$defs/Language"
+        },
+        "theme": {
+          "description": "Built-in theme (`forge-dark`, `forge-light`) or the stem of a file in\n`themes/` next to the config.",
+          "type": "string",
+          "default": "forge-dark"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Language": {
+      "type": "string",
+      "enum": [
+        "spanish",
+        "english"
+      ]
+    },
+    "UserKeyBinding": {
+      "description": "User-owned binding declaration, accepted from `config.toml`.",
+      "type": "object",
+      "properties": {
+        "command": {
+          "description": "Command id, e.g. `terminal.newTab`.",
+          "type": "string"
+        },
+        "keys": {
+          "description": "Chord such as `ctrl+shift+p`.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "command",
+        "keys"
+      ]
+    }
+  }
+}

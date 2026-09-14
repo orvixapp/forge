@@ -2,4 +2,4 @@
 /bench/results/*.json
 *.sock
 
-/graphify-out/
+graphify-out/
