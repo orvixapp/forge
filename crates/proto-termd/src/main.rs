@@ -14,6 +14,9 @@ mod search;
 #[cfg(any(unix, windows))]
 mod transport;
 
+#[cfg(all(any(unix, windows), feature = "alacritty"))]
+mod alacritty;
+
 #[cfg(any(unix, windows))]
 mod daemon {
     use anyhow::{Context, Result, bail};
@@ -70,7 +73,7 @@ mod daemon {
     /// Terminal state-machine boundary. PTY/session code depends on this
     /// contract rather than on Ghostty, so another engine can be benchmarked
     /// without changing lifecycle, IPC or rendering code.
-    trait VtEngine: Send {
+    pub(crate) trait VtEngine: Send {
         fn write(&mut self, data: &[u8]);
         fn resize(&mut self, cols: u16, rows: u16) -> Result<()>;
         fn snapshot(&mut self) -> Result<RenderSnapshot>;
@@ -692,21 +695,31 @@ mod daemon {
         }
     }
 
+    /// Which VT state machine new sessions use.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum EngineKind {
+        Ghostty,
+        #[cfg(feature = "alacritty")]
+        Alacritty,
+    }
+
     struct Daemon {
         instance_id: u64,
+        engine: EngineKind,
         ghostty: GhosttyLibrary,
         sessions: RwLock<HashMap<u64, Arc<Session>>>,
         next_session_id: std::sync::atomic::AtomicU64,
     }
 
     impl Daemon {
-        fn new(ghostty: GhosttyLibrary) -> Self {
+        fn new(ghostty: GhosttyLibrary, engine: EngineKind) -> Self {
             let started = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default();
             let started = started.as_secs() ^ (u64::from(started.subsec_nanos()) << 32);
             Self {
                 instance_id: started ^ u64::from(std::process::id()),
+                engine,
                 ghostty,
                 sessions: RwLock::new(HashMap::new()),
                 next_session_id: std::sync::atomic::AtomicU64::new(0),
@@ -744,58 +757,13 @@ mod daemon {
             let writer = pair.master.take_writer().context("take PTY writer")?;
             let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(128);
             let (events, _) = broadcast::channel(256);
-            let mut terminal = self
-                .ghostty
-                .terminal(cols, rows)
-                .context("create Ghostty terminal")?;
-            terminal
-                .set_scrollback_max_bytes(64 * 1024 * 1024)
-                .context("configure terminal scrollback bytes")?;
-            terminal
-                .set_scrollback_max_lines(100_000)
-                .context("configure terminal scrollback lines")?;
-            // Replies to the application's queries (DA, DSR, mode reports)
-            // go straight back to the PTY.
-            let replies = input_tx.clone();
-            terminal
-                .set_write_pty(move |bytes| {
-                    let _ = replies.send(bytes.to_vec());
-                })
-                .context("install PTY reply callback")?;
-            // Clipboard writes are forwarded to every attached client; the
-            // daemon has no clipboard and never decides for the user.
-            let clipboard_events = events.clone();
-            terminal
-                .set_clipboard_write(move |location, text, program| {
-                    let target = match location {
-                        ClipboardLocation::Standard | ClipboardLocation::Selection => {
-                            ClipboardTarget::Clipboard
-                        }
-                        ClipboardLocation::Primary => ClipboardTarget::Primary,
-                    };
-                    let _ = clipboard_events.send(SessionEvent::Clipboard {
-                        target,
-                        text,
-                        program,
-                    });
-                })
-                .context("install clipboard write callback")?;
-            let key_encoder = self.ghostty.key_encoder().context("create key encoder")?;
-            let mouse_encoder = self
-                .ghostty
-                .mouse_encoder()
-                .context("create mouse encoder")?;
-            let engine = GhosttyVtEngine {
-                terminal,
-                key_encoder,
-                mouse_encoder,
-            };
+            let engine = self.build_engine(cols, rows, &input_tx, &events)?;
             let session = Arc::new(Session {
                 input: input_tx,
                 master: Mutex::new(pair.master),
                 child: Mutex::new(child),
                 backlog: Mutex::new(VecDeque::with_capacity(64 * 1024)),
-                terminal: Mutex::new(Box::new(engine)),
+                terminal: Mutex::new(engine),
                 cols: std::sync::atomic::AtomicU16::new(cols.max(1)),
                 rows: std::sync::atomic::AtomicU16::new(rows.max(1)),
                 revision: std::sync::atomic::AtomicU64::new(0),
@@ -823,6 +791,81 @@ mod daemon {
             self.sessions.write().await.insert(session_id, session);
             info!(session_id, "created PTY session");
             Ok(session_id)
+        }
+
+        /// The VT engine of a new session, wired to the PTY (replies) and
+        /// the session's event channel (clipboard writes).
+        fn build_engine(
+            &self,
+            cols: u16,
+            rows: u16,
+            input_tx: &mpsc::SyncSender<Vec<u8>>,
+            events: &broadcast::Sender<SessionEvent>,
+        ) -> Result<Box<dyn VtEngine>> {
+            let replies = input_tx.clone();
+            let clipboard_events = events.clone();
+            #[cfg(feature = "alacritty")]
+            if self.engine == EngineKind::Alacritty {
+                return Ok(Box::new(crate::alacritty::AlacrittyEngine::new(
+                    cols,
+                    rows,
+                    100_000,
+                    move |bytes| {
+                        let _ = replies.send(bytes.to_vec());
+                    },
+                    move |target, text| {
+                        let _ = clipboard_events.send(SessionEvent::Clipboard {
+                            target,
+                            text,
+                            program: String::new(),
+                        });
+                    },
+                )));
+            }
+            let mut terminal = self
+                .ghostty
+                .terminal(cols, rows)
+                .context("create Ghostty terminal")?;
+            terminal
+                .set_scrollback_max_bytes(64 * 1024 * 1024)
+                .context("configure terminal scrollback bytes")?;
+            terminal
+                .set_scrollback_max_lines(100_000)
+                .context("configure terminal scrollback lines")?;
+            // Replies to the application's queries (DA, DSR, mode reports)
+            // go straight back to the PTY.
+            terminal
+                .set_write_pty(move |bytes| {
+                    let _ = replies.send(bytes.to_vec());
+                })
+                .context("install PTY reply callback")?;
+            // Clipboard writes are forwarded to every attached client; the
+            // daemon has no clipboard and never decides for the user.
+            terminal
+                .set_clipboard_write(move |location, text, program| {
+                    let target = match location {
+                        ClipboardLocation::Standard | ClipboardLocation::Selection => {
+                            ClipboardTarget::Clipboard
+                        }
+                        ClipboardLocation::Primary => ClipboardTarget::Primary,
+                    };
+                    let _ = clipboard_events.send(SessionEvent::Clipboard {
+                        target,
+                        text,
+                        program,
+                    });
+                })
+                .context("install clipboard write callback")?;
+            let key_encoder = self.ghostty.key_encoder().context("create key encoder")?;
+            let mouse_encoder = self
+                .ghostty
+                .mouse_encoder()
+                .context("create mouse encoder")?;
+            Ok(Box::new(GhosttyVtEngine {
+                terminal,
+                key_encoder,
+                mouse_encoder,
+            }))
         }
 
         async fn session(&self, id: u64) -> Result<Arc<Session>> {
@@ -953,7 +996,7 @@ mod daemon {
         let socket = options.socket;
         let mut listener = crate::transport::Listener::bind(&socket).await?;
         info!(path = %socket.display(), "terminal daemon listening");
-        let daemon = Arc::new(Daemon::new(ghostty));
+        let daemon = Arc::new(Daemon::new(ghostty, options.engine));
         loop {
             let stream = listener.accept().await?;
             let daemon = Arc::clone(&daemon);
@@ -968,6 +1011,7 @@ mod daemon {
     struct Options {
         socket: PathBuf,
         ghostty_lib: PathBuf,
+        engine: EngineKind,
     }
 
     fn parse_options() -> Result<Options> {
@@ -976,6 +1020,7 @@ mod daemon {
             || "target/ghostty/lib/libghostty-vt.so".into(),
             PathBuf::from,
         );
+        let mut engine = EngineKind::Ghostty;
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -983,12 +1028,22 @@ mod daemon {
                 "--ghostty-lib" => {
                     ghostty_lib = args.next().context("--ghostty-lib requires a path")?.into();
                 }
-                _ => bail!("usage: proto-termd [--socket PATH] [--ghostty-lib PATH]"),
+                "--engine" => {
+                    engine = match args.next().as_deref() {
+                        Some("ghostty") => EngineKind::Ghostty,
+                        #[cfg(feature = "alacritty")]
+                        Some("alacritty") => EngineKind::Alacritty,
+                        Some(other) => bail!("unknown --engine {other:?} (built engines: ghostty{})", if cfg!(feature = "alacritty") { ", alacritty" } else { "" }),
+                        None => bail!("--engine requires a name"),
+                    };
+                }
+                _ => bail!("usage: proto-termd [--socket PATH] [--ghostty-lib PATH] [--engine ghostty|alacritty]"),
             }
         }
         Ok(Options {
             socket,
             ghostty_lib,
+            engine,
         })
     }
 
