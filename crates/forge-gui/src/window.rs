@@ -343,7 +343,7 @@ pub struct ForgeWindow {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
     next_tab_id: u64,
-    event_tx: Sender<UiEvent>,
+    pub(crate) event_tx: Sender<UiEvent>,
     pub config: Arc<Config>,
     pub theme: ThemeColors,
     pub theme_name: String,
@@ -1247,6 +1247,7 @@ impl ForgeWindow {
                     tab.status = status;
                 }
             }
+            UiEvent::SyntaxReady { tab_id, state } => self.on_syntax_ready(tab_id, *state, cx),
             UiEvent::Attached {
                 tab_id,
                 session_id,

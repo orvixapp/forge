@@ -54,12 +54,24 @@ struct HistoryEntry {
     mergeable: bool,
 }
 
+/// One edit as it landed in the text, for consumers that track the buffer
+/// incrementally (tree-sitter, LSP): where the new text starts, what went
+/// in and what came out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedEdit {
+    pub new_start_char: usize,
+    pub inserted: String,
+    pub removed: String,
+}
+
 /// Not `Clone`: the journal is a file handle. Background work takes
 /// [`Buffer::rope`] snapshots instead.
 #[derive(Debug)]
 pub struct Buffer {
     text: Rope,
     version: u64,
+    /// Edits of the transaction that produced `version`, in text order.
+    last_change: Vec<AppliedEdit>,
     undo: Vec<HistoryEntry>,
     redo: Vec<HistoryEntry>,
     selections: Selections,
@@ -80,6 +92,7 @@ impl Buffer {
         Self {
             text: Rope::from_str(text),
             version: 0,
+            last_change: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             selections: Selections::default(),
@@ -93,6 +106,13 @@ impl Buffer {
     #[must_use]
     pub const fn version(&self) -> u64 {
         self.version
+    }
+
+    /// The edits that took the buffer from `version() - 1` to `version()`,
+    /// in text order with positions in the current text.
+    #[must_use]
+    pub fn last_change(&self) -> &[AppliedEdit] {
+        &self.last_change
     }
 
     /// Snapshot of the text; O(1), for background work (parsing, search).
@@ -365,6 +385,7 @@ impl Buffer {
     /// the version and returns the transaction that undoes it.
     fn apply(&mut self, transaction: &Transaction) -> Transaction {
         let mut inverse_edits = Vec::with_capacity(transaction.edits.len());
+        let mut applied = Vec::with_capacity(transaction.edits.len());
         // Positions in the inverse are in the *new* text; track the drift of
         // earlier edits so each inverse range lands where the text ended up.
         let mut drift: isize = 0;
@@ -374,6 +395,11 @@ impl Buffer {
             let new_start =
                 usize::try_from(isize::try_from(start).unwrap_or(0) + drift).unwrap_or(0);
             let inserted_len = edit.text.chars().count();
+            applied.push(AppliedEdit {
+                new_start_char: new_start,
+                inserted: edit.text.clone(),
+                removed: removed.clone(),
+            });
             inverse_edits.push(Edit {
                 range: new_start..new_start + inserted_len,
                 text: removed,
@@ -388,6 +414,7 @@ impl Buffer {
             }
         }
         self.version += 1;
+        self.last_change = applied;
         self.selections = transaction.selections_after.clone();
         Transaction {
             edits: inverse_edits,
@@ -546,6 +573,32 @@ mod tests {
         assert_eq!(buffer.byte_of(2), 3, "é is two bytes");
         assert_eq!(buffer.char_of(3), 2);
         assert_eq!(buffer.line(5), None);
+    }
+
+    #[test]
+    fn the_last_change_describes_what_landed_in_the_text() {
+        let mut buffer = Buffer::new("hello world");
+        buffer
+            .edit(vec![Edit::insert(0, ">> "), Edit::delete(6..11)], false)
+            .unwrap();
+        assert_eq!(buffer.text(), ">> hello ");
+        assert_eq!(
+            buffer.last_change(),
+            [
+                AppliedEdit {
+                    new_start_char: 0,
+                    inserted: ">> ".into(),
+                    removed: String::new()
+                },
+                AppliedEdit {
+                    new_start_char: 9,
+                    inserted: String::new(),
+                    removed: "world".into()
+                }
+            ]
+        );
+        buffer.undo();
+        assert_eq!(buffer.last_change()[1].inserted, "world");
     }
 
     #[test]

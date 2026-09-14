@@ -7,6 +7,7 @@ members = [
     "crates/proto-term-client",
     "crates/proto-termd",
     "crates/forge-buffer",
+    "crates/forge-syntax",
     "crates/forge-gui",
 ]
 resolver = "3"

@@ -5,11 +5,13 @@
 
 use crate::{
     grid_element::{CellMetrics, color},
+    ipc::UiEvent,
     window::{ForgeWindow, NotificationLevel, Tab, TabContent},
 };
 use forge_buffer::{
     Buffer, Cursor, Edit, Journal, LoadedFile, Motion, Position, Selection, Selections,
 };
+use forge_syntax::{PARSE_BUDGET_MS, Span, SyntaxState, Token};
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, Element, ElementId, Entity, Font,
     GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, MouseDownEvent, Pixels,
@@ -20,7 +22,12 @@ use std::{
     borrow::Cow,
     ops::Range,
     path::{Path, PathBuf},
+    sync::mpsc::Sender,
 };
+
+/// Files above this size are parsed on a background thread the first time;
+/// smaller ones parse synchronously when opened.
+const BACKGROUND_PARSE_BYTES: usize = 256 * 1024;
 
 /// Space between the gutter text and the code, and around the gutter.
 const GUTTER_PADDING: f32 = 12.0;
@@ -42,6 +49,11 @@ pub struct EditorTab {
     pub recovered: bool,
     /// Line to centre on the next paint, once the row count is known.
     pending_center: Option<usize>,
+    /// tree-sitter state; `None` while unknown language or while a
+    /// background parse owns it.
+    pub syntax: Option<SyntaxState>,
+    /// A background parse is in flight for this tab.
+    parsing: bool,
 }
 
 impl EditorTab {
@@ -56,7 +68,80 @@ impl EditorTab {
             drag_anchor: None,
             recovered: false,
             pending_center: None,
+            syntax: None,
+            parsing: false,
         }
+    }
+
+    /// Picks the grammar for the file and parses it (synchronously for
+    /// small files; otherwise on a thread that hands the state back via
+    /// `UiEvent::SyntaxReady`).
+    pub fn detect_language(&mut self, tab_id: u64, events: &Sender<UiEvent>) {
+        let first_line = self.buffer.line(0).unwrap_or_default();
+        let Some(config) = forge_syntax::detect(self.path(), &first_line) else {
+            self.syntax = None;
+            return;
+        };
+        let Ok(mut state) = SyntaxState::new(config) else {
+            self.syntax = None;
+            return;
+        };
+        let rope = self.buffer.rope();
+        let version = self.buffer.version();
+        if self.buffer.len_bytes() <= BACKGROUND_PARSE_BYTES {
+            state.parse(&rope, version, None);
+            self.syntax = Some(state);
+            return;
+        }
+        self.parsing = true;
+        let events = events.clone();
+        std::thread::Builder::new()
+            .name("forge-syntax".into())
+            .spawn(move || {
+                state.parse(&rope, version, None);
+                let _ = events.send(UiEvent::SyntaxReady {
+                    tab_id,
+                    state: Box::new(state),
+                });
+            })
+            .expect("spawn syntax parser");
+    }
+
+    /// Takes a background parse result; a version gap triggers another
+    /// full parse so highlights never describe stale text.
+    pub fn syntax_ready(&mut self, state: SyntaxState, tab_id: u64, events: &Sender<UiEvent>) {
+        self.parsing = false;
+        if state.version == self.buffer.version() {
+            self.syntax = Some(state);
+        } else {
+            self.detect_language(tab_id, events);
+        }
+    }
+
+    /// Brings the tree up to date after buffer changes: incrementally when
+    /// only the last change is missing, otherwise from scratch.
+    pub fn sync_syntax(&mut self) {
+        let Some(state) = &mut self.syntax else {
+            return;
+        };
+        let version = self.buffer.version();
+        if state.version == version {
+            return;
+        }
+        let rope = self.buffer.rope();
+        if state.version + 1 == version && state.has_tree() {
+            for change in self.buffer.last_change() {
+                state.edited(&forge_syntax::input_edit(
+                    &rope,
+                    change.new_start_char,
+                    &change.inserted,
+                    &change.removed,
+                ));
+            }
+        } else {
+            state.invalidate();
+        }
+        state.parse(&rope, version, Some(PARSE_BUDGET_MS));
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -254,6 +339,7 @@ impl Element for EditorElement {
                     selection.a = theme.selection_opacity;
                     selection
                 },
+                syntax: theme.syntax,
             };
             paint_editor(editor, bounds, &paint, window, cx);
         });
@@ -269,6 +355,78 @@ struct EditorPaint {
     muted: Hsla,
     cursor: Hsla,
     selection: Hsla,
+    syntax: forge_gui::theme::SyntaxColors,
+}
+
+impl EditorPaint {
+    fn token_color(&self, token: Token) -> Hsla {
+        let colors = &self.syntax;
+        color(match token {
+            Token::Keyword => colors.keyword,
+            Token::String => colors.string,
+            Token::Comment => colors.comment,
+            Token::Function => colors.function,
+            Token::Type => colors.type_,
+            Token::Variable => colors.variable,
+            Token::Number => colors.number,
+            Token::Constant => colors.constant,
+            Token::Operator => colors.operator,
+            Token::Punctuation => colors.punctuation,
+            Token::Attribute => colors.attribute,
+            Token::Property => colors.property,
+            Token::Tag => colors.tag,
+        })
+        .into()
+    }
+
+    /// Text runs for a display line from spans over the source line (byte
+    /// ranges in `text`), mapped through the tab-expansion `offsets`.
+    fn runs(
+        &self,
+        text: &str,
+        offsets: &[usize],
+        display_len: usize,
+        spans: &[Span],
+    ) -> Vec<TextRun> {
+        let run = |len: usize, color: Hsla| TextRun {
+            len,
+            font: self.font.clone(),
+            color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        if spans.is_empty() {
+            return vec![run(display_len, self.foreground)];
+        }
+        // Byte offset in `text` → display byte offset, one entry per byte
+        // so a span boundary inside a multibyte char maps to its start.
+        let mut byte_to_display: Vec<usize> = Vec::with_capacity(text.len() + 1);
+        for (char_index, c) in text.chars().enumerate() {
+            let display = offsets.get(char_index).copied().unwrap_or(display_len);
+            byte_to_display.extend(std::iter::repeat_n(display, c.len_utf8()));
+        }
+        byte_to_display.push(display_len);
+        let to_display =
+            |byte: usize| -> usize { byte_to_display.get(byte).copied().unwrap_or(display_len) };
+        let mut runs = Vec::with_capacity(spans.len() * 2 + 1);
+        let mut cursor = 0;
+        for span in spans {
+            let start = to_display(span.range.start).max(cursor);
+            let end = to_display(span.range.end).max(start);
+            if start > cursor {
+                runs.push(run(start - cursor, self.foreground));
+            }
+            if end > start {
+                runs.push(run(end - start, self.token_color(span.token)));
+            }
+            cursor = end;
+        }
+        if display_len > cursor {
+            runs.push(run(display_len - cursor, self.foreground));
+        }
+        runs
+    }
 }
 
 #[allow(
@@ -312,26 +470,30 @@ fn paint_editor(
     let first = editor.scroll_line;
     let last = (first + rows).min(total_lines);
     let text_system = window.text_system().clone();
+    // Highlights come from the tree as of the last successful parse; a
+    // parse that ran out of budget keeps the previous tree, so a stale
+    // frame is at worst one keystroke behind.
+    let rope = editor.buffer.rope();
+    let spans_for = |line: usize| -> Vec<Span> {
+        editor.syntax.as_ref().map_or_else(Vec::new, |state| {
+            let start = rope.line_to_byte(line);
+            let end = if line + 1 < rope.len_lines() {
+                rope.line_to_byte(line + 1)
+            } else {
+                rope.len_bytes()
+            };
+            state.line_spans(&rope, start..end)
+        })
+    };
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         window.paint_layer(bounds, |window| {
             for line in first..last {
                 let y = bounds.origin.y + line_height * ((line - first) as f32);
                 let text = editor.buffer.line(line).unwrap_or_default();
                 let (display, offsets) = display_line(&text, paint.tab_size);
-                let run = TextRun {
-                    len: display.len(),
-                    font: paint.font.clone(),
-                    color: paint.foreground,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let shaped = text_system.shape_line(
-                    SharedString::from(display),
-                    font_size,
-                    std::slice::from_ref(&run),
-                    None,
-                );
+                let runs = paint.runs(&text, &offsets, display.len(), &spans_for(line));
+                let shaped =
+                    text_system.shape_line(SharedString::from(display), font_size, &runs, None);
                 let line_start = editor.buffer.char_at(Position { line, column: 0 });
                 let line_end = line_start + editor.buffer.line_len_chars(line);
                 // Selections covering this line, as x ranges of the display text.
@@ -453,7 +615,12 @@ impl ForgeWindow {
                     ),
                 );
             }
-            self.push_tab(TabContent::Editor(Box::new(editor)), cx);
+            let index = self.push_tab(TabContent::Editor(Box::new(editor)), cx);
+            let tab_id = self.tabs[index].id;
+            let events = self.event_tx.clone();
+            if let Some(editor) = self.tabs[index].editor_mut() {
+                editor.detect_language(tab_id, &events);
+            }
         }
         if let Some(line) = line
             && let Some(editor) = self.active_tab_mut().editor_mut()
@@ -461,6 +628,15 @@ impl ForgeWindow {
             editor.go_to(line, column);
         }
         cx.notify();
+    }
+
+    /// A background parse finished for `tab_id`.
+    pub fn on_syntax_ready(&mut self, tab_id: u64, state: SyntaxState, cx: &mut Context<Self>) {
+        let events = self.event_tx.clone();
+        if let Some(editor) = self.tab_mut(tab_id).and_then(Tab::editor_mut) {
+            editor.syntax_ready(state, tab_id, &events);
+            cx.notify();
+        }
     }
 
     /// Replays a leftover journal for `path` into `buffer` and attaches a
@@ -554,6 +730,10 @@ impl ForgeWindow {
                         }
                         let index = view.tabs.iter().position(|tab| tab.id == tab_id);
                         if let Some(index) = index {
+                            let events = view.event_tx.clone();
+                            if let Some(editor) = view.tabs[index].editor_mut() {
+                                editor.detect_language(tab_id, &events);
+                            }
                             view.activate_tab(index, cx);
                             view.save_active(cx);
                         }
@@ -725,6 +905,7 @@ impl ForgeWindow {
             let _ = editor.buffer.insert(text, true);
             editor.goal_column = None;
             editor.follow_cursor();
+            editor.sync_syntax();
             cx.notify();
         }
     }
@@ -738,6 +919,7 @@ impl ForgeWindow {
             };
             if changed {
                 editor.follow_cursor();
+                editor.sync_syntax();
                 cx.notify();
             }
         }
@@ -860,6 +1042,7 @@ impl ForgeWindow {
                 .collect();
             let _ = editor.buffer.edit(edits, false);
             editor.follow_cursor();
+            editor.sync_syntax();
             cx.notify();
         }
     }
@@ -871,6 +1054,7 @@ impl ForgeWindow {
         if let Some(editor) = self.active_tab_mut().editor_mut() {
             let _ = editor.buffer.insert(&text, false);
             editor.follow_cursor();
+            editor.sync_syntax();
             cx.notify();
         }
     }

@@ -54,10 +54,20 @@ sin snippets, sin emulación Vim completa.
 
 ## 3.3 — Sintaxis (`forge-syntax`)
 
-- [ ] tree-sitter con gramáticas cargadas bajo demanda, parseo incremental
-  en hilo de fondo sobre snapshot, `highlights.scm`/`injections.scm`,
-  caché por línea invalidada por `changed_ranges`, mapeo captura → token
-  del tema; folds e indents.
+- [x] tree-sitter 0.27 con gramáticas empaquetadas (rust, toml, json,
+  bash, python, javascript, markdown, c) y sus `highlights.scm`; detección
+  por extensión y shebang.
+- [x] Parseo incremental: el buffer registra cada cambio aplicado
+  (`AppliedEdit`) y el editor lo traduce a `InputEdit`; el parse tras cada
+  tecla corre en el hilo de UI con presupuesto de 8 ms (si se agota, se
+  conserva el árbol anterior y se reintenta); la primera pasada de archivos
+  > 256 KiB va a un hilo de fondo sobre un snapshot del rope.
+- [x] Resaltado por línea visible (`line_spans`, captura más interna gana)
+  mapeado a 13 tokens del tema (`[syntax]` en temas), runs de color en
+  `shape_line` con tabs expandidos.
+- [ ] Gramáticas `.so` cargadas con `dlopen` desde `<config>/grammars/`,
+  inyecciones (Markdown → código), folds e indents desde queries, caché de
+  capturas por línea invalidada por `changed_ranges`.
 
 ## 3.4 — Proyecto y búsqueda (`forge-project`, `forge-search`)
 
