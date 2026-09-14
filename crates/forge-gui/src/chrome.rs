@@ -1096,10 +1096,18 @@ fn agent_timeline_item(item: &TimelineItem, theme: forge_gui::theme::ThemeColors
             let label = match role {
                 MessageRole::User => tr("You"),
                 MessageRole::Agent => tr("Agent"),
-                MessageRole::System => tr("System"),
             };
             (label, text.clone(), theme.foreground)
         }
+        TimelineItem::Thought { text, active, .. } => (
+            if *active {
+                tr("● Thinking…")
+            } else {
+                tr("Reasoning")
+            },
+            text.clone(),
+            theme.muted,
+        ),
         TimelineItem::ToolCall {
             title,
             state,

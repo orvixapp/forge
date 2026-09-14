@@ -63,7 +63,6 @@ pub enum AgentCommand {
 pub enum MessageRole {
     User,
     Agent,
-    System,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +79,11 @@ pub enum TimelineItem {
     Message {
         role: MessageRole,
         text: String,
+    },
+    Thought {
+        id: String,
+        text: String,
+        active: bool,
     },
     ToolCall {
         id: String,
@@ -308,9 +312,8 @@ impl AgentTab {
         start..(start + self.visible_items).min(self.timeline.len())
     }
 
-    /// Applies one tolerant `session/update`. Unknown update shapes are kept
-    /// as system messages, making optional vendor capabilities visible rather
-    /// than fatal to the session.
+    /// Applies one tolerant `session/update`. Unknown update shapes are logged
+    /// instead of leaking protocol JSON into the conversation timeline.
     pub fn apply_update(&mut self, update: &Value) {
         let follow_tail = self.following_tail;
         let kind = update
@@ -338,6 +341,7 @@ impl AgentTab {
                     .collect();
             }
             "agent_message_chunk" | "message_chunk" => {
+                self.finish_thoughts();
                 let text = update
                     .get("content")
                     .and_then(|content| content.get("text"))
@@ -347,8 +351,26 @@ impl AgentTab {
                 self.append_agent_chunk(text);
                 self.status = tr("Receiving the answer…").into();
             }
-            "tool_call" | "tool_call_update" => self.apply_tool_update(update),
+            "agent_thought_chunk" | "thought_chunk" => {
+                let id = update
+                    .get("messageId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("thought");
+                let text = update
+                    .get("content")
+                    .and_then(|content| content.get("text"))
+                    .or_else(|| update.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                self.append_thought_chunk(id, text);
+                self.status = tr("Thinking…").into();
+            }
+            "tool_call" | "tool_call_update" => {
+                self.finish_thoughts();
+                self.apply_tool_update(update);
+            }
             "plan" => {
+                self.finish_thoughts();
                 let entries = update
                     .get("entries")
                     .and_then(Value::as_array)
@@ -371,10 +393,8 @@ impl AgentTab {
                     entries,
                 });
             }
-            _ => self.timeline.push(TimelineItem::Message {
-                role: MessageRole::System,
-                text: update.to_string(),
-            }),
+            "current_mode_update" | "config_option_update" | "config_options_update" => {}
+            _ => tracing::debug!(kind, update = %update, "unhandled ACP session update"),
         }
         if follow_tail {
             self.scroll_to_end();
@@ -393,6 +413,34 @@ impl AgentTab {
                 role: MessageRole::Agent,
                 text: chunk.into(),
             });
+        }
+    }
+
+    fn append_thought_chunk(&mut self, id: &str, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        if let Some(TimelineItem::Thought { text, active, .. }) =
+            self.timeline.iter_mut().rev().find(
+                |item| matches!(item, TimelineItem::Thought { id: old_id, .. } if old_id == id),
+            )
+        {
+            text.push_str(chunk);
+            *active = true;
+        } else {
+            self.timeline.push(TimelineItem::Thought {
+                id: id.to_owned(),
+                text: chunk.to_owned(),
+                active: true,
+            });
+        }
+    }
+
+    fn finish_thoughts(&mut self) {
+        for item in &mut self.timeline {
+            if let TimelineItem::Thought { active, .. } = item {
+                *active = false;
+            }
         }
     }
 
@@ -599,13 +647,40 @@ mod tests {
     }
 
     #[test]
+    fn thought_chunks_stream_into_one_live_timeline_card() {
+        let mut tab = AgentTab::new("OpenCode", PathBuf::from("."));
+        tab.apply_update(&json!({
+            "sessionUpdate": "agent_thought_chunk", "messageId": "m1",
+            "content": {"type": "text", "text": "Voy a "}
+        }));
+        tab.apply_update(&json!({
+            "sessionUpdate": "agent_thought_chunk", "messageId": "m1",
+            "content": {"type": "text", "text": "revisarlo"}
+        }));
+        assert!(matches!(
+            tab.timeline.as_slice(),
+            [TimelineItem::Thought { id, text, active: true }]
+                if id == "m1" && text == "Voy a revisarlo"
+        ));
+        tab.apply_update(&json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "Resultado"}
+        }));
+        assert!(matches!(
+            tab.timeline[0],
+            TimelineItem::Thought { active: false, .. }
+        ));
+        assert_eq!(tab.timeline.len(), 2);
+    }
+
+    #[test]
     fn scrolling_away_from_tail_survives_new_updates() {
         let mut tab = AgentTab::new("Codex", PathBuf::from("."));
         tab.visible_items = 2;
         for index in 0..5 {
             tab.apply_update(&json!({"type":"message_chunk","text":format!("{index}")}));
             tab.timeline.push(TimelineItem::Message {
-                role: MessageRole::System,
+                role: MessageRole::Agent,
                 text: index.to_string(),
             });
         }
