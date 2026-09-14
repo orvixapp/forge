@@ -3,6 +3,7 @@
 //! into transactions. Terminal tabs keep their own element in
 //! `grid_element.rs`; both share the pane tree.
 
+use crate::assist::{Completion, Diagnostic};
 use crate::{
     grid_element::{CellMetrics, color},
     ipc::{GitDiffResult, UiEvent},
@@ -87,7 +88,20 @@ pub struct EditorTab {
     minimap_drag: Option<(Pixels, usize)>,
     /// Git state: repository/branch, `HEAD` text and the gutter diff.
     pub git: GitState,
+    /// Syntax errors from the last adopted tree and, for Forge config
+    /// files, what `Config` rejects; see `crate::assist`.
+    syntax_diagnostics: Vec<Diagnostic>,
+    config_diagnostics: Vec<Diagnostic>,
+    /// Syntax generation the diagnostics describe.
+    diagnostics_generation: Option<u64>,
+    /// Buffer version the config check describes.
+    config_checked: Option<u64>,
+    /// Open completion popup.
+    pub completion: Option<Completion>,
 }
+
+/// Edits settle this long before a Forge config file is re-validated.
+const CONFIG_CHECK_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// What the editor knows about its file in git.
 #[derive(Default)]
@@ -183,6 +197,11 @@ impl EditorTab {
             minimap_cache: None,
             minimap_drag: None,
             git: GitState::default(),
+            syntax_diagnostics: Vec::new(),
+            config_diagnostics: Vec::new(),
+            diagnostics_generation: None,
+            config_checked: None,
+            completion: None,
         }
     }
 
@@ -454,7 +473,84 @@ impl EditorTab {
     /// Adopts trees the syntax worker finished; true when highlights
     /// changed and the pane should repaint.
     pub fn poll_syntax(&mut self) -> bool {
-        self.syntax.as_mut().is_some_and(SyntaxState::poll)
+        let adopted = self.syntax.as_mut().is_some_and(SyntaxState::poll);
+        self.refresh_diagnostics() || adopted
+    }
+
+    /// Recomputes syntax errors when a new tree arrived and re-validates
+    /// a Forge config file once edits settle. True when anything changed.
+    fn refresh_diagnostics(&mut self) -> bool {
+        let mut changed = false;
+        let generation = self.syntax.as_ref().map(SyntaxState::generation);
+        if generation != self.diagnostics_generation {
+            self.diagnostics_generation = generation;
+            let rope = self.buffer.rope();
+            let fresh = self.syntax.as_ref().map_or_else(Vec::new, |state| {
+                crate::assist::syntax_diagnostics(state, &rope)
+            });
+            changed |= fresh != self.syntax_diagnostics;
+            self.syntax_diagnostics = fresh;
+        }
+        if crate::assist::is_forge_config(self.path())
+            && self.large.is_none()
+            && self.config_checked != Some(self.buffer.version())
+            && self.last_edit.elapsed() >= CONFIG_CHECK_DEBOUNCE
+        {
+            self.config_checked = Some(self.buffer.version());
+            let rope = self.buffer.rope();
+            let fresh = crate::assist::config_diagnostics(&self.buffer.text(), &rope);
+            changed |= fresh != self.config_diagnostics;
+            self.config_diagnostics = fresh;
+        }
+        changed
+    }
+
+    /// Every diagnostic, syntax first.
+    pub fn diagnostics(&self) -> impl Iterator<Item = &Diagnostic> {
+        self.syntax_diagnostics
+            .iter()
+            .chain(self.config_diagnostics.iter())
+    }
+
+    /// Schema hints when this buffer is a Forge config file.
+    fn schema_hints(&self) -> Option<&'static crate::assist::SchemaHints> {
+        crate::assist::is_forge_config(self.path()).then(crate::assist::schema_hints)
+    }
+
+    /// Opens or refreshes the completion popup for the primary cursor
+    /// (single cursor only); closes it when nothing matches.
+    pub fn refresh_completion(&mut self, explicit: bool) {
+        if self.large.is_some() || self.buffer.selections().len() != 1 {
+            self.completion = None;
+            return;
+        }
+        let cursor = self.buffer.selections().primary().head;
+        let rope = self.buffer.rope();
+        let language = self.syntax.as_ref().map(SyntaxState::language_name);
+        self.completion =
+            crate::assist::complete(&rope, cursor, explicit, self.schema_hints(), language);
+    }
+
+    /// Inserts the rest of the selected item and closes the popup.
+    pub fn accept_completion(&mut self) -> bool {
+        let Some(completion) = self.completion.take() else {
+            return false;
+        };
+        let Some(item) = completion.selected() else {
+            return false;
+        };
+        let suffix = item
+            .label
+            .get(completion.prefix.len()..)
+            .unwrap_or_default();
+        if suffix.is_empty() {
+            return false;
+        }
+        if self.buffer.insert(suffix, false).is_ok() {
+            self.sync_syntax();
+            return true;
+        }
+        false
     }
 
     /// Tells the syntax worker about the last change and marks the edit
@@ -541,6 +637,20 @@ impl EditorTab {
         }
         if self.buffer.is_dirty() {
             parts.push(tr("● unsaved").into());
+        }
+        let errors = self.diagnostics().count();
+        if errors > 0 {
+            parts.push(trf("⚠ {} errors", &[&errors]));
+            // The message of the error under the cursor, VS Code style.
+            let head = self.buffer.selections().primary().head;
+            let line = self.buffer.position_of(head).line;
+            if let Some(diagnostic) = self.diagnostics().find(|diagnostic| {
+                let start = self.buffer.position_of(diagnostic.range.start).line;
+                let end = self.buffer.position_of(diagnostic.range.end).line;
+                (start..=end).contains(&line)
+            }) {
+                parts.push(diagnostic.message.chars().take(100).collect());
+            }
         }
         parts.join(" · ")
     }
@@ -871,6 +981,10 @@ impl Element for EditorElement {
                 git_added: color(theme.git_added).into(),
                 git_modified: color(theme.git_modified).into(),
                 git_deleted: color(theme.git_deleted).into(),
+                diagnostic: color(theme.danger).into(),
+                popup_bg: color(theme.chrome).into(),
+                popup_border: color(theme.chrome_active_border).into(),
+                popup_selected: color(theme.highlight).into(),
             };
             let Some(editor) = view.tabs.get_mut(index).and_then(Tab::editor_mut) else {
                 return;
@@ -905,6 +1019,11 @@ struct EditorPaint {
     git_added: Hsla,
     git_modified: Hsla,
     git_deleted: Hsla,
+    /// Diagnostic underline and the completion popup.
+    diagnostic: Hsla,
+    popup_bg: Hsla,
+    popup_border: Hsla,
+    popup_selected: Hsla,
 }
 
 impl EditorPaint {
@@ -1113,6 +1232,17 @@ fn paint_editor(
         .map_or_else(Vec::new, |state| state.highlights(&rope, first..last_line));
     let spans_for =
         |line: usize| -> &[Span] { highlights.get(line - first).map_or(&[][..], Vec::as_slice) };
+    let diagnostics: Vec<Range<usize>> = editor
+        .diagnostics()
+        .map(|diagnostic| diagnostic.range.clone())
+        .collect();
+    // Where the completion popup hangs from: the prefix start on the
+    // primary cursor's row, filled in while painting that row.
+    let completion_start = editor
+        .completion
+        .as_ref()
+        .map(|completion| completion.start);
+    let mut popup_anchor: Option<Point<Pixels>> = None;
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         window.paint_layer(bounds, |window| {
             for (row_index, row) in visual.iter().enumerate() {
@@ -1205,12 +1335,36 @@ fn paint_editor(
                     ));
                 }
                 let _ = shaped.paint(point(x_origin, y), line_height, window, cx);
+                // Red underline where the grammar (or the config) objects;
+                // a zero-width diagnostic still gets one cell.
+                for range in &diagnostics {
+                    if range.start > row_end || range.end < row_start {
+                        continue;
+                    }
+                    let from = range.start.max(row_start) - row_start;
+                    let to = range.end.min(row_end) - row_start;
+                    let x0 = x_of(from);
+                    let x1 = x_of(to).max(x0 + px(paint.metrics.width));
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(x_origin + x0, y + line_height - px(2.0)),
+                            size(x1 - x0, px(2.0)),
+                        ),
+                        paint.diagnostic,
+                    ));
+                }
                 for selection in selections.iter() {
                     let head = selection.head;
                     let on_row =
                         head >= row_start && (head < row_end || (row.last && head == row_end));
                     if !on_row {
                         continue;
+                    }
+                    if head == primary_head
+                        && let Some(start) = completion_start
+                    {
+                        let column = start.clamp(row_start, head) - row_start;
+                        popup_anchor = Some(point(x_origin + x_of(column), y));
                     }
                     window.paint_quad(fill(
                         Bounds::new(
@@ -1255,6 +1409,85 @@ fn paint_editor(
     if let Some(minimap) = editor.minimap_bounds {
         paint_minimap(editor, minimap, visual.len(), paint, window);
     }
+    if let (Some(completion), Some(anchor)) = (&editor.completion, popup_anchor) {
+        paint_completion(completion, anchor, bounds, paint, &text_system, window, cx);
+    }
+}
+
+/// The completion popup under (or, near the bottom, above) the cursor:
+/// up to `COMPLETION_ROWS` rows of label + origin, selected row filled.
+#[allow(clippy::cast_precision_loss)]
+fn paint_completion(
+    completion: &Completion,
+    anchor: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    paint: &EditorPaint,
+    text_system: &gpui::WindowTextSystem,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use crate::assist::COMPLETION_ROWS;
+    let line_height = px(paint.metrics.height);
+    let font_size = px(paint.metrics.font_size);
+    let width = px(340.0_f32.min(f32::from(bounds.size.width)));
+    let rows = completion.items.len().min(COMPLETION_ROWS);
+    let height = line_height * rows as f32 + px(8.0);
+    let mut origin = point(anchor.x, anchor.y + line_height);
+    if origin.y + height > bounds.bottom() && anchor.y - height >= bounds.top() {
+        origin.y = anchor.y - height;
+    }
+    if origin.x + width > bounds.right() {
+        origin.x = (bounds.right() - width).max(bounds.left());
+    }
+    let popup = Bounds::new(origin, size(width, height));
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        window.paint_layer(popup, |window| {
+            window.paint_quad(gpui::quad(
+                popup,
+                px(4.0),
+                paint.popup_bg,
+                px(1.0),
+                paint.popup_border,
+                gpui::BorderStyle::Solid,
+            ));
+            let first = completion.first_visible();
+            for (row, item) in completion.items.iter().enumerate().skip(first).take(rows) {
+                let y = origin.y + px(4.0) + line_height * (row - first) as f32;
+                if row == completion.index {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(origin.x + px(2.0), y),
+                            size(width - px(4.0), line_height),
+                        ),
+                        paint.popup_selected,
+                    ));
+                }
+                let run = |len: usize, color: Hsla| TextRun {
+                    len,
+                    font: paint.font.clone(),
+                    color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let label = text_system.shape_line(
+                    SharedString::from(item.label.clone()),
+                    font_size,
+                    &[run(item.label.len(), paint.foreground)],
+                    None,
+                );
+                let _ = label.paint(point(origin.x + px(8.0), y), line_height, window, cx);
+                let detail = text_system.shape_line(
+                    SharedString::from(item.detail.clone()),
+                    font_size,
+                    &[run(item.detail.len(), paint.muted)],
+                    None,
+                );
+                let x = origin.x + width - px(8.0) - detail.width;
+                let _ = detail.paint(point(x, y), line_height, window, cx);
+            }
+        });
+    });
 }
 
 /// The minimap: one 2 px row per buffer line, token colours from a coarse
@@ -2026,6 +2259,47 @@ impl ForgeWindow {
         if editor.mode == EditorMode::Normal {
             return self.normal_mode_key(key, key_char, modifiers, cx);
         }
+        if let Some(completion) = &mut editor.completion {
+            let handled = match key {
+                "up" => {
+                    completion.index = completion.index.saturating_sub(1);
+                    true
+                }
+                "down" => {
+                    completion.index = (completion.index + 1).min(completion.items.len() - 1);
+                    true
+                }
+                "enter" | "tab" => {
+                    editor.accept_completion();
+                    true
+                }
+                "escape" => {
+                    editor.completion = None;
+                    true
+                }
+                _ => false,
+            };
+            if handled {
+                cx.notify();
+                return;
+            }
+        }
+        if key == "space" && modifiers.control {
+            editor.refresh_completion(true);
+            cx.notify();
+            return;
+        }
+        // Whether this key extends the word under the cursor (keeps the
+        // popup following) or should close it.
+        let typing_word = match key {
+            "backspace" => editor.completion.is_some(),
+            _ => {
+                !modifiers.control
+                    && !modifiers.alt
+                    && key_char
+                        .is_some_and(|text| text.chars().all(|c| c.is_alphanumeric() || c == '_'))
+            }
+        };
         let extend = modifiers.shift;
         let word = modifiers.control;
         let rows = editor.visible_rows.saturating_sub(1).max(1);
@@ -2065,6 +2339,7 @@ impl ForgeWindow {
             });
             editor.buffer.set_selections(selections);
             editor.goal_column = if vertical { new_goal } else { None };
+            editor.completion = None;
             editor.follow_cursor();
             cx.notify();
             return;
@@ -2211,11 +2486,28 @@ impl ForgeWindow {
             },
             _ => return,
         };
-        if let Err(error) = result {
-            self.notify_user(NotificationLevel::Error, trf("Edit failed: {}", &[&error]));
-        } else if let Some(editor) = self.active_tab_mut().editor_mut() {
-            editor.goal_column = None;
-            editor.follow_cursor();
+        match result {
+            Err(error) => {
+                self.notify_user(NotificationLevel::Error, trf("Edit failed: {}", &[&error]));
+            }
+            Ok(changed) => {
+                if let Some(editor) = self.active_tab_mut().editor_mut() {
+                    if changed.is_some() {
+                        // The worker reparses; highlights follow the text
+                        // only if every edit path reports here.
+                        editor.sync_syntax();
+                        if typing_word {
+                            editor.refresh_completion(false);
+                        } else {
+                            editor.completion = None;
+                        }
+                    } else {
+                        editor.completion = None;
+                    }
+                    editor.goal_column = None;
+                    editor.follow_cursor();
+                }
+            }
         }
         cx.notify();
     }
@@ -2652,6 +2944,9 @@ impl ForgeWindow {
         let Some(at) = self.editor_char_at(event.position, window) else {
             return;
         };
+        if let Some(editor) = self.active_tab_mut().editor_mut() {
+            editor.completion = None;
+        }
         let Some(editor) = self.active_tab_mut().editor_mut() else {
             return;
         };

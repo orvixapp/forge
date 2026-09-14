@@ -173,7 +173,19 @@ config: `tab_size`, `indent_with_tabs`, `line_numbers`. Syntax highlighting
 via tree-sitter for Rust, TOML, JSON, Bash, Python, JavaScript, Markdown and
 C; colours come from the theme's `[syntax]` table (`keyword`, `string`,
 `comment`, `function`, `type`, `variable`, `number`, `constant`, `operator`,
-`punctuation`, `attribute`, `property`, `tag`). `Ctrl+P` fuzzy-finds files
+`punctuation`, `attribute`, `property`, `tag`).
+
+Tree-sitter reparses every editing path incrementally, so removing a TOML
+comment marker recolours the line without reopening the file. Syntax errors
+are underlined in red and summarized in the status bar; Forge's own
+`config.toml` additionally reports unknown or invalid settings after a short
+debounce. For every bundled programming language, the editor offers keywords
+and local words while typing; Forge config files additionally complete keys
+and values from their schema. `Ctrl+Space` opens completion
+explicitly, arrows select, `Enter`/`Tab` accept and `Esc` closes it. Semantic
+completion and language diagnostics remain part of the LSP phase.
+
+`Ctrl+P` fuzzy-finds files
 in the working directory (respecting `.gitignore` and the global excludes),
 `Ctrl+Shift+F` searches the project with the ripgrep engine, `Ctrl+F` /
 `Ctrl+H` find and replace in the current file; files changed on disk reload

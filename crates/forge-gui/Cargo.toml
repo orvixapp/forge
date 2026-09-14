@@ -12,6 +12,7 @@ forge-mcp = { path = "../forge-mcp" }
 forge-project = { path = "../forge-project" }
 forge-search = { path = "../forge-search" }
 forge-syntax = { path = "../forge-syntax" }
+ropey.workspace = true
 gpui.workspace = true
 proto-ipc = { path = "../proto-ipc" }
 proto-acp = { path = "../proto-acp" }

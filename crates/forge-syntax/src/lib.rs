@@ -160,6 +160,16 @@ pub struct Span {
     pub token: Token,
 }
 
+/// A place the grammar rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxError {
+    pub bytes: Range<usize>,
+    /// A token the grammar expected but did not find.
+    pub missing: bool,
+    /// Kind of the missing token (`"}"`, `identifier`…).
+    pub expected: Option<String>,
+}
+
 /// tree-sitter state for one buffer. Parsing runs on a worker thread that
 /// owns the `Parser`; the UI keeps the last tree it received, applies
 /// edits to it ahead of time (so highlights follow the text while the
@@ -307,6 +317,53 @@ impl SyntaxState {
             self.generation += 1;
         }
         adopted
+    }
+
+    /// Bumps whenever a new tree is adopted; callers cache derived data
+    /// (diagnostics, minimap) against it.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Byte ranges the parser could not make sense of: `ERROR` nodes and
+    /// `MISSING` tokens (`missing == true`, zero-width, pointing at where
+    /// the token was expected). At most `limit` entries, document order.
+    #[must_use]
+    pub fn syntax_errors(&self, limit: usize) -> Vec<SyntaxError> {
+        let Some(tree) = &self.tree else {
+            return Vec::new();
+        };
+        let mut errors = Vec::new();
+        let mut cursor = tree.walk();
+        let mut visited_children = false;
+        loop {
+            if errors.len() >= limit {
+                break;
+            }
+            let node = cursor.node();
+            if !visited_children && (node.is_error() || node.is_missing()) {
+                errors.push(SyntaxError {
+                    bytes: node.start_byte()..node.end_byte(),
+                    missing: node.is_missing(),
+                    expected: node.is_missing().then(|| node.kind().to_owned()),
+                });
+                // An ERROR subtree is one problem; do not descend.
+                visited_children = true;
+            }
+            if !visited_children && node.has_error() && cursor.goto_first_child() {
+                continue;
+            }
+            if cursor.goto_next_sibling() {
+                visited_children = false;
+                continue;
+            }
+            if !cursor.goto_parent() {
+                break;
+            }
+            visited_children = true;
+        }
+        errors
     }
 
     /// Whether the worker still owes a tree for the current text.
@@ -639,6 +696,65 @@ mod tests {
             Some(Token::Keyword)
         );
         assert_eq!(state.parsed_version, 2);
+    }
+
+    #[test]
+    fn uncommenting_a_toml_line_recolours_it() {
+        let config = LANGUAGES.iter().find(|l| l.name == "toml").unwrap();
+        let mut state = SyntaxState::new(config).unwrap();
+        let mut text = Rope::from_str("[ui]\n# language = \"spanish\"\n# theme = \"forge-dark\"\n");
+        parse_now(&mut state, &text, 1);
+        let before = state.highlights(&text, 1..2);
+        assert_eq!(
+            before[0].first().map(|span| span.token),
+            Some(Token::Comment)
+        );
+        // Backspace twice at the start of line 1: "# " goes away one char at a time.
+        let mut version = 1;
+        for _ in 0..2 {
+            let start = text.line_to_char(1);
+            let removed: String = text.slice(start..=start).to_string();
+            text.remove(start..=start);
+            let edit = input_edit(&text, start, "", &removed);
+            version += 1;
+            state.edited(&edit, version);
+            state.parse(&text, version, None);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.is_stale() && Instant::now() < deadline {
+            state.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!state.is_stale());
+        let after = state.highlights(&text, 1..2);
+        let tokens: Vec<Token> = after[0].iter().map(|span| span.token).collect();
+        assert!(
+            !tokens.contains(&Token::Comment) && !tokens.is_empty(),
+            "line 1 still looks like a comment: {tokens:?}"
+        );
+        assert_eq!(
+            text.to_string(),
+            "[ui]\nlanguage = \"spanish\"\n# theme = \"forge-dark\"\n"
+        );
+    }
+
+    #[test]
+    fn syntax_errors_report_error_and_missing_nodes() {
+        let config = LANGUAGES.iter().find(|l| l.name == "toml").unwrap();
+        let mut state = SyntaxState::new(config).unwrap();
+        let text = Rope::from_str("[ui]\nlanguage = \n");
+        parse_now(&mut state, &text, 1);
+        let errors = state.syntax_errors(10);
+        assert!(!errors.is_empty(), "a value-less pair must be an error");
+        let clean = Rope::from_str("[ui]\nlanguage = \"spanish\"\n");
+        state.invalidate();
+        parse_now(&mut state, &clean, 2);
+        assert!(state.syntax_errors(10).is_empty());
+        let json = LANGUAGES.iter().find(|l| l.name == "json").unwrap();
+        let mut state = SyntaxState::new(json).unwrap();
+        let text = Rope::from_str("{\"a\": 1,\n");
+        parse_now(&mut state, &text, 1);
+        assert!(!state.syntax_errors(10).is_empty());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 mod agent;
+mod assist;
 mod bench;
 mod chrome;
 mod editor;
