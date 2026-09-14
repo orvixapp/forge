@@ -53,10 +53,14 @@ pub enum ShellCommand {
     EditorSelectNextMatch,
     EditorAddCursorAbove,
     EditorAddCursorBelow,
+    OpenProjectFile,
+    SearchProject,
+    EditorFind,
+    EditorReplace,
 }
 
 impl ShellCommand {
-    pub const ALL: [Self; 41] = [
+    pub const ALL: [Self; 45] = [
         Self::NewTerminalTab,
         Self::NewTerminalTabInDirectory,
         Self::CloseWindow,
@@ -98,6 +102,10 @@ impl ShellCommand {
         Self::EditorSelectNextMatch,
         Self::EditorAddCursorAbove,
         Self::EditorAddCursorBelow,
+        Self::OpenProjectFile,
+        Self::SearchProject,
+        Self::EditorFind,
+        Self::EditorReplace,
     ];
 
     #[must_use]
@@ -144,6 +152,10 @@ impl ShellCommand {
             Self::EditorSelectNextMatch => "editor.selectNextMatch",
             Self::EditorAddCursorAbove => "editor.addCursorAbove",
             Self::EditorAddCursorBelow => "editor.addCursorBelow",
+            Self::OpenProjectFile => "project.openFile",
+            Self::SearchProject => "project.search",
+            Self::EditorFind => "editor.find",
+            Self::EditorReplace => "editor.replace",
         }
     }
 
@@ -191,6 +203,10 @@ impl ShellCommand {
             Self::EditorSelectNextMatch => "Add next occurrence to selection",
             Self::EditorAddCursorAbove => "Add cursor above",
             Self::EditorAddCursorBelow => "Add cursor below",
+            Self::OpenProjectFile => "Go to file…",
+            Self::SearchProject => "Search in project…",
+            Self::EditorFind => "Find in file",
+            Self::EditorReplace => "Find and replace in file",
         }
     }
 

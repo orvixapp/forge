@@ -71,9 +71,24 @@ sin snippets, sin emulación Vim completa.
 
 ## 3.4 — Proyecto y búsqueda (`forge-project`, `forge-search`)
 
-- [ ] Explorador de archivos con `ignore` y exclusiones globales; fuzzy
-  finder (`nucleo` + `fst`); búsqueda/reemplazo en buffer (regex) y en
-  proyecto (crates de ripgrep) en stream; watcher (`notify`) con fallback.
+- [x] `forge-project`: walker `ignore` (gitignore/.ignore/ocultos +
+  exclusiones globales de §13.6, sin exigir repositorio git), índice de
+  rutas en memoria con fuzzy `nucleo-matcher` (smart case, índices de
+  coincidencia) y `FileWatcher` (`notify`) por archivo abierto.
+- [x] `forge-search`: regex sobre el rope (buffer) y búsqueda de proyecto
+  con `grep-searcher`/`grep-regex` en hilos, resultados en stream con
+  tope (1.000) y cancelación al soltar el handle; literal/regex,
+  mayúsculas y palabra completa.
+- [x] GUI: «Ir a archivo» (`Ctrl+P`, índice en hilo de fondo, TTL 30 s),
+  «Buscar en el proyecto» (`Ctrl+Shift+F` fuera de terminales, resultados
+  en vivo, Enter abre en `ruta:línea:col`), barra de buscar/reemplazar en
+  el editor (`Ctrl+F`/`Ctrl+H`: resaltado de coincidencias, Enter/Shift+Enter,
+  Ctrl+Enter reemplaza, Ctrl+Alt+Enter todos, Alt+R/C/W), y recarga
+  automática de buffers limpios que cambian en disco (aviso si están
+  sucios o se borran).
+- [ ] Explorador de archivos en árbol (panel lateral), índice `fst` para
+  workspaces de 1M rutas, búsqueda por chunks con `regex-automata` para
+  buffers muy grandes, reemplazo en proyecto.
 
 ## 3.5 — Archivos grandes, autosave y cierre
 

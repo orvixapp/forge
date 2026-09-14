@@ -34,6 +34,10 @@ pub enum UiEvent {
         tab_id: u64,
         state: Box<forge_syntax::SyntaxState>,
     },
+    /// The workspace path index was (re)built.
+    IndexReady {
+        index: Box<Result<forge_project::PathIndex, String>>,
+    },
 }
 
 #[cfg_attr(not(any(unix, windows)), allow(dead_code))]

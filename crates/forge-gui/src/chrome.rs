@@ -68,6 +68,13 @@ pub fn render_window(
         })
         .when(view.palette.open, |root| root.child(palette(view)))
         .when(view.search.open, |root| root.child(search_bar(view, cx)))
+        .when(
+            view.find.open && view.active_tab().editor().is_some(),
+            |root| root.child(find_bar(view)),
+        )
+        .when(view.finder.is_some(), |root| {
+            root.child(finder_overlay(view))
+        })
         .when_some(view.confirmation.as_ref(), |root, confirmation| {
             root.child(confirmation_dialog(view, confirmation))
         })
@@ -659,6 +666,227 @@ fn picker_overlay(view: &ForgeWindow, picker: &crate::window::Picker) -> impl In
                     "↑↓ select · Enter opens · Esc closes"
                 } else {
                     "↑↓ selecciona · Enter abre · Esc cierra"
+                }),
+        )
+}
+
+/// File finder / project search: a query line, a status line and the
+/// matching rows, with the selected one highlighted.
+#[allow(clippy::too_many_lines)]
+fn finder_overlay(view: &ForgeWindow) -> AnyElement {
+    let theme = view.theme;
+    let english = view.config.ui.language == Language::English;
+    let Some(finder) = &view.finder else {
+        return div().into_any_element();
+    };
+    let rows = view.finder_rows();
+    let first = view.finder_first_row();
+    let status = view.finder_status();
+    let (title, hint) = match finder.mode {
+        crate::project::FinderMode::Files => (
+            if english {
+                "Go to file"
+            } else {
+                "Ir a archivo"
+            },
+            if english {
+                "↑↓ select · Enter opens · Esc closes"
+            } else {
+                "↑↓ selecciona · Enter abre · Esc cierra"
+            },
+        ),
+        crate::project::FinderMode::ProjectSearch => (
+            if english {
+                "Search in project"
+            } else {
+                "Buscar en el proyecto"
+            },
+            if english {
+                "↑↓ select · Enter opens · Alt+R regex · Alt+C case · Alt+W word · Esc closes"
+            } else {
+                "↑↓ selecciona · Enter abre · Alt+R regex · Alt+C mayúsculas · Alt+W palabra · Esc cierra"
+            },
+        ),
+    };
+    let flags = match finder.mode {
+        crate::project::FinderMode::ProjectSearch => format!(
+            "{}{}{}",
+            if finder.options.regex { " .*" } else { "" },
+            if finder.options.case_sensitive {
+                " Aa"
+            } else {
+                ""
+            },
+            if finder.options.whole_word {
+                " \\b"
+            } else {
+                ""
+            }
+        ),
+        crate::project::FinderMode::Files => String::new(),
+    };
+    div()
+        .id("finder")
+        .absolute()
+        .top(px(TOPBAR_HEIGHT + 28.0))
+        .left(px(48.0))
+        .right(px(48.0))
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .w(px(760.0))
+                .p(px(12.0))
+                .rounded(px(8.0))
+                .bg(color(theme.chrome))
+                .border_1()
+                .border_color(color(theme.chrome_border))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .text_size(px(12.0))
+                        .text_color(color(theme.muted))
+                        .child(title)
+                        .child(format!("{status}{flags}")),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(color(theme.foreground))
+                        .child(format!("› {}▏", finder.query)),
+                )
+                .children(rows.into_iter().enumerate().map(|(offset, row)| {
+                    let selected = first + offset == finder.index;
+                    div()
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .rounded(px(4.0))
+                        .flex()
+                        .gap(px(12.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .bg(color(if selected {
+                            theme.highlight
+                        } else {
+                            theme.chrome_active
+                        }))
+                        .text_size(px(13.0))
+                        .child(finder_label(&row.label, &row.emphasis, theme))
+                        .when(!row.detail.is_empty(), |item| {
+                            item.child(
+                                div()
+                                    .text_color(color(theme.muted))
+                                    .overflow_hidden()
+                                    .child(row.detail),
+                            )
+                        })
+                }))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(color(theme.muted))
+                        .child(hint),
+                ),
+        )
+        .into_any_element()
+}
+
+/// A finder row label with the fuzzy-matched characters in the accent
+/// colour; runs of consecutive hits share one element.
+fn finder_label(
+    label: &str,
+    emphasis: &[u32],
+    theme: forge_gui::theme::ThemeColors,
+) -> impl IntoElement {
+    let mut pieces: Vec<(String, bool)> = Vec::new();
+    for (index, c) in label.chars().enumerate() {
+        let hit = emphasis
+            .binary_search(&u32::try_from(index).unwrap_or(u32::MAX))
+            .is_ok();
+        match pieces.last_mut() {
+            Some((text, last_hit)) if *last_hit == hit => text.push(c),
+            _ => pieces.push((c.to_string(), hit)),
+        }
+    }
+    div()
+        .flex()
+        .text_color(color(theme.foreground))
+        .children(pieces.into_iter().map(|(text, hit)| {
+            div()
+                .when(hit, |piece| piece.text_color(color(theme.accent)))
+                .child(text)
+        }))
+}
+
+/// Find/replace bar of the active editor, top-right like the terminal's.
+fn find_bar(view: &ForgeWindow) -> impl IntoElement {
+    let theme = view.theme;
+    let english = view.config.ui.language == Language::English;
+    let find = &view.find;
+    let status = find.error.clone().unwrap_or_else(|| find.label());
+    let field = |label: &str, value: &str, focused: bool| {
+        div()
+            .flex()
+            .gap(px(6.0))
+            .text_size(px(13.0))
+            .child(div().text_color(color(theme.muted)).child(label.to_owned()))
+            .child(
+                div()
+                    .text_color(color(theme.foreground))
+                    .child(format!("{value}{}", if focused { "▏" } else { "" })),
+            )
+    };
+    div()
+        .id("find-bar")
+        .absolute()
+        .top(px(TOPBAR_HEIGHT + 8.0))
+        .right(px(24.0))
+        .w(px(460.0))
+        .px(px(10.0))
+        .py(px(8.0))
+        .rounded(px(8.0))
+        .bg(color(theme.chrome))
+        .border_1()
+        .border_color(color(theme.chrome_border))
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .child(field("⌕", &find.query, !find.replacing))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(color(if find.error.is_some() {
+                            theme.danger
+                        } else {
+                            theme.accent
+                        }))
+                        .child(format!(
+                            "{status}{}{}{}",
+                            if find.options.regex { " .*" } else { "" },
+                            if find.options.case_sensitive { " Aa" } else { "" },
+                            if find.options.whole_word { " \\b" } else { "" }
+                        )),
+                ),
+        )
+        .when(find.replacing || !find.replacement.is_empty(), |bar| {
+            bar.child(field("⇄", &find.replacement, find.replacing))
+        })
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(color(theme.muted))
+                .child(if english {
+                    "Enter next · Shift+Enter previous · Tab field · Ctrl+Enter replace · Ctrl+Alt+Enter all · Alt+R/C/W"
+                } else {
+                    "Enter siguiente · Shift+Enter anterior · Tab campo · Ctrl+Enter reemplaza · Ctrl+Alt+Enter todos · Alt+R/C/W"
                 }),
         )
 }

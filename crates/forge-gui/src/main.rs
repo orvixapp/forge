@@ -3,6 +3,7 @@ mod chrome;
 mod editor;
 mod grid_element;
 mod ipc;
+mod project;
 mod search;
 mod window;
 

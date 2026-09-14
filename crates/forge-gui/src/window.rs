@@ -6,6 +6,7 @@ use crate::{
     editor::EditorTab,
     grid_element::{CellMetrics, Palette, SearchHighlights, TerminalSurface},
     ipc::{IpcCommand, SessionSpec, UiEvent, spawn_ipc_worker},
+    project::{EditorFind, Finder, FinderMode, ProjectState},
     search::{SearchAction, SearchDirection, SearchState, reveal_row},
 };
 use forge_gui::{
@@ -354,6 +355,9 @@ pub struct ForgeWindow {
     pub keymap: ShellKeymap,
     pub palette: PaletteState,
     pub search: SearchState,
+    pub finder: Option<Finder>,
+    pub project: ProjectState,
+    pub find: EditorFind,
     pub confirmation: Option<Confirmation>,
     pub rename: Option<TextPrompt>,
     pub picker: Option<Picker>,
@@ -390,6 +394,9 @@ impl ForgeWindow {
             keymap,
             palette: PaletteState::default(),
             search: SearchState::default(),
+            finder: None,
+            project: ProjectState::default(),
+            find: EditorFind::default(),
             confirmation: None,
             rename: None,
             picker: None,
@@ -437,6 +444,10 @@ impl ForgeWindow {
                         Err(_) => return,
                     }
                 }
+                match this.update(cx, |view, _| view.poll_project_search()) {
+                    Ok(dirty) => changed |= dirty,
+                    Err(_) => return,
+                }
                 if changed && this.update(cx, |_, cx| cx.notify()).is_err() {
                     return;
                 }
@@ -454,6 +465,7 @@ impl ForgeWindow {
         dirty |= self.notifications.len() != before;
         self.save_session();
         self.refresh_search_if_due();
+        dirty |= self.poll_watcher(cx);
         dirty
     }
 
@@ -861,6 +873,10 @@ impl ForgeWindow {
         if let Some(terminal) = closed.terminal() {
             let _ = terminal.input.send(IpcCommand::Shutdown);
         }
+        if let Some(path) = closed.editor().and_then(EditorTab::path) {
+            let path = path.to_path_buf();
+            self.unwatch_file(&path);
+        }
         self.active_tab = if self.active_tab > index {
             self.active_tab - 1
         } else {
@@ -1248,6 +1264,7 @@ impl ForgeWindow {
                 }
             }
             UiEvent::SyntaxReady { tab_id, state } => self.on_syntax_ready(tab_id, *state, cx),
+            UiEvent::IndexReady { index } => self.on_index_ready(*index, cx),
             UiEvent::Attached {
                 tab_id,
                 session_id,
@@ -1429,10 +1446,14 @@ impl ForgeWindow {
             self.rename_key(key, key_char, modifiers, cx);
         } else if self.picker.is_some() {
             self.picker_key(key, cx);
+        } else if self.finder.is_some() {
+            self.finder_key(key, key_char, modifiers, cx);
         } else if self.palette.open {
             self.palette_key(key, key_char, modifiers, window, cx);
         } else if self.search.open {
             self.search_key(key, key_char, modifiers, window, cx);
+        } else if self.find.open && self.active_tab().editor().is_some() {
+            self.find_key(key, key_char, modifiers, cx);
         } else {
             return false;
         }
@@ -1621,6 +1642,10 @@ impl ForgeWindow {
             ShellCommand::EditorSelectNextMatch => self.editor_select_next_match(cx),
             ShellCommand::EditorAddCursorAbove => self.editor_add_cursor(false, cx),
             ShellCommand::EditorAddCursorBelow => self.editor_add_cursor(true, cx),
+            ShellCommand::OpenProjectFile => self.open_finder(FinderMode::Files, cx),
+            ShellCommand::SearchProject => self.open_finder(FinderMode::ProjectSearch, cx),
+            ShellCommand::EditorFind => self.open_find(false, cx),
+            ShellCommand::EditorReplace => self.open_find(true, cx),
             other => self.run_layout_command(other, cx),
         }
     }

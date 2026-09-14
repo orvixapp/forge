@@ -1,0 +1,18 @@
+[package]
+name = "forge-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Search in buffers and across the workspace for the Forge editor, built on the ripgrep crates"
+
+[dependencies]
+forge-project = { path = "../forge-project" }
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+regex.workspace = true
+ropey.workspace = true
+
+[lints]
+workspace = true

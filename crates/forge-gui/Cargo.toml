@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 forge-buffer = { path = "../forge-buffer" }
+forge-project = { path = "../forge-project" }
+forge-search = { path = "../forge-search" }
 forge-syntax = { path = "../forge-syntax" }
 gpui.workspace = true
 proto-ipc = { path = "../proto-ipc" }

@@ -155,7 +155,11 @@ config: `tab_size`, `indent_with_tabs`, `line_numbers`. Syntax highlighting
 via tree-sitter for Rust, TOML, JSON, Bash, Python, JavaScript, Markdown and
 C; colours come from the theme's `[syntax]` table (`keyword`, `string`,
 `comment`, `function`, `type`, `variable`, `number`, `constant`, `operator`,
-`punctuation`, `attribute`, `property`, `tag`).
+`punctuation`, `attribute`, `property`, `tag`). `Ctrl+P` fuzzy-finds files
+in the working directory (respecting `.gitignore` and the global excludes),
+`Ctrl+Shift+F` searches the project with the ripgrep engine, `Ctrl+F` /
+`Ctrl+H` find and replace in the current file; files changed on disk reload
+while their buffer is clean.
 
 Diagnostics: `FORGE_LOG=debug` prints tracing/GPUI logs; `FORGE_TRACE_FILE=trace.json`
 writes a Chrome trace of the startup spans that Perfetto can open.

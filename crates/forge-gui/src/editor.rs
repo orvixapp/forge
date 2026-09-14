@@ -211,6 +211,35 @@ impl EditorTab {
         self.follow_cursor();
     }
 
+    /// Re-reads the file after it changed on disk, keeping cursor and
+    /// scroll where they were. Returns whether the text changed.
+    pub fn reload_from_disk(&mut self) -> bool {
+        let Some(file) = &self.file else {
+            return false;
+        };
+        let Ok(reloaded) = LoadedFile::read(&file.path) else {
+            return false;
+        };
+        if reloaded.text == self.buffer.text() {
+            self.file = Some(reloaded);
+            return false;
+        }
+        let len = self.buffer.len_chars();
+        let selections = self.buffer.selections().clone();
+        let _ = self.buffer.edit_with_selections(
+            vec![Edit {
+                range: 0..len,
+                text: reloaded.text.clone(),
+            }],
+            selections.clamped(reloaded.text.chars().count()),
+            false,
+        );
+        self.buffer.mark_saved();
+        self.file = Some(reloaded);
+        self.sync_syntax();
+        true
+    }
+
     /// Cursor at a 1-based line and column, as links and the CLI give them.
     pub fn go_to(&mut self, line: u32, column: Option<u32>) {
         let at = self.buffer.char_at(Position {
@@ -323,9 +352,6 @@ impl Element for EditorElement {
             let tab_size = view.config.editor.tab_size;
             let line_numbers = view.config.editor.line_numbers;
             let font = window.text_style().font();
-            let Some(editor) = view.tabs.get_mut(index).and_then(Tab::editor_mut) else {
-                return;
-            };
             let paint = EditorPaint {
                 metrics,
                 font,
@@ -340,6 +366,17 @@ impl Element for EditorElement {
                     selection
                 },
                 syntax: theme.syntax,
+                search_match: color(theme.search_match).into(),
+                search_current: color(theme.search_current).into(),
+                find: if view.find.open && index == view.active_tab {
+                    view.find.matches.clone()
+                } else {
+                    Vec::new()
+                },
+                find_current: view.find.current,
+            };
+            let Some(editor) = view.tabs.get_mut(index).and_then(Tab::editor_mut) else {
+                return;
             };
             paint_editor(editor, bounds, &paint, window, cx);
         });
@@ -356,6 +393,11 @@ struct EditorPaint {
     cursor: Hsla,
     selection: Hsla,
     syntax: forge_gui::theme::SyntaxColors,
+    search_match: Hsla,
+    search_current: Hsla,
+    /// Find-bar matches (char ranges) and the current one, active tab only.
+    find: Vec<Range<usize>>,
+    find_current: Option<usize>,
 }
 
 impl EditorPaint {
@@ -496,6 +538,28 @@ fn paint_editor(
                     text_system.shape_line(SharedString::from(display), font_size, &runs, None);
                 let line_start = editor.buffer.char_at(Position { line, column: 0 });
                 let line_end = line_start + editor.buffer.line_len_chars(line);
+                // Find-bar matches on this line, under the selection overlay.
+                let first_match = paint.find.partition_point(|range| range.end <= line_start);
+                for (index, range) in paint.find.iter().enumerate().skip(first_match) {
+                    if range.start > line_end {
+                        break;
+                    }
+                    let from = range.start.max(line_start) - line_start;
+                    let to = range.end.min(line_end) - line_start;
+                    let x0 = shaped.x_for_index(offsets[from]);
+                    let x1 = shaped.x_for_index(offsets[to]);
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(text_bounds.origin.x + x0, y),
+                            size((x1 - x0).max(px(2.0)), line_height),
+                        ),
+                        if paint.find_current == Some(index) {
+                            paint.search_current
+                        } else {
+                            paint.search_match
+                        },
+                    ));
+                }
                 // Selections covering this line, as x ranges of the display text.
                 for selection in selections.iter() {
                     let range = selection.range();
@@ -621,6 +685,7 @@ impl ForgeWindow {
             if let Some(editor) = self.tabs[index].editor_mut() {
                 editor.detect_language(tab_id, &events);
             }
+            self.watch_file(&path);
         }
         if let Some(line) = line
             && let Some(editor) = self.active_tab_mut().editor_mut()
@@ -920,6 +985,7 @@ impl ForgeWindow {
             if changed {
                 editor.follow_cursor();
                 editor.sync_syntax();
+                self.refresh_find();
                 cx.notify();
             }
         }

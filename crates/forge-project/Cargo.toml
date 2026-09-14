@@ -1,0 +1,14 @@
+[package]
+name = "forge-project"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Workspace files for the Forge editor: ignore-aware walker, path index, fuzzy finder and watcher"
+
+[dependencies]
+ignore = "0.4"
+notify = "8"
+nucleo-matcher = "0.3"
+
+[lints]
+workspace = true
