@@ -134,6 +134,9 @@ pub struct AgentTab {
     pub last_prompt: Option<String>,
     pub timeline: Vec<TimelineItem>,
     pub context: Vec<PromptContext>,
+    /// Slash commands advertised by the ACP agent. Kept as session metadata;
+    /// the protocol update must not become a raw JSON chat message.
+    pub available_commands: Vec<(String, String)>,
     pub proposed_edits: Vec<ProposedEdit>,
     pub pending_permissions: Vec<PendingPermissionRequest>,
     pub scroll_item: usize,
@@ -157,6 +160,7 @@ impl AgentTab {
             last_prompt: None,
             timeline: Vec::new(),
             context: Vec::new(),
+            available_commands: Vec::new(),
             proposed_edits: Vec::new(),
             pending_permissions: Vec::new(),
             scroll_item: 0,
@@ -315,6 +319,24 @@ impl AgentTab {
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         match kind {
+            "available_commands_update" => {
+                self.available_commands = update
+                    .get("availableCommands")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|command| {
+                        Some((
+                            command.get("name")?.as_str()?.to_owned(),
+                            command
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                        ))
+                    })
+                    .collect();
+            }
             "agent_message_chunk" | "message_chunk" => {
                 let text = update
                     .get("content")
@@ -560,6 +582,20 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn available_commands_are_metadata_not_raw_timeline_messages() {
+        let mut tab = AgentTab::new("OpenCode", PathBuf::from("."));
+        tab.apply_update(&json!({
+            "sessionUpdate": "available_commands_update",
+            "availableCommands": [{"name": "review", "description": "Review changes"}]
+        }));
+        assert_eq!(
+            tab.available_commands,
+            [("review".to_owned(), "Review changes".to_owned())]
+        );
+        assert!(tab.timeline.is_empty());
     }
 
     #[test]
