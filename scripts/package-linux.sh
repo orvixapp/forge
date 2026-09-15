@@ -180,5 +180,13 @@ rm -f "${tarball}"
 tar -C "${stage}" -czf "${tarball}" --owner=0 --group=0 "${name}"
 echo "${tarball}"
 
-(cd "${dist}" && sha256sum "$(basename "${deb}")" "$(basename "${tarball}")" > "SHA256SUMS-${version}.txt")
+# Unversioned copies give install.sh stable download URLs on every release.
+cp "${deb}" "${dist}/forge_${deb_arch}.deb"
+cp "${tarball}" "${dist}/forge-linux-${arch}.tar.gz"
+(
+  cd "${dist}"
+  sha256sum "$(basename "${deb}")" "$(basename "${tarball}")" \
+    "forge_${deb_arch}.deb" "forge-linux-${arch}.tar.gz" > "SHA256SUMS-${version}.txt"
+  cp "SHA256SUMS-${version}.txt" SHA256SUMS.txt
+)
 echo "${dist}/SHA256SUMS-${version}.txt"

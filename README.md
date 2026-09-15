@@ -8,17 +8,25 @@ PTY daemon before adding the GPU renderer.
 
 ## Install on Linux
 
-Every run of the `release` workflow (Actions tab → *release* → *Run
-workflow*, or a `v*` tag, which also publishes a GitHub Release) produces the
-`forge-linux-x86_64` artifact with two installers built on Ubuntu 24.04
-(glibc 2.39; Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch):
+One command, no toolchain: downloads the latest build from GitHub Releases,
+verifies its checksum and installs the Debian package (or, elsewhere, a
+`~/.local` install), leaving `forge` in the terminal and in the menu:
 
 ```bash
-sudo apt install ./forge_<version>_amd64.deb          # Debian/Ubuntu → `forge`
-# any distribution, no root needed:
-tar -xzf forge-<version>-linux-x86_64.tar.gz
-./forge-<version>-linux-x86_64/install.sh             # ~/.local/bin/forge + menu entry
-./forge-<version>-linux-x86_64/install.sh --prefix /usr/local   # system-wide (sudo)
+curl -fsSL https://raw.githubusercontent.com/orvixapp/forge/main/install.sh | bash
+```
+
+`| bash -s -- --user` skips root and installs under `~/.local`; `--version dev`
+picks the rolling development build (the default until a `v*` release exists),
+`--prefix DIR` chooses the location and `--uninstall` removes it. The
+packages are built on Ubuntu 24.04 (glibc 2.39: Ubuntu 24.04+, Debian 13+,
+Fedora 40+, Arch) by the `release` workflow (Actions tab → *release* → *Run
+workflow* updates the `dev` pre-release; a `v*` tag publishes a release).
+Manual alternative from the release page:
+
+```bash
+sudo apt install ./forge_amd64.deb                    # Debian/Ubuntu
+tar -xzf forge-linux-x86_64.tar.gz && ./forge-*/install.sh    # any distro, no root
 ```
 
 Both ship `forge-gui`, the terminal daemon, `libghostty-vt` and the shell
