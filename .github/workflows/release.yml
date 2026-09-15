@@ -1,0 +1,79 @@
+name: release
+
+# Builds the Linux installers (.deb and .tar.gz with install.sh) from a
+# release build plus the pinned libghostty-vt. Run it by hand from the
+# Actions tab to get the files as a workflow artifact, or push a `v*` tag
+# to also publish them as a GitHub Release.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version (default: Cargo version + git hash)"
+        required: false
+        default: ""
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    # ubuntu-24.04 links against glibc 2.39: the packages run on Ubuntu 24.04+,
+    # Debian 13+, Fedora 40+, Arch and similar. Older distributions need a
+    # build on an older base image.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - name: Build dependencies (GPUI)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev \
+            libwayland-dev libx11-xcb-dev libvulkan-dev libasound2-dev libzstd-dev
+      - name: libghostty-vt
+        run: ./scripts/bootstrap-ghostty.sh
+      - name: Release build
+        run: cargo build --release -p forge-gui -p proto-termd
+      - name: Package
+        run: ./scripts/package-linux.sh "${{ inputs.version || (startsWith(github.ref, 'refs/tags/v') && github.ref_name || '') }}"
+      - name: Smoke test the tarball installer
+        run: |
+          set -eux
+          prefix=$(mktemp -d)
+          tar -xzf dist/forge-*-linux-x86_64.tar.gz -C "$prefix"
+          "$prefix"/forge-*/install.sh --prefix "$prefix/opt"
+          test -x "$prefix/opt/lib/forge/proto-termd"
+          test -f "$prefix/opt/lib/forge/libghostty-vt.so"
+          "$prefix/opt/bin/forge" --print-config-schema > /dev/null
+          dpkg-deb --info dist/forge_*_amd64.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: forge-linux-x86_64
+          path: |
+            dist/*.deb
+            dist/*.tar.gz
+            dist/SHA256SUMS-*.txt
+          if-no-files-found: error
+      - name: GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.deb
+            dist/*.tar.gz
+            dist/SHA256SUMS-*.txt
+          generate_release_notes: true
