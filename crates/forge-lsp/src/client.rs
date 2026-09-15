@@ -2,12 +2,20 @@
 
 use crate::jsonrpc::{Id, Message, Notification, Request, Response, ResponseError};
 use crate::transport::{TransportError, read_message, write_message};
-use lsp_types::*;
+use lsp_types::{
+    CodeActionParams, CodeActionResponse, CompletionItem, CompletionParams, CompletionResponse,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, DocumentFormattingParams, DocumentRangeFormattingParams,
+    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
+    Hover, HoverParams, InitializeParams, InitializeResult, InitializedParams, Location,
+    PartialResultParams, ReferenceParams, SymbolInformation, TextEdit, WorkDoneProgressParams,
+    WorkspaceSymbolParams,
+};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
@@ -33,20 +41,90 @@ pub enum LspError {
     Channel(String),
 }
 
-type PendingRequests = Arc<tokio::sync::Mutex<HashMap<Id, oneshot::Sender<Result<Value, ResponseError>>>>>;
+type PendingRequests =
+    Arc<std::sync::Mutex<HashMap<Id, oneshot::Sender<Result<Value, ResponseError>>>>>;
+
+struct ClientTasks {
+    reader: JoinHandle<()>,
+    writer: JoinHandle<()>,
+}
+impl Drop for ClientTasks {
+    fn drop(&mut self) {
+        self.reader.abort();
+        self.writer.abort();
+    }
+}
+
+struct PendingRequest {
+    id: Id,
+    pending: PendingRequests,
+    outgoing: mpsc::Sender<Message>,
+}
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        let removed = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id)
+            .is_some();
+        if removed {
+            let _ = self.outgoing.try_send(Message::Notification(Notification {
+                jsonrpc: "2.0".into(),
+                method: "$/cancelRequest".into(),
+                params: Some(json!({"id":self.id})),
+            }));
+        }
+    }
+}
+
+fn server_response(req: Request) -> Response {
+    match req.method.as_str() {
+        "workspace/configuration" => Response {
+            jsonrpc: "2.0".to_string(),
+            id: Some(req.id),
+            result: Some(json!(
+                req.params
+                    .as_ref()
+                    .and_then(|params| params.get("items"))
+                    .and_then(Value::as_array)
+                    .map_or_else(Vec::new, |items| vec![Value::Null; items.len()])
+            )),
+            error: None,
+        },
+        "window/workDoneProgress/create" => Response {
+            jsonrpc: "2.0".to_string(),
+            id: Some(req.id),
+            result: Some(Value::Null),
+            error: None,
+        },
+        _ => Response {
+            jsonrpc: "2.0".to_string(),
+            id: Some(req.id),
+            result: None,
+            error: Some(ResponseError {
+                code: -32601,
+                message: format!("Method {} not supported by client", req.method),
+                data: None,
+            }),
+        },
+    }
+}
 
 #[derive(Clone)]
 pub struct LspClient {
-    next_id: Arc<AtomicU64>,
+    next_id: Arc<AtomicI64>,
     outgoing_tx: mpsc::Sender<Message>,
     pending_requests: PendingRequests,
     notifications_tx: broadcast::Sender<Notification>,
-    _reader_handle: Arc<JoinHandle<()>>,
-    _writer_handle: Arc<JoinHandle<()>>,
+    _tasks: Arc<ClientTasks>,
 }
 
 impl LspClient {
     /// Connects to a language server over the given async reader and writer.
+    ///
+    /// # Panics
+    /// Requires an active Tokio runtime.
     pub fn new<R, W>(reader: R, mut writer: W) -> Self
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -54,7 +132,7 @@ impl LspClient {
     {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Message>(128);
         let (notifications_tx, _) = broadcast::channel::<Notification>(256);
-        let pending_requests: PendingRequests = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let pending_requests: PendingRequests = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         let pending_for_reader = Arc::clone(&pending_requests);
         let notif_tx_for_reader = notifications_tx.clone();
@@ -69,7 +147,9 @@ impl LspClient {
                         match Message::parse(&payload) {
                             Ok(Message::Response(res)) => {
                                 if let Some(id) = res.id {
-                                    let mut pending = pending_for_reader.lock().await;
+                                    let mut pending = pending_for_reader
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                                     if let Some(sender) = pending.remove(&id) {
                                         let result = if let Some(err) = res.error {
                                             Err(err)
@@ -78,7 +158,9 @@ impl LspClient {
                                         };
                                         let _ = sender.send(result);
                                     } else {
-                                        trace!("Received response for unknown/cancelled id: {id:?}");
+                                        trace!(
+                                            "Received response for unknown/cancelled id: {id:?}"
+                                        );
                                     }
                                 }
                             }
@@ -89,37 +171,10 @@ impl LspClient {
                             Ok(Message::Request(req)) => {
                                 debug!("Received server-to-client request: {}", req.method);
                                 // Handle known server requests with sensible defaults
-                                let response = match req.method.as_str() {
-                                    "workspace/configuration" => Response {
-                                        jsonrpc: "2.0".to_string(),
-                                        id: Some(req.id),
-                                        result: Some(json!([])),
-                                        error: None,
-                                    },
-                                    "client/registerCapability" | "client/unregisterCapability" => Response {
-                                        jsonrpc: "2.0".to_string(),
-                                        id: Some(req.id),
-                                        result: Some(Value::Null),
-                                        error: None,
-                                    },
-                                    "window/workDoneProgress/create" => Response {
-                                        jsonrpc: "2.0".to_string(),
-                                        id: Some(req.id),
-                                        result: Some(Value::Null),
-                                        error: None,
-                                    },
-                                    _ => Response {
-                                        jsonrpc: "2.0".to_string(),
-                                        id: Some(req.id),
-                                        result: None,
-                                        error: Some(ResponseError {
-                                            code: -32601,
-                                            message: format!("Method {} not supported by client", req.method),
-                                            data: None,
-                                        }),
-                                    },
-                                };
-                                let _ = outgoing_tx_for_reader.send(Message::Response(response)).await;
+                                let response = server_response(req);
+                                let _ = outgoing_tx_for_reader
+                                    .send(Message::Response(response))
+                                    .await;
                             }
                             Err(err) => {
                                 warn!("Failed to parse incoming LSP message: {err}");
@@ -138,7 +193,9 @@ impl LspClient {
             }
 
             // Connection died: cancel all pending requests
-            let mut pending = pending_for_reader.lock().await;
+            let mut pending = pending_for_reader
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (_, tx) in pending.drain() {
                 let _ = tx.send(Err(ResponseError {
                     code: -32099,
@@ -166,12 +223,14 @@ impl LspClient {
         });
 
         Self {
-            next_id: Arc::new(AtomicU64::new(1)),
+            next_id: Arc::new(AtomicI64::new(1)),
             outgoing_tx,
             pending_requests,
             notifications_tx,
-            _reader_handle: Arc::new(reader_handle),
-            _writer_handle: Arc::new(writer_handle),
+            _tasks: Arc::new(ClientTasks {
+                reader: reader_handle,
+                writer: writer_handle,
+            }),
         }
     }
 
@@ -182,26 +241,41 @@ impl LspClient {
     }
 
     /// Sends a raw JSON-RPC request with default timeout (15s).
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn send_request_raw(
         &self,
         method: &str,
         params: Option<Value>,
     ) -> Result<Value, LspError> {
-        self.send_request_timeout(method, params, Duration::from_secs(15)).await
+        self.send_request_timeout(method, params, Duration::from_secs(15))
+            .await
     }
 
     /// Sends a raw JSON-RPC request with a custom timeout.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn send_request_timeout(
         &self,
         method: &str,
         params: Option<Value>,
         timeout: Duration,
     ) -> Result<Value, LspError> {
-        let id = Id::Number(self.next_id.fetch_add(1, Ordering::Relaxed) as i64);
+        let id = Id::Number(self.next_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
+        let _cleanup = PendingRequest {
+            id: id.clone(),
+            pending: self.pending_requests.clone(),
+            outgoing: self.outgoing_tx.clone(),
+        };
 
         {
-            let mut pending = self.pending_requests.lock().await;
+            let mut pending = self
+                .pending_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             pending.insert(id.clone(), tx);
         }
 
@@ -212,41 +286,43 @@ impl LspClient {
             params,
         });
 
-        if let Err(err) = self.outgoing_tx.send(request).await {
-            let mut pending = self.pending_requests.lock().await;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let sent = tokio::time::timeout_at(deadline, self.outgoing_tx.send(request))
+            .await
+            .map_err(|_| LspError::Timeout)?;
+        if let Err(err) = sent {
+            let mut pending = self
+                .pending_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             pending.remove(&id);
             return Err(LspError::Channel(err.to_string()));
         }
 
-        match tokio::time::timeout(timeout, rx).await {
+        match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(val))) => Ok(val),
             Ok(Ok(Err(err))) => Err(LspError::Rpc(err)),
             Ok(Err(_)) => Err(LspError::Closed),
             Err(_) => {
-                // Timeout: remove from pending and send $/cancelRequest
-                {
-                    let mut pending = self.pending_requests.lock().await;
-                    pending.remove(&id);
-                }
-                let _ = self.cancel_request(id).await;
+                // The RAII guard sends cancellation without waiting on a blocked writer.
                 Err(LspError::Timeout)
             }
         }
     }
 
     /// Cancels a pending request via `$/cancelRequest`.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn cancel_request(&self, id: Id) -> Result<(), LspError> {
-        let cancel_params = CancelParams {
-            id: match id {
-                Id::Number(n) => NumberOrString::Number(n as i32),
-                Id::String(s) => NumberOrString::String(s),
-            },
-        };
-        self.send_notification("$/cancelRequest", Some(serde_json::to_value(cancel_params)?))
+        self.send_notification("$/cancelRequest", Some(json!({"id":id})))
             .await
     }
 
     /// Sends a typed request and deserializes the typed response.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn send_request<P: Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
@@ -258,6 +334,9 @@ impl LspClient {
     }
 
     /// Sends a notification to the language server.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn send_notification(
         &self,
         method: &str,
@@ -275,6 +354,9 @@ impl LspClient {
     }
 
     /// Sends a typed notification to the language server.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn send_typed_notification<P: Serialize>(
         &self,
         method: &str,
@@ -287,46 +369,78 @@ impl LspClient {
     // --- Standard LSP lifecycle methods ---
 
     /// Performs the LSP `initialize` handshake.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult, LspError> {
         self.send_request("initialize", params).await
     }
 
     /// Sends the `initialized` notification.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn initialized(&self) -> Result<(), LspError> {
-        self.send_typed_notification("initialized", InitializedParams {}).await
+        self.send_typed_notification("initialized", InitializedParams {})
+            .await
     }
 
     /// Performs the LSP `shutdown` request.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn shutdown(&self) -> Result<(), LspError> {
         let _: Value = self.send_request("shutdown", ()).await?;
         Ok(())
     }
 
     /// Sends the LSP `exit` notification.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn exit(&self) -> Result<(), LspError> {
         self.send_notification("exit", None).await
     }
 
     // --- Standard LSP text document synchronization ---
 
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn did_open(&self, params: DidOpenTextDocumentParams) -> Result<(), LspError> {
-        self.send_typed_notification("textDocument/didOpen", params).await
+        self.send_typed_notification("textDocument/didOpen", params)
+            .await
     }
 
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn did_change(&self, params: DidChangeTextDocumentParams) -> Result<(), LspError> {
-        self.send_typed_notification("textDocument/didChange", params).await
+        self.send_typed_notification("textDocument/didChange", params)
+            .await
     }
 
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn did_save(&self, params: DidSaveTextDocumentParams) -> Result<(), LspError> {
-        self.send_typed_notification("textDocument/didSave", params).await
+        self.send_typed_notification("textDocument/didSave", params)
+            .await
     }
 
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn did_close(&self, params: DidCloseTextDocumentParams) -> Result<(), LspError> {
-        self.send_typed_notification("textDocument/didClose", params).await
+        self.send_typed_notification("textDocument/didClose", params)
+            .await
     }
 
     // --- Language features ---
 
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn completion(
         &self,
         params: CompletionParams,
@@ -334,6 +448,9 @@ impl LspClient {
         self.send_request("textDocument/completion", params).await
     }
 
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn resolve_completion_item(
         &self,
         item: CompletionItem,
@@ -341,10 +458,16 @@ impl LspClient {
         self.send_request("completionItem/resolve", item).await
     }
 
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn hover(&self, params: HoverParams) -> Result<Option<Hover>, LspError> {
         self.send_request("textDocument/hover", params).await
     }
 
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn goto_definition(
         &self,
         params: GotoDefinitionParams,
@@ -352,6 +475,9 @@ impl LspClient {
         self.send_request("textDocument/definition", params).await
     }
 
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn references(
         &self,
         params: ReferenceParams,
@@ -359,6 +485,9 @@ impl LspClient {
         self.send_request("textDocument/references", params).await
     }
 
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn formatting(
         &self,
         params: DocumentFormattingParams,
@@ -366,13 +495,20 @@ impl LspClient {
         self.send_request("textDocument/formatting", params).await
     }
 
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn range_formatting(
         &self,
         params: DocumentRangeFormattingParams,
     ) -> Result<Option<Vec<TextEdit>>, LspError> {
-        self.send_request("textDocument/rangeFormatting", params).await
+        self.send_request("textDocument/rangeFormatting", params)
+            .await
     }
 
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn code_action(
         &self,
         params: CodeActionParams,
@@ -380,13 +516,20 @@ impl LspClient {
         self.send_request("textDocument/codeAction", params).await
     }
 
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn document_symbol(
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>, LspError> {
-        self.send_request("textDocument/documentSymbol", params).await
+        self.send_request("textDocument/documentSymbol", params)
+            .await
     }
 
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn workspace_symbols(
         &self,
         query: &str,

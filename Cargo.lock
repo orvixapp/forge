@@ -1953,11 +1953,13 @@ dependencies = [
  "anyhow",
  "forge-buffer",
  "forge-git",
+ "forge-lsp",
  "forge-mcp",
  "forge-project",
  "forge-search",
  "forge-syntax",
  "gpui",
+ "lsp-types",
  "proto-acp",
  "proto-ipc",
  "ropey",
@@ -1971,6 +1973,7 @@ dependencies = [
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -1981,6 +1984,7 @@ dependencies = [
  "forge-buffer",
  "lsp-types",
  "ropey",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",

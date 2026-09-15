@@ -78,11 +78,17 @@ pub enum Message {
 }
 
 impl Message {
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub fn parse(raw: &[u8]) -> Result<Self, serde_json::Error> {
         let value: Value = serde_json::from_slice(raw)?;
         Self::from_value(value)
     }
 
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub fn from_value(value: Value) -> Result<Self, serde_json::Error> {
         let has_id = value.get("id").is_some();
         let has_method = value.get("method").is_some();
@@ -96,6 +102,9 @@ impl Message {
         }
     }
 
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         match self {
             Message::Request(req) => serde_json::to_vec(req),
@@ -108,7 +117,6 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn test_parse_request() {
@@ -140,7 +148,8 @@ mod tests {
 
     #[test]
     fn test_parse_response_error() {
-        let raw = br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#;
+        let raw =
+            br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#;
         let msg = Message::parse(raw).unwrap();
         match msg {
             Message::Response(res) => {

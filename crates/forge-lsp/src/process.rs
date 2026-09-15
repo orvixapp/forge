@@ -5,7 +5,10 @@ use crate::client::{LspClient, LspError};
 use crate::diagnostics::DiagnosticStore;
 use crate::registry::ServerConfig;
 use crate::sync::{DocumentTracker, TrackedDocument, path_to_uri};
-use lsp_types::*;
+use lsp_types::{
+    ClientInfo, DidOpenTextDocumentParams, InitializeParams, PublishDiagnosticsParams,
+    ServerCapabilities, TextDocumentItem, Uri, WorkDoneProgressParams, WorkspaceFolder,
+};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -39,13 +42,19 @@ pub struct ServerInstance {
 }
 
 impl ServerInstance {
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub fn new(
         config: ServerConfig,
         root_path: PathBuf,
         diagnostics: DiagnosticStore,
     ) -> Result<Self, LspError> {
         let root_uri = path_to_uri(&root_path).ok_or_else(|| {
-            LspError::Channel(format!("Failed to convert path to URI: {root_path:?}"))
+            LspError::Channel(format!(
+                "Failed to convert path to URI: {}",
+                root_path.display()
+            ))
         })?;
 
         Ok(Self {
@@ -92,72 +101,9 @@ impl ServerInstance {
         self.status == ServerStatus::Running && self.last_activity.elapsed() >= idle_timeout
     }
 
-    /// Spawns and initializes the server, performing handshake and re-syncing any open files.
-    pub async fn start(&mut self) -> Result<(), LspError> {
-        self.status = ServerStatus::Starting;
-        info!(
-            "Starting LSP server '{}' at {:?}",
-            self.config.name, self.root_path
-        );
-
-        let mut cmd = Command::new(&self.config.command);
-        cmd.args(&self.config.args)
-            .envs(&self.config.env)
-            .current_dir(&self.root_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = cmd.spawn().map_err(|e| {
-            self.status = ServerStatus::Crashed;
-            LspError::Transport(crate::transport::TransportError::Io(e))
-        })?;
-
-        let stdin = child.stdin.take().expect("Failed to open child stdin");
-        let stdout = child.stdout.take().expect("Failed to open child stdout");
-        let stderr = child.stderr.take().expect("Failed to open child stderr");
-
-        let server_name = self.config.name.clone();
-        // Background task to log stderr lines
-        tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let mut reader = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                debug!("[LSP stderr: {server_name}] {line}");
-            }
-        });
-
-        let client = LspClient::new(stdout, stdin);
-
-        // Subscribe to diagnostics notifications
-        let mut notif_rx = client.subscribe_notifications();
-        let diag_store = self.diagnostics.clone();
-        let server_name_diag = self.config.name.clone();
-        tokio::spawn(async move {
-            while let Ok(notif) = notif_rx.recv().await {
-                if notif.method == "textDocument/publishDiagnostics" {
-                    if let Some(params_val) = notif.params {
-                        match serde_json::from_value::<PublishDiagnosticsParams>(params_val) {
-                            Ok(params) => {
-                                trace!(
-                                    "[{server_name_diag}] publishDiagnostics for {}: {} items",
-                                    params.uri.as_str(),
-                                    params.diagnostics.len()
-                                );
-                                diag_store.update(params.uri, params.version, params.diagnostics);
-                            }
-                            Err(e) => {
-                                warn!("[{server_name_diag}] Malformed publishDiagnostics params: {e}");
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        // Initialize handshake
-        #[allow(deprecated)]
-        let init_params = InitializeParams {
+    #[allow(deprecated)]
+    fn initialize_params(&self) -> InitializeParams {
+        InitializeParams {
             process_id: Some(std::process::id()),
             root_path: Some(self.root_path.to_string_lossy().into_owned()),
             root_uri: Some(self.root_uri.clone()),
@@ -179,7 +125,54 @@ impl ServerInstance {
             }),
             locale: None,
             work_done_progress_params: WorkDoneProgressParams::default(),
-        };
+        }
+    }
+
+    /// Spawns and initializes the server, performing handshake and re-syncing any open files.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
+    pub async fn start(&mut self) -> Result<(), LspError> {
+        self.status = ServerStatus::Starting;
+        info!(
+            "Starting LSP server '{}' at {:?}",
+            self.config.name, self.root_path
+        );
+
+        let mut cmd = Command::new(&self.config.command);
+        cmd.args(&self.config.args)
+            .envs(&self.config.env)
+            .current_dir(&self.root_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = cmd.spawn().map_err(|e| {
+            self.status = ServerStatus::Crashed;
+            LspError::Transport(crate::transport::TransportError::Io(e))
+        })?;
+
+        let stdin = child.stdin.take().ok_or(LspError::Closed)?;
+        let stdout = child.stdout.take().ok_or(LspError::Closed)?;
+        let stderr = child.stderr.take().ok_or(LspError::Closed)?;
+
+        let server_name = self.config.name.clone();
+        // Background task to log stderr lines
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                debug!("[LSP stderr: {server_name}] {line}");
+            }
+        });
+
+        let client = LspClient::new(stdout, stdin);
+
+        self.watch_diagnostics(&client);
+
+        // Initialize handshake
+        let init_params = self.initialize_params();
 
         let init_result = match client.initialize(init_params).await {
             Ok(res) => res,
@@ -190,9 +183,61 @@ impl ServerInstance {
             }
         };
 
-        client.initialized().await?;
+        if init_result
+            .capabilities
+            .position_encoding
+            .as_ref()
+            .is_some_and(|encoding| encoding != &lsp_types::PositionEncodingKind::UTF16)
+        {
+            self.status = ServerStatus::Crashed;
+            return Err(LspError::Channel(
+                "Server selected unsupported position encoding".into(),
+            ));
+        }
         self.server_capabilities = Some(init_result.capabilities);
+        client.initialized().await?;
+        self.client = Some(client);
+        self.child = Some(child);
+        self.status = ServerStatus::Running;
+        self.last_activity = Instant::now();
+        self.resync_documents().await?;
+        Ok(())
+    }
 
+    fn watch_diagnostics(&self, client: &LspClient) {
+        let mut notif_rx = client.subscribe_notifications();
+        let diag_store = self.diagnostics.clone();
+        let server_name_diag = self.config.name.clone();
+        tokio::spawn(async move {
+            loop {
+                let notif = match notif_rx.recv().await {
+                    Ok(notif) => notif,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if notif.method == "textDocument/publishDiagnostics"
+                    && let Some(params_val) = notif.params
+                {
+                    match serde_json::from_value::<PublishDiagnosticsParams>(params_val) {
+                        Ok(params) => {
+                            trace!(
+                                "[{server_name_diag}] publishDiagnostics for {}: {} items",
+                                params.uri.as_str(),
+                                params.diagnostics.len()
+                            );
+                            diag_store.update(params.uri, params.version, params.diagnostics);
+                        }
+                        Err(e) => {
+                            warn!("[{server_name_diag}] Malformed publishDiagnostics params: {e}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    async fn resync_documents(&self) -> Result<(), LspError> {
+        let client = self.client.as_ref().ok_or(LspError::Closed)?;
         // Re-didOpen any documents previously opened (crash recovery / restart)
         let docs: Vec<TrackedDocument> = {
             let tracker = self.tracker.lock().await;
@@ -213,15 +258,14 @@ impl ServerInstance {
             }
         }
 
-        self.client = Some(client);
-        self.child = Some(child);
-        self.status = ServerStatus::Running;
-        self.last_activity = Instant::now();
         info!("LSP server '{}' is running and ready", self.config.name);
         Ok(())
     }
 
     /// Stops the server gracefully with `shutdown` + `exit`, killing if unresponsive.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn stop(&mut self) -> Result<(), LspError> {
         if self.status != ServerStatus::Running && self.status != ServerStatus::Starting {
             return Ok(());
@@ -230,10 +274,12 @@ impl ServerInstance {
         self.status = ServerStatus::Stopping;
         info!("Stopping LSP server '{}'", self.config.name);
 
-        if let Some(client) = self.client.take() {
+        let client = self.client.take();
+        if let Some(client) = &client {
             // Attempt clean shutdown with timeout
-            let shutdown_res = tokio::time::timeout(Duration::from_secs(2), client.shutdown()).await;
-            if shutdown_res.is_ok() {
+            let shutdown_res =
+                tokio::time::timeout(Duration::from_secs(2), client.shutdown()).await;
+            if matches!(shutdown_res, Ok(Ok(()))) {
                 let _ = client.exit().await;
             }
         }
@@ -246,10 +292,14 @@ impl ServerInstance {
         }
 
         self.status = ServerStatus::Stopped;
+        drop(client);
         Ok(())
     }
 
     /// Checks if the process crashed, and restarts with backoff if needed.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn check_and_recover(&mut self) -> Result<bool, LspError> {
         let is_dead = if let Some(ref mut child) = self.child {
             match child.try_wait() {
@@ -276,10 +326,11 @@ impl ServerInstance {
             let backoff_ms = (200u64 * (1 << self.restart_count.min(5))).min(5000);
             info!(
                 "Recovering LSP server '{}' in {backoff_ms}ms (restart #{})",
-                self.config.name, self.restart_count + 1
+                self.config.name,
+                self.restart_count + 1
             );
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-            self.restart_count += 1;
+            self.restart_count = self.restart_count.saturating_add(1);
             self.start().await?;
             return Ok(true);
         }

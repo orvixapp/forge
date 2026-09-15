@@ -382,6 +382,8 @@ pub enum PromptKind {
     AskAgent,
     /// A step of a settings wizard (`crate::settings::Wizard`).
     Wizard,
+    McpImport(forge_gui::mcp::ImportSource),
+    McpAgents(usize),
 }
 
 /// List picker inside the window; `index` selects an item.
@@ -404,6 +406,12 @@ pub enum PickerKind {
     Theme,
     /// A choice step of a settings wizard.
     Wizard,
+    McpImport,
+    McpImportWarnings,
+    McpServers,
+    McpAction(usize),
+    LspInfo,
+    LspProblems,
 }
 
 /// What a right click landed on; decides the context menu's items.
@@ -430,6 +438,9 @@ pub struct ForgeWindow {
     next_tab_id: u64,
     pub(crate) event_tx: Sender<UiEvent>,
     pub config: Arc<Config>,
+    pub(crate) lsp: Option<crate::lsp::LspService>,
+    pub(crate) lsp_problems: Vec<crate::lsp::Problem>,
+    pub(crate) lsp_navigation: Option<(PathBuf, lsp_types::Position)>,
     pub theme: ThemeColors,
     pub theme_name: String,
     pub focus: FocusHandle,
@@ -490,6 +501,9 @@ impl ForgeWindow {
             active_tab: 0,
             next_tab_id: 1,
             event_tx,
+            lsp: None,
+            lsp_problems: Vec::new(),
+            lsp_navigation: None,
             config: Arc::clone(&factory.config),
             theme,
             theme_name,
@@ -563,9 +577,11 @@ impl ForgeWindow {
                         Err(_) => return,
                     }
                 }
-                match this.update(cx, |view, _| {
+                match this.update(cx, |view, cx| {
                     view.refresh_git_diffs();
-                    view.poll_project_search() | view.poll_syntax()
+                    let changed = view.poll_project_search() | view.poll_syntax();
+                    view.lsp_finish_navigation(cx);
+                    changed
                 }) {
                     Ok(dirty) => changed |= dirty,
                     Err(_) => return,
@@ -965,7 +981,10 @@ impl ForgeWindow {
                 || std::env::temp_dir().join("forge-acp-registry.json"),
                 |directory| directory.join("acp-registry.json"),
             );
-        let mcp_servers = self.mcp_server_entries(&mcp_env);
+        let mcp_servers = (
+            Self::mcp_server_entries(&mcp_env),
+            self.config.mcp_servers.clone(),
+        );
         let (commands, command_rx) = async_mpsc::unbounded_channel();
         let send_now = self.tabs[index]
             .agent()
@@ -1031,7 +1050,7 @@ impl ForgeWindow {
 
     /// `session/new.mcpServers`: Forge itself first (§18), then the user's
     /// servers. The agent connects to them directly; Forge does not proxy.
-    fn mcp_server_entries(&self, mcp_env: &[(String, String)]) -> Vec<serde_json::Value> {
+    fn mcp_server_entries(mcp_env: &[(String, String)]) -> Vec<serde_json::Value> {
         let env_entries = |env: &[(String, String)]| {
             env.iter()
                 .map(|(name, value)| serde_json::json!({"name": name, "value": value}))
@@ -1048,19 +1067,6 @@ impl ForgeWindow {
                 "env": env_entries(mcp_env),
             }));
         }
-        servers.extend(self.config.mcp_servers.iter().map(|server| {
-            let env: Vec<(String, String)> = server
-                .env
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect();
-            serde_json::json!({
-                "name": server.name,
-                "command": server.command,
-                "args": server.args,
-                "env": env_entries(&env),
-            })
-        }));
         servers
     }
 
@@ -1840,6 +1846,8 @@ impl ForgeWindow {
                         }
                     }
                     PromptKind::Wizard => self.wizard_text(&value, cx),
+                    PromptKind::McpImport(source) => self.mcp_import_file(source, &value, cx),
+                    PromptKind::McpAgents(index) => self.mcp_set_agents(index, &value, cx),
                 }
             }
             "backspace" => {
@@ -1898,6 +1906,12 @@ impl ForgeWindow {
                     PickerKind::Settings => self.settings_pick(index, cx),
                     PickerKind::Theme => self.settings_apply_theme(index, cx),
                     PickerKind::Wizard => self.wizard_choice(index, cx),
+                    PickerKind::McpImport => self.mcp_import_source(index, cx),
+                    PickerKind::McpImportWarnings => self.mcp_manage_menu(cx),
+                    PickerKind::McpServers => self.mcp_server_menu(index, cx),
+                    PickerKind::McpAction(server) => self.mcp_server_action(server, index, cx),
+                    PickerKind::LspInfo => {}
+                    PickerKind::LspProblems => self.lsp_problem_pick(index, cx),
                     PickerKind::Provider => {
                         if let (Some(provider), Some((prompt, context))) = (
                             self.config.providers.get(index).cloned(),
@@ -3287,6 +3301,10 @@ impl ForgeWindow {
             ShellCommand::NewTerminalTab => {
                 self.create_terminal_tab(None, cx);
             }
+            ShellCommand::LspHover => self.lsp_feature(crate::lsp::Feature::Hover, cx),
+            ShellCommand::LspDefinition => self.lsp_feature(crate::lsp::Feature::Definition, cx),
+            ShellCommand::LspSignature => self.lsp_feature(crate::lsp::Feature::Signature, cx),
+            ShellCommand::LspDiagnostics => self.lsp_feature(crate::lsp::Feature::Problems, cx),
             ShellCommand::NewAgentSession
             | ShellCommand::AgentAcceptAllHunks
             | ShellCommand::AgentRejectAllHunks

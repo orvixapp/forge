@@ -112,3 +112,31 @@ Pruebas manuales de las entregas ya utilizables: [`PHASE_4_TESTING.md`](PHASE_4_
   Codex con login de ChatGPT sin configuración extra; tarea `trivial`
   atendida por un proveedor `free`. Guion en `PHASE_4_TESTING.md`; requiere
   ejecutar los agentes reales (validación manual del usuario).
+
+## Ampliación 4.6 — Configuración MCP común (2026-09-15)
+
+- [x] Definiciones compartidas por todos los agentes ACP, con `enabled` y
+  lista `agents` por servidor; vacía significa todos. Ajustes (`Ctrl+,`):
+  importar, gestionar activación/acceso y añadir MCP HTTP.
+- [x] Importación explícita desde Claude Code (`.mcp.json` o
+  `~/.claude.json`, incluido el scope local del workspace), Codex
+  (`$CODEX_HOME/config.toml`) y OpenCode (`opencode.json`/`opencode.jsonc`).
+  Solo lectura del origen; imports desactivados, deduplicación por nombre
+  y conexión; comentarios del destino preservados. No se sobrescriben
+  ajustes abiertos con cambios sin guardar.
+- [x] Transporte HTTP en passthrough: comprobación de
+  `agentCapabilities.mcpCapabilities.http` después de `initialize`, HTTPS
+  o HTTP loopback únicamente, sin credenciales en URL. Headers mediante
+  referencias a variables de entorno; aviso en timeline si falta una
+  variable o el agente no anuncia HTTP. Sin proxy ni instalación automática.
+- [x] No importar sesiones OAuth ni almacenes de credenciales. Valores
+  literales en `env`/headers, argumentos con flags de credenciales, SSE y
+  restricciones sin equivalente requieren migración manual y se omiten
+  con aviso seguro. Referencias `${VARIABLE}` y `{env:VARIABLE}` se
+  normalizan; las claves se resuelven únicamente al crear la sesión.
+- [ ] Validación manual con servidores/agentes reales: importación,
+  autorización independiente y herramientas disponibles según allowlist.
+- [ ] Cliente HTTP/OAuth propio de Forge (listar tools/resources/prompts,
+  conectar/desconectar, renovación y almacenamiento seguro). Esta entrega
+  configura conexiones directas del agente; **no implementa** ese cliente
+  ni copia el login de otro CLI. OAuth lo autoriza cada cliente por separado.

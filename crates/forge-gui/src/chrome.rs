@@ -1632,6 +1632,20 @@ fn picker_overlay(
     cx: &mut Context<ForgeWindow>,
 ) -> impl IntoElement {
     let theme = view.theme;
+    if picker.kind == crate::window::PickerKind::LspInfo {
+        return overlay_box(view, "lsp-info")
+            .max_h(px(480.0))
+            .overflow_y_scroll()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(picker.title.clone())
+            .child(agent_markdown(
+                picker.items.first().map_or("", String::as_str),
+                false,
+                theme,
+            ))
+            .child(tr("Esc closes"))
+            .into_any_element();
+    }
     overlay_box(view, "picker")
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(
@@ -1640,36 +1654,45 @@ fn picker_overlay(
                 .text_color(color(theme.foreground))
                 .child(picker.title.clone()),
         )
-        .children(picker.items.iter().enumerate().map(|(index, item)| {
-            let selected = index == picker.index;
-            div()
-                .id(("picker-item", index))
-                .px(px(8.0))
-                .py(px(5.0))
-                .rounded(px(4.0))
-                .cursor_pointer()
-                .hover(move |style| style.bg(color(theme.highlight)))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |view, _, _, cx| {
-                        view.picker_pick(index, cx);
-                        cx.stop_propagation();
-                    }),
-                )
-                .bg(color(if selected {
-                    theme.highlight
-                } else {
-                    theme.chrome_active
-                }))
-                .text_size(px(13.0))
-                .child(item.clone())
-        }))
+        .children(
+            picker
+                .items
+                .iter()
+                .enumerate()
+                .skip(picker.index.saturating_sub(4))
+                .take(9)
+                .map(|(index, item)| {
+                    let selected = index == picker.index;
+                    div()
+                        .id(("picker-item", index))
+                        .px(px(8.0))
+                        .py(px(5.0))
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(color(theme.highlight)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |view, _, _, cx| {
+                                view.picker_pick(index, cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .bg(color(if selected {
+                            theme.highlight
+                        } else {
+                            theme.chrome_active
+                        }))
+                        .text_size(px(13.0))
+                        .child(item.clone())
+                }),
+        )
         .child(
             div()
                 .text_size(px(11.0))
                 .text_color(color(theme.muted))
                 .child(tr("↑↓ select · Enter opens · Esc closes")),
         )
+        .into_any_element()
 }
 
 /// File finder / project search: a query line, a status line and the

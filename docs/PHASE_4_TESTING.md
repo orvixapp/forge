@@ -179,6 +179,43 @@ con `[[agents]]`, indicando su comando ACP y sus argumentos.
    agente lista las tools `forge_*` (`/mcp` en Claude Code, `mcp list` en
    OpenCode).
 
+## MCP común: importación y HTTP
+
+1. `Ctrl+,` → «Importar servidores MCP…» → Claude Code, Codex u OpenCode.
+   Revisar la ruta propuesta; también admite un archivo JSONC o `.mcp.json`
+   seleccionado explícitamente. No se modifica ese archivo.
+2. Los imports están desactivados: «Gestionar servidores MCP…» permite
+   revisarlos y activarlos. Importar de nuevo no crea duplicados ni
+   reemplaza las definiciones existentes. Si hay secretos literales o
+   restricciones sin equivalente, el servidor se omite con un aviso;
+   migrarlo manualmente mediante referencias a variables de entorno.
+3. «Elegir agentes permitidos…»: nombres de `[[agents]]` separados por
+   comas; vacío permite todos. Abrir una sesión nueva para aplicar cambios.
+   La lista es un filtro de las conexiones enviadas **por Forge**, no
+   impide que el CLI cargue sus propios MCP desde su configuración nativa.
+4. «Añadir servidor MCP HTTP…»: nombre `notion`, URL
+   `https://mcp.notion.com/mcp`; revisar y activar después. El agente debe
+   anunciar `mcpCapabilities.http`; si no, el timeline lo indica y omite
+   esa conexión. No se instala `mcp-remote` automáticamente.
+5. OAuth requiere autorización independiente en el cliente/agente que
+   conecta. Forge no tiene todavía botones de login/logout OAuth ni lee
+   los caches de login de otros CLI. Una conexión HTTP no garantiza que
+   el adaptador implemente OAuth: comprobarlo en su documentación.
+6. Tokens opcionales de HTTP se referencian, nunca se pegan en config:
+
+```toml
+[[mcp_servers]]
+name = "remote"
+transport = "http"
+url = "https://example.com/mcp"
+enabled = false
+agents = ["codex", "opencode"] # nombres configurados, case-insensitive
+headers = { Authorization = "Bearer ${MY_MCP_TOKEN}" }
+```
+
+7. Con ajustes abiertos y cambios sin guardar, importar/activar debe
+   pedir guardarlos antes, sin sobrescribir el buffer ni el archivo.
+
 ## Benchmarks (4.6)
 
 ```bash

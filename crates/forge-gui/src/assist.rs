@@ -23,11 +23,51 @@ const MIN_WORD: usize = 3;
 /// budget); the schema still completes.
 const MAX_SCAN_BYTES: usize = 512 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+    Information,
+    Hint,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     /// Char range in the buffer; empty for a missing token.
     pub range: Range<usize>,
     pub message: String,
+    pub severity: DiagnosticSeverity,
+    pub source: Option<String>,
+}
+
+impl Diagnostic {
+    #[must_use]
+    pub fn error(range: Range<usize>, message: impl Into<String>) -> Self {
+        Self {
+            range,
+            message: message.into(),
+            severity: DiagnosticSeverity::Error,
+            source: None,
+        }
+    }
+}
+
+/// Converts an LSP diagnostic to Forge's internal diagnostic structure.
+#[must_use]
+pub fn from_lsp_diagnostic(d: &lsp_types::Diagnostic, rope: &Rope) -> Diagnostic {
+    let range = forge_lsp::sync::lsp_range_to_range(rope, &d.range);
+    let severity = match d.severity {
+        Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
+        Some(lsp_types::DiagnosticSeverity::INFORMATION) => DiagnosticSeverity::Information,
+        Some(lsp_types::DiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
+        _ => DiagnosticSeverity::Error,
+    };
+    Diagnostic {
+        range,
+        message: d.message.clone(),
+        severity,
+        source: d.source.clone(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +75,53 @@ pub struct CompletionItem {
     pub label: String,
     /// Where it comes from: the section for a key, `value`, or `word`.
     pub detail: String,
+    pub insert_text: Option<String>,
+    pub documentation: Option<String>,
+    /// Resolved char-range edits against the response's buffer revision.
+    pub edits: Option<Vec<forge_buffer::Edit>>,
+}
+
+impl CompletionItem {
+    #[must_use]
+    pub fn new(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            detail: detail.into(),
+            insert_text: None,
+            documentation: None,
+            edits: None,
+        }
+    }
+}
+
+/// Converts an LSP completion item to Forge's internal item.
+#[must_use]
+pub fn from_lsp_completion_item(item: &lsp_types::CompletionItem) -> CompletionItem {
+    let detail = item.detail.clone().unwrap_or_else(|| match item.kind {
+        Some(lsp_types::CompletionItemKind::FUNCTION) => "fn".to_string(),
+        Some(lsp_types::CompletionItemKind::METHOD) => "method".to_string(),
+        Some(lsp_types::CompletionItemKind::VARIABLE) => "var".to_string(),
+        Some(lsp_types::CompletionItemKind::FIELD) => "field".to_string(),
+        Some(lsp_types::CompletionItemKind::CLASS | lsp_types::CompletionItemKind::STRUCT) => {
+            "type".to_string()
+        }
+        Some(lsp_types::CompletionItemKind::INTERFACE) => "trait".to_string(),
+        Some(lsp_types::CompletionItemKind::MODULE) => "mod".to_string(),
+        Some(lsp_types::CompletionItemKind::KEYWORD) => "keyword".to_string(),
+        Some(lsp_types::CompletionItemKind::SNIPPET) => "snippet".to_string(),
+        _ => "lsp".to_string(),
+    });
+    let documentation = item.documentation.as_ref().map(|doc| match doc {
+        lsp_types::Documentation::String(s) => s.clone(),
+        lsp_types::Documentation::MarkupContent(m) => m.value.clone(),
+    });
+    CompletionItem {
+        label: item.label.clone(),
+        detail,
+        insert_text: item.insert_text.clone(),
+        documentation,
+        edits: None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -158,10 +245,7 @@ pub fn syntax_diagnostics(state: &SyntaxState, rope: &Rope) -> Vec<Diagnostic> {
                 Some(expected) => format!("syntax: missing {expected}"),
                 None => "syntax error".to_owned(),
             };
-            Diagnostic {
-                range: start..end.max(start),
-                message,
-            }
+            Diagnostic::error(start..end.max(start), message)
         })
         .collect()
 }
@@ -184,10 +268,7 @@ pub fn config_diagnostics(text: &str, rope: &Rope) -> Vec<Diagnostic> {
         .unwrap_or("invalid configuration")
         .trim()
         .to_owned();
-    vec![Diagnostic {
-        range: start..end.max(start),
-        message,
-    }]
+    vec![Diagnostic::error(start..end.max(start), message)]
 }
 
 fn is_word_char(c: char) -> bool {
@@ -231,10 +312,7 @@ pub fn complete(
             .into_iter()
             .flat_map(language_keywords)
             .filter(|keyword| matches(keyword))
-            .map(|keyword| CompletionItem {
-                label: (*keyword).to_owned(),
-                detail: "keyword".to_owned(),
-            }),
+            .map(|keyword| CompletionItem::new(*keyword, "keyword")),
     );
     if let Some(hints) = hints {
         // Before `=` on the line a key is being typed; after it, a value.
@@ -247,20 +325,19 @@ pub fn complete(
                     .values
                     .iter()
                     .filter(|value| matches(value))
-                    .map(|value| CompletionItem {
-                        label: value.clone(),
-                        detail: "value".to_owned(),
-                    }),
+                    .map(|value| CompletionItem::new(value.clone(), "value")),
             );
         } else {
             items.extend(hints.keys.iter().filter(|(key, _)| matches(key)).map(
-                |(key, section)| CompletionItem {
-                    label: key.clone(),
-                    detail: if section.is_empty() {
-                        "key".to_owned()
-                    } else {
-                        format!("[{section}]")
-                    },
+                |(key, section)| {
+                    CompletionItem::new(
+                        key.clone(),
+                        if section.is_empty() {
+                            "key".to_owned()
+                        } else {
+                            format!("[{section}]")
+                        },
+                    )
                 },
             ));
         }
@@ -277,10 +354,11 @@ pub fn complete(
                 words.insert(word.to_owned());
             }
         }
-        items.extend(words.into_iter().map(|label| CompletionItem {
-            label,
-            detail: "word".to_owned(),
-        }));
+        items.extend(
+            words
+                .into_iter()
+                .map(|label| CompletionItem::new(label, "word")),
+        );
     }
     // Exact-case prefix matches first, then the rest, stable otherwise.
     items.sort_by_key(|item| !item.label.starts_with(&prefix));

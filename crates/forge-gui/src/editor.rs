@@ -98,6 +98,9 @@ pub struct EditorTab {
     config_checked: Option<u64>,
     /// Open completion popup.
     pub completion: Option<Completion>,
+    pub(crate) lsp_handle: Option<crate::lsp::LspHandle>,
+    pub(crate) lsp_diagnostics: Vec<Diagnostic>,
+    pub(crate) lsp_counts: (usize, usize, usize),
 }
 
 /// Edits settle this long before a Forge config file is re-validated.
@@ -202,6 +205,9 @@ impl EditorTab {
             diagnostics_generation: None,
             config_checked: None,
             completion: None,
+            lsp_handle: None,
+            lsp_diagnostics: Vec::new(),
+            lsp_counts: (0, 0, 0),
         }
     }
 
@@ -510,6 +516,7 @@ impl EditorTab {
         self.syntax_diagnostics
             .iter()
             .chain(self.config_diagnostics.iter())
+            .chain(self.lsp_diagnostics.iter())
     }
 
     /// Schema hints when this buffer is a Forge config file.
@@ -529,6 +536,14 @@ impl EditorTab {
         let language = self.syntax.as_ref().map(SyntaxState::language_name);
         self.completion =
             crate::assist::complete(&rope, cursor, explicit, self.schema_hints(), language);
+        if let Some(handle) = &self.lsp_handle {
+            handle.request(
+                crate::lsp::Feature::Completion,
+                self.buffer.version(),
+                cursor,
+                rope,
+            );
+        }
     }
 
     /// Inserts the rest of the selected item and closes the popup.
@@ -539,6 +554,13 @@ impl EditorTab {
         let Some(item) = completion.selected() else {
             return false;
         };
+        if let Some(edits) = &item.edits {
+            let changed = self.buffer.edit(edits.clone(), false).is_ok();
+            if changed {
+                self.sync_syntax();
+            }
+            return changed;
+        }
         let suffix = item
             .label
             .get(completion.prefix.len()..)
@@ -557,6 +579,8 @@ impl EditorTab {
     /// time for autosave; every mutation ends up here. The UI tree shifts
     /// immediately, the reparse arrives through [`Self::poll_syntax`].
     pub fn sync_syntax(&mut self) {
+        self.lsp_diagnostics.clear();
+        self.lsp_counts = (0, 0, 0);
         self.last_edit = Instant::now();
         let Some(state) = &mut self.syntax else {
             return;
@@ -638,9 +662,14 @@ impl EditorTab {
         if self.buffer.is_dirty() {
             parts.push(tr("● unsaved").into());
         }
-        let errors = self.diagnostics().count();
-        if errors > 0 {
+        let errors =
+            self.syntax_diagnostics.len() + self.config_diagnostics.len() + self.lsp_counts.0;
+        let warnings = self.lsp_counts.1;
+        if errors + warnings > 0 {
             parts.push(trf("⚠ {} errors", &[&errors]));
+            if warnings > 0 {
+                parts.push(format!("⚠ {warnings} warnings"));
+            }
             // The message of the error under the cursor, VS Code style.
             let head = self.buffer.selections().primary().head;
             let line = self.buffer.position_of(head).line;
@@ -1232,9 +1261,9 @@ fn paint_editor(
         .map_or_else(Vec::new, |state| state.highlights(&rope, first..last_line));
     let spans_for =
         |line: usize| -> &[Span] { highlights.get(line - first).map_or(&[][..], Vec::as_slice) };
-    let diagnostics: Vec<Range<usize>> = editor
+    let diagnostics: Vec<_> = editor
         .diagnostics()
-        .map(|diagnostic| diagnostic.range.clone())
+        .map(|diagnostic| (diagnostic.range.clone(), diagnostic.severity))
         .collect();
     // Where the completion popup hangs from: the prefix start on the
     // primary cursor's row, filled in while painting that row.
@@ -1337,7 +1366,7 @@ fn paint_editor(
                 let _ = shaped.paint(point(x_origin, y), line_height, window, cx);
                 // Red underline where the grammar (or the config) objects;
                 // a zero-width diagnostic still gets one cell.
-                for range in &diagnostics {
+                for (range, severity) in &diagnostics {
                     if range.start > row_end || range.end < row_start {
                         continue;
                     }
@@ -1345,13 +1374,28 @@ fn paint_editor(
                     let to = range.end.min(row_end) - row_start;
                     let x0 = x_of(from);
                     let x1 = x_of(to).max(x0 + px(paint.metrics.width));
+                    let color = match severity {
+                        crate::assist::DiagnosticSeverity::Error => paint.diagnostic,
+                        crate::assist::DiagnosticSeverity::Warning => gpui::rgb(0xd7ad65).into(),
+                        crate::assist::DiagnosticSeverity::Information
+                        | crate::assist::DiagnosticSeverity::Hint => paint.gutter,
+                    };
                     window.paint_quad(fill(
                         Bounds::new(
                             point(x_origin + x0, y + line_height - px(2.0)),
                             size(x1 - x0, px(2.0)),
                         ),
-                        paint.diagnostic,
+                        color,
                     ));
+                    if row.first {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(bounds.origin.x + px(2.0), y + px(4.0)),
+                                size(px(3.0), line_height - px(8.0)),
+                            ),
+                            color,
+                        ));
+                    }
                 }
                 for selection in selections.iter() {
                     let head = selection.head;
@@ -2084,7 +2128,7 @@ impl ForgeWindow {
     /// due. Called from the frame-rate poll loop.
     pub fn poll_syntax(&mut self) -> bool {
         // Every tab is polled (no short circuit) so no tree stays queued.
-        let mut changed = false;
+        let mut changed = self.poll_lsp();
         for editor in self.tabs.iter_mut().filter_map(Tab::editor_mut) {
             changed |= editor.poll_syntax();
         }

@@ -125,12 +125,69 @@ fn spanish(english: &str) -> Option<&'static str> {
         "Close tab" => "Cerrar pestaña",
         // ----- settings menu ---------------------------------------------
         "Settings" => "Ajustes",
+        "Show symbol documentation" => "Mostrar documentación del símbolo",
+        "Go to definition" => "Ir a definición",
+        "Show signature help" => "Mostrar ayuda de firma",
+        "Show language diagnostics" => "Mostrar diagnósticos del lenguaje",
+        "Language server" => "Servidor de lenguaje",
+        "Diagnostics (up to 1000)" => "Diagnósticos (hasta 1000)",
+        "Esc closes" => "Esc cierra",
         "Open user settings (config.toml)" => "Abrir ajustes de usuario (config.toml)",
         "Open workspace settings (.forge/config.toml)" => {
             "Abrir ajustes del workspace (.forge/config.toml)"
         }
         "Add provider…" => "Añadir proveedor…",
         "Add agent…" => "Añadir agente…",
+        "Import MCP servers…" => "Importar servidores MCP…",
+        "Manage MCP servers…" => "Gestionar servidores MCP…",
+        "Add HTTP MCP server…" => "Añadir servidor MCP HTTP…",
+        "MCP server name" => "Nombre del servidor MCP",
+        "MCP HTTPS URL (OAuth is authorized separately in each agent)" => {
+            "URL HTTPS del MCP (OAuth se autoriza por separado en cada agente)"
+        }
+        "Invalid or duplicate MCP server — use HTTPS and a unique name" => {
+            "Servidor MCP inválido o duplicado — usa HTTPS y un nombre único"
+        }
+        "Import MCP definitions only — no credentials" => {
+            "Importar solo definiciones MCP — sin credenciales"
+        }
+        "MCP configuration file from {}" => "Archivo de configuración MCP de {}",
+        "MCP: {} imported (disabled), {} duplicates, {} skipped. Review in settings." => {
+            "MCP: {} importados (desactivados), {} duplicados, {} omitidos. Revisar en ajustes."
+        }
+        "MCP import warnings — no credentials copied" => {
+            "Avisos de importación MCP — sin copiar credenciales"
+        }
+        "All agents" => "Todos los agentes",
+        "Enabled" => "Activado",
+        "Disabled" => "Desactivado",
+        "Edit MCP definitions in user settings…" => {
+            "Editar definiciones MCP en ajustes de usuario…"
+        }
+        "MCP servers — changes apply to new sessions" => {
+            "Servidores MCP — cambios para sesiones nuevas"
+        }
+        "Disable server" => "Desactivar servidor",
+        "Enable server (starts a process or connects remotely)" => {
+            "Activar servidor (inicia un proceso o conecta remotamente)"
+        }
+        "Choose allowed agents…" => "Elegir agentes permitidos…",
+        "Allowed agent names, comma separated (empty = all)" => {
+            "Nombres de agentes separados por comas (vacío = todos)"
+        }
+        "Unknown agent name — add it in settings first" => {
+            "Agente desconocido — añádelo primero en ajustes"
+        }
+        "MCP settings saved — open a new agent session" => {
+            "Ajustes MCP guardados — abre una sesión nueva del agente"
+        }
+        "MCP server no longer exists — reopen settings" => {
+            "El servidor MCP ya no existe — vuelve a abrir ajustes"
+        }
+        "Save or discard unsaved settings before using a wizard" => {
+            "Guarda o descarta los ajustes sin guardar antes de usar el asistente"
+        }
+        "Cannot read user settings" => "No se pueden leer los ajustes de usuario",
         "Choose theme…" => "Elegir tema…",
         "Language: Español" => "Idioma: Español",
         "Language: English" => "Idioma: English",

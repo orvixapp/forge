@@ -39,6 +39,7 @@ pub const WORKSPACE_FORBIDDEN_KEYS: &[&[&str]] = &[
     &["providers"],
     &["router"],
     &["mcp_servers"],
+    &["languages"],
 ];
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, JsonSchema)]
@@ -64,6 +65,29 @@ pub struct Config {
     /// MCP servers handed to agents in `session/new` (§18). User layer only:
     /// a repository must not make Forge start executables.
     pub mcp_servers: Vec<McpServerConfig>,
+    pub lsp: LspConfig,
+    /// User-only language/server overrides; never execute repo-supplied commands.
+    pub languages: Vec<forge_lsp::LanguageDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct LspConfig {
+    pub enabled: bool,
+    pub debounce_ms: u64,
+    pub startup_ms: u64,
+    pub idle_shutdown_secs: u64,
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            debounce_ms: 75,
+            startup_ms: 500,
+            idle_shutdown_secs: 1800,
+        }
+    }
 }
 
 /// A model provider: how an agent should reach a model, expressed as the
@@ -192,13 +216,45 @@ impl RouterConfig {
 }
 
 /// An MCP server the agent connects to directly (ACP `session/new`).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpServerConfig {
     pub name: String,
+    pub transport: McpTransport,
     pub command: String,
     pub args: Vec<String>,
     pub env: std::collections::BTreeMap<String, String>,
+    /// Streamable HTTP endpoint (HTTPS, or HTTP on loopback only).
+    pub url: String,
+    /// Header values expressed as `${ENV_VAR}` references, never tokens.
+    pub headers: std::collections::BTreeMap<String, String>,
+    pub enabled: bool,
+    /// Empty means all agents; otherwise matches configured agent names.
+    pub agents: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    Http,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            transport: McpTransport::Stdio,
+            command: String::new(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            url: String::new(),
+            headers: std::collections::BTreeMap::new(),
+            enabled: true,
+            agents: Vec::new(),
+        }
+    }
 }
 
 impl ProviderConfig {

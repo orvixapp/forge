@@ -8,10 +8,12 @@ license.workspace = true
 anyhow.workspace = true
 forge-buffer = { path = "../forge-buffer" }
 forge-git = { path = "../forge-git" }
+forge-lsp = { path = "../forge-lsp" }
 forge-mcp = { path = "../forge-mcp" }
 forge-project = { path = "../forge-project" }
 forge-search = { path = "../forge-search" }
 forge-syntax = { path = "../forge-syntax" }
+lsp-types.workspace = true
 ropey.workspace = true
 gpui.workspace = true
 proto-ipc = { path = "../proto-ipc" }
@@ -23,6 +25,7 @@ thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
 toml_edit = "0.22"
+url.workspace = true
 tracing.workspace = true
 tracing-chrome = "0.7"
 tracing-subscriber.workspace = true

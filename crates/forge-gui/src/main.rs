@@ -5,6 +5,8 @@ mod chrome;
 mod editor;
 mod grid_element;
 mod ipc;
+mod lsp;
+mod mcp_settings;
 mod project;
 mod search;
 mod settings;

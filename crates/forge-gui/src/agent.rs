@@ -382,6 +382,16 @@ impl AgentTab {
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         match kind {
+            "forge_mcp_notice" => self.timeline.push(TimelineItem::Plan {
+                title: "MCP".into(),
+                entries: vec![
+                    update
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .into(),
+                ],
+            }),
             "available_commands_update" => {
                 self.available_commands = update
                     .get("availableCommands")
@@ -582,11 +592,41 @@ fn acp_content_text(value: &Value) -> String {
     }
 }
 
+fn session_mcp_servers(
+    configured: &(Vec<Value>, Vec<forge_gui::config::McpServerConfig>),
+    agent: &str,
+    capabilities: &Value,
+    events: &Sender<UiEvent>,
+    tab_id: u64,
+) -> Vec<Value> {
+    let mut servers = configured.0.clone();
+    for server in &configured.1 {
+        match forge_gui::mcp::acp_entry(server, agent, capabilities, |name| {
+            std::env::var(name).ok()
+        }) {
+            Ok(Some(entry)) if !servers.iter().any(|old| old["name"] == entry["name"]) => {
+                servers.push(entry);
+            }
+            Ok(_) => {}
+            Err(reason) => {
+                let _ = events.send(UiEvent::AgentEvent { tab_id, event: AcpEvent::SessionUpdate {
+                    session_id: None,
+                    update: serde_json::json!({"sessionUpdate":"forge_mcp_notice", "text":format!("MCP {}: {}", server.name, reason)}),
+                }});
+            }
+        }
+    }
+    servers
+}
+
 pub fn spawn_agent_worker(
     definition: Option<AgentDefinition>,
     registry_cache: PathBuf,
     workspace: PathBuf,
-    mcp_servers: Vec<serde_json::Value>,
+    mcp_servers: (
+        Vec<serde_json::Value>,
+        Vec<forge_gui::config::McpServerConfig>,
+    ),
     tab_id: u64,
     events: Sender<UiEvent>,
     mut commands: async_mpsc::UnboundedReceiver<AgentCommand>,
@@ -624,16 +664,17 @@ pub fn spawn_agent_worker(
                     };
                     let client = process.client.clone();
                     let initialized = client.initialize("Forge", env!("CARGO_PKG_VERSION")).await;
-                    if let Err(error) = initialized {
+                    if let Err(error) = &initialized {
                         let _ = events.send(UiEvent::AgentStatus { tab_id, status: trf("ACP initialize failed: {}", &[&error]) });
-                    } else {
+                    } else if let Ok(capabilities) = initialized {
+                        let session_servers = session_mcp_servers(&mcp_servers, &definition.name, &capabilities.agent_capabilities, &events, tab_id);
                         if let Some(method) = &definition.auth_method { let _ = client.authenticate(method).await; }
                         let session = match previous_session.as_deref() {
-                            Some(id) => match client.load_session(id, &workspace, mcp_servers.clone()).await {
+                            Some(id) => match client.load_session(id, &workspace, session_servers.clone()).await {
                                 Ok(session) => Ok(session),
-                                Err(_) => client.new_session(&workspace, mcp_servers.clone()).await,
+                                Err(_) => client.new_session(&workspace, session_servers.clone()).await,
                             },
-                            None => client.new_session(&workspace, mcp_servers.clone()).await,
+                            None => client.new_session(&workspace, session_servers).await,
                         };
                         match session {
                             Ok(session) => {
@@ -699,6 +740,64 @@ fn discover_agent(cache: &std::path::Path) -> Option<AgentDefinition> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn mcp_passthrough_filters_and_surfaces_connection_failures() {
+        use forge_gui::config::{McpServerConfig, McpTransport};
+        let configured = (
+            vec![json!({"name":"forge", "command":"forge-gui", "args":["mcp-server"], "env":[]})],
+            vec![
+                McpServerConfig {
+                    name: "shared".into(),
+                    command: "node".into(),
+                    ..Default::default()
+                },
+                McpServerConfig {
+                    name: "private".into(),
+                    command: "node".into(),
+                    agents: vec!["Claude".into()],
+                    ..Default::default()
+                },
+                McpServerConfig {
+                    name: "remote".into(),
+                    transport: McpTransport::Http,
+                    url: "https://mcp.notion.com/mcp".into(),
+                    ..Default::default()
+                },
+            ],
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let entries = session_mcp_servers(&configured, "Codex", &json!({}), &tx, 42);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["forge", "shared"]
+        );
+        let UiEvent::AgentEvent {
+            tab_id,
+            event: AcpEvent::SessionUpdate { update, .. },
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected MCP notice");
+        };
+        assert_eq!(tab_id, 42);
+        let mut tab = AgentTab::new("Codex", PathBuf::from("."));
+        tab.apply_update(&update);
+        assert!(
+            matches!(&tab.timeline[0], TimelineItem::Plan { title, entries } if title == "MCP" && entries[0].contains("HTTP support"))
+        );
+        let entries = session_mcp_servers(
+            &configured,
+            "Codex",
+            &json!({"mcpCapabilities":{"http":true}}),
+            &tx,
+            42,
+        );
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2]["type"], "http");
+    }
 
     #[test]
     fn coalesces_streaming_chunks() {

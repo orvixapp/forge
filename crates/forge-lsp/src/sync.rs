@@ -2,7 +2,11 @@
 //! and incremental transaction-to-didChange translation.
 
 use forge_buffer::Edit;
-use lsp_types::*;
+use lsp_types::{
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, Position, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, Uri, VersionedTextDocumentIdentifier,
+};
 use ropey::Rope;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -34,8 +38,8 @@ pub fn offset_to_position(rope: &Rope, char_offset: usize) -> Position {
     let utf16_col: usize = line_slice.chars().map(char::len_utf16).sum();
 
     Position {
-        line: line as u32,
-        character: utf16_col as u32,
+        line: u32::try_from(line).unwrap_or(u32::MAX),
+        character: u32::try_from(utf16_col).unwrap_or(u32::MAX),
     }
 }
 
@@ -55,7 +59,7 @@ pub fn position_to_offset(rope: &Rope, pos: Position) -> usize {
     let mut chars_count = 0;
 
     for c in line_slice.chars() {
-        if current_utf16 >= target_utf16 {
+        if c == '\n' || c == '\r' || current_utf16 + c.len_utf16() > target_utf16 {
             break;
         }
         current_utf16 += c.len_utf16();
@@ -108,7 +112,7 @@ pub fn transaction_to_changes(
             #[allow(deprecated)]
             TextDocumentContentChangeEvent {
                 range: Some(lsp_range),
-                range_length: Some(utf16_len as u32),
+                range_length: u32::try_from(utf16_len).ok(),
                 text: edit.text.clone(),
             }
         })
@@ -143,7 +147,17 @@ impl DocumentTracker {
         language_id: String,
         text: String,
     ) -> DidOpenTextDocumentParams {
-        let version = 1;
+        self.did_open_versioned(uri, language_id, text, 1)
+    }
+
+    /// Registers the actual live buffer revision, including unsaved files.
+    pub fn did_open_versioned(
+        &mut self,
+        uri: Uri,
+        language_id: String,
+        text: String,
+        version: i32,
+    ) -> DidOpenTextDocumentParams {
         let item = TextDocumentItem {
             uri: uri.clone(),
             language_id: language_id.clone(),
@@ -199,7 +213,7 @@ impl DocumentTracker {
         let doc = self.documents.get_mut(uri)?;
         doc.version += 1;
         let version = doc.version;
-        doc.text = new_text.clone();
+        doc.text.clone_from(&new_text);
 
         Some(DidChangeTextDocumentParams {
             text_document: VersionedTextDocumentIdentifier {
@@ -241,6 +255,13 @@ impl DocumentTracker {
         self.documents.get(uri).map(|doc| doc.version)
     }
 
+    /// Sets a real buffer revision after coalescing multiple transactions.
+    pub fn set_version(&mut self, uri: &Uri, version: i32) {
+        if let Some(doc) = self.documents.get_mut(uri) {
+            doc.version = version;
+        }
+    }
+
     #[must_use]
     pub fn is_open(&self, uri: &Uri) -> bool {
         self.documents.contains_key(uri)
@@ -272,22 +293,33 @@ mod tests {
 
     #[test]
     fn test_utf16_position_multibyte_and_emoji() {
+        // "añó 🦀!\nend"
+        // 0: 'a'  (utf16: 0..1)
+        // 1: 'ñ'  (utf16: 1..2)
+        // 2: 'ó'  (utf16: 2..3)
+        // 3: ' '  (utf16: 3..4)
+        // 4: '🦀' (utf16: 4..6)
+        // 5: '!'  (utf16: 6..7)
+        // 6: '\n'
+        // 7: 'e'  (line 1, col 0)
+        // 8: 'n'  (line 1, col 1)
+        // 9: 'd'  (line 1, col 2)
         let text = "añó 🦀!\nend";
         let rope = Rope::from_str(text);
 
-        let pos_exclamation = offset_to_position(&rope, 6);
+        let pos_exclamation = offset_to_position(&rope, 5);
         assert_eq!(pos_exclamation.line, 0);
         assert_eq!(pos_exclamation.character, 6);
 
         let back_offset = position_to_offset(&rope, pos_exclamation);
-        assert_eq!(back_offset, 6);
+        assert_eq!(back_offset, 5);
 
-        let pos_end = offset_to_position(&rope, 9);
+        let pos_end = offset_to_position(&rope, 8);
         assert_eq!(pos_end.line, 1);
         assert_eq!(pos_end.character, 1);
 
         let back_end = position_to_offset(&rope, pos_end);
-        assert_eq!(back_end, 9);
+        assert_eq!(back_end, 8);
     }
 
     #[test]
@@ -296,7 +328,8 @@ mod tests {
         let uri = Uri::from_str("file:///src/main.rs").unwrap();
 
         // 1. Open
-        let open_params = tracker.did_open(uri.clone(), "rust".to_string(), "fn main() {}".to_string());
+        let open_params =
+            tracker.did_open(uri.clone(), "rust".to_string(), "fn main() {}".to_string());
         assert_eq!(open_params.text_document.version, 1);
         assert_eq!(tracker.version(&uri), Some(1));
 

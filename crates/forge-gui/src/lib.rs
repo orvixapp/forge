@@ -3,6 +3,7 @@
 pub mod config;
 pub mod i18n;
 pub mod links;
+pub mod mcp;
 pub mod shell;
 pub mod theme;
 

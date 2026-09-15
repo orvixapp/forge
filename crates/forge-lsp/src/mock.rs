@@ -2,7 +2,14 @@
 
 use crate::jsonrpc::{Id, Message, Notification, Request, Response};
 use crate::transport::{read_message, write_message};
-use lsp_types::*;
+use lsp_types::{
+    CancelParams, CompletionItem, CompletionItemKind, CompletionOptions, CompletionResponse,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, Documentation, GotoDefinitionResponse,
+    Hover, HoverContents, HoverProviderCapability, InitializeResult, Location, MarkupContent,
+    MarkupKind, NumberOrString, OneOf, Position, PublishDiagnosticsParams, Range,
+    ServerCapabilities, ServerInfo, SymbolInformation, SymbolKind, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextEdit, Uri,
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -41,6 +48,9 @@ impl MockLspServer {
     }
 
     /// Runs the mock server loop over an async duplex reader and writer.
+    ///
+    /// # Panics
+    /// Panics only if serialization of the mock's fixed protocol fixtures fails.
     pub async fn run<R, W>(
         self,
         reader: R,
@@ -52,7 +62,17 @@ impl MockLspServer {
     {
         let documents = Arc::clone(&self.documents);
         let cancelled = Arc::clone(&self.cancelled_requests);
-        let mut buf_reader = BufReader::new(reader);
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(16);
+        let reader_task = tokio::spawn(async move {
+            let mut buf_reader = BufReader::new(reader);
+            loop {
+                let message = read_message(&mut buf_reader).await;
+                let closed = message.is_err();
+                if incoming_tx.send(message).await.is_err() || closed {
+                    break;
+                }
+            }
+        });
 
         loop {
             tokio::select! {
@@ -73,7 +93,7 @@ impl MockLspServer {
                 }
 
                 // Incoming client messages
-                read_res = read_message(&mut buf_reader) => {
+                Some(read_res) = incoming_rx.recv() => {
                     let Ok(payload) = read_res else {
                         break;
                     };
@@ -83,7 +103,7 @@ impl MockLspServer {
 
                     match msg {
                         Message::Request(req) => {
-                            let resp = Self::handle_request(&req, &documents).await;
+                            let resp = Self::handle_request(&req, &documents);
                             let bytes = Message::Response(resp).to_bytes().unwrap();
                             if write_message(&mut writer, &bytes).await.is_err() {
                                 break;
@@ -91,33 +111,39 @@ impl MockLspServer {
                         }
                         Message::Notification(notif) => {
                             if notif.method == "$/cancelRequest" {
-                                if let Some(params) = notif.params {
-                                    if let Ok(cancel) = serde_json::from_value::<CancelParams>(params) {
+                                if let Some(params) = notif.params
+                                    && let Ok(cancel) = serde_json::from_value::<CancelParams>(params) {
                                         let id = match cancel.id {
-                                            NumberOrString::Number(n) => Id::Number(n as i64),
+                                            NumberOrString::Number(n) => Id::Number(i64::from(n)),
                                             NumberOrString::String(s) => Id::String(s),
                                         };
                                         cancelled.lock().await.push(id);
                                     }
-                                }
                             } else if notif.method == "textDocument/didOpen" {
-                                if let Some(params) = notif.params {
-                                    if let Ok(open) = serde_json::from_value::<DidOpenTextDocumentParams>(params) {
+                                if let Some(params) = notif.params
+                                    && let Ok(open) = serde_json::from_value::<DidOpenTextDocumentParams>(params) {
                                         documents.lock().await.insert(open.text_document.uri, open.text_document.text);
                                     }
-                                }
                             } else if notif.method == "textDocument/didChange" {
-                                if let Some(params) = notif.params {
-                                    if let Ok(change) = serde_json::from_value::<DidChangeTextDocumentParams>(params) {
+                                if let Some(params) = notif.params
+                                    && let Ok(change) = serde_json::from_value::<DidChangeTextDocumentParams>(params) {
                                         let mut docs = documents.lock().await;
                                         if let Some(doc) = docs.get_mut(&change.text_document.uri) {
                                             for c in change.content_changes {
-                                                if c.range.is_none() {
-                                                    *doc = c.text;
-                                                }
+                                                if let Some(range) = c.range {
+                                                    let mut rope = ropey::Rope::from_str(doc);
+                                                    let chars = crate::sync::lsp_range_to_range(&rope, &range);
+                                                    rope.remove(chars.clone());
+                                                    rope.insert(chars.start, &c.text);
+                                                    *doc = rope.to_string();
+                                                } else { *doc = c.text; }
                                             }
                                         }
                                     }
+                            } else if notif.method == "textDocument/didClose" {
+                                if let Some(params) = notif.params
+                                    && let Ok(close) = serde_json::from_value::<lsp_types::DidCloseTextDocumentParams>(params) {
+                                    documents.lock().await.remove(&close.text_document.uri);
                                 }
                             } else if notif.method == "exit" {
                                 break;
@@ -128,9 +154,12 @@ impl MockLspServer {
                 }
             }
         }
+        reader_task.abort();
     }
 
-    async fn handle_request(req: &Request, _docs: &Arc<Mutex<HashMap<Uri, String>>>) -> Response {
+    // A single fixture table keeps the mock protocol responses auditable.
+    #[allow(clippy::too_many_lines)]
+    fn handle_request(req: &Request, _docs: &Arc<Mutex<HashMap<Uri, String>>>) -> Response {
         let result = match req.method.as_str() {
             "initialize" => {
                 #[allow(deprecated)]
@@ -177,8 +206,11 @@ impl MockLspServer {
                 ]))
             }
             "completionItem/resolve" => {
-                let mut item: CompletionItem = serde_json::from_value(req.params.clone().unwrap()).unwrap();
-                item.documentation = Some(Documentation::String("Resolved documentation from server".to_string()));
+                let mut item: CompletionItem =
+                    serde_json::from_value(req.params.clone().unwrap()).unwrap();
+                item.documentation = Some(Documentation::String(
+                    "Resolved documentation from server".to_string(),
+                ));
                 json!(item)
             }
             "textDocument/hover" => {
@@ -194,16 +226,28 @@ impl MockLspServer {
                 json!(GotoDefinitionResponse::Scalar(Location {
                     uri: Uri::from_str("file:///src/main.rs").unwrap(),
                     range: Range {
-                        start: Position { line: 10, character: 4 },
-                        end: Position { line: 10, character: 11 },
+                        start: Position {
+                            line: 10,
+                            character: 4
+                        },
+                        end: Position {
+                            line: 10,
+                            character: 11
+                        },
                     },
                 }))
             }
             "textDocument/formatting" => {
                 json!(vec![TextEdit {
                     range: Range {
-                        start: Position { line: 0, character: 0 },
-                        end: Position { line: 0, character: 0 },
+                        start: Position {
+                            line: 0,
+                            character: 0
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 0
+                        },
                     },
                     new_text: "// Formatted by mock\n".to_string(),
                 }])
@@ -218,8 +262,14 @@ impl MockLspServer {
                     location: Location {
                         uri: Uri::from_str("file:///src/lib.rs").unwrap(),
                         range: Range {
-                            start: Position { line: 1, character: 0 },
-                            end: Position { line: 1, character: 10 },
+                            start: Position {
+                                line: 1,
+                                character: 0,
+                            },
+                            end: Position {
+                                line: 1,
+                                character: 10,
+                            },
                         },
                     },
                     container_name: None,

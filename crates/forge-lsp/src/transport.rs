@@ -20,15 +20,27 @@ pub enum TransportError {
 /// Reads a single framed LSP message from an async buffered reader.
 ///
 /// Returns the message payload as raw bytes.
+///
+/// # Errors
+/// Returns transport, serialization, protocol or lifecycle errors.
 pub async fn read_message<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
 ) -> Result<Vec<u8>, TransportError> {
     let mut content_length: Option<usize> = None;
     let mut header_line = String::new();
+    let mut header_bytes = 0;
 
     loop {
         header_line.clear();
-        let bytes_read = reader.read_line(&mut header_line).await?;
+        // Bound even an unterminated header before allocating its full length.
+        let bytes_read = (&mut *reader)
+            .take(8193)
+            .read_line(&mut header_line)
+            .await?;
+        header_bytes += bytes_read;
+        if header_bytes > 8192 {
+            return Err(TransportError::HeaderFormat("Headers exceed 8 KiB".into()));
+        }
         if bytes_read == 0 {
             // If we haven't read any header lines yet, it's a clean EOF
             return Err(TransportError::Closed);
@@ -44,10 +56,14 @@ pub async fn read_message<R: AsyncBufReadExt + Unpin>(
             let name = name.trim().to_ascii_lowercase();
             let value = value.trim();
             if name == "content-length" {
-                let len = value
-                    .parse::<usize>()
-                    .map_err(|e| TransportError::HeaderFormat(format!("Invalid Content-Length: {e}")))?;
-                content_length = Some(len);
+                let len = value.parse::<usize>().map_err(|e| {
+                    TransportError::HeaderFormat(format!("Invalid Content-Length: {e}"))
+                })?;
+                if content_length.replace(len).is_some() || len > 16 * 1024 * 1024 {
+                    return Err(TransportError::HeaderFormat(
+                        "Duplicate or oversized Content-Length".into(),
+                    ));
+                }
             }
             // Other headers such as Content-Type are accepted and ignored according to LSP spec
         } else {
@@ -64,6 +80,9 @@ pub async fn read_message<R: AsyncBufReadExt + Unpin>(
 }
 
 /// Writes a single framed LSP message to an async writer with Content-Length header.
+///
+/// # Errors
+/// Returns transport, serialization, protocol or lifecycle errors.
 pub async fn write_message<W: AsyncWrite + Unpin>(
     writer: &mut W,
     payload: &[u8],
@@ -133,7 +152,10 @@ mod tests {
         let (client, mut server) = duplex(1024);
         let mut reader = BufReader::new(client);
 
-        server.write_all(b"Content-Type: text/plain\r\n\r\n").await.unwrap();
+        server
+            .write_all(b"Content-Type: text/plain\r\n\r\n")
+            .await
+            .unwrap();
         server.flush().await.unwrap();
 
         let res = read_message(&mut reader).await;

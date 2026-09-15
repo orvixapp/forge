@@ -70,10 +70,14 @@ pub enum ShellCommand {
     AgentForward,
     AgentAcceptAllHunks,
     AgentRejectAllHunks,
+    LspHover,
+    LspDefinition,
+    LspSignature,
+    LspDiagnostics,
 }
 
 impl ShellCommand {
-    pub const ALL: [Self; 58] = [
+    pub const ALL: [Self; 62] = [
         Self::NewTerminalTab,
         Self::NewTerminalTabInDirectory,
         Self::CloseWindow,
@@ -132,6 +136,10 @@ impl ShellCommand {
         Self::AgentForward,
         Self::AgentAcceptAllHunks,
         Self::AgentRejectAllHunks,
+        Self::LspHover,
+        Self::LspDefinition,
+        Self::LspSignature,
+        Self::LspDiagnostics,
     ];
 
     #[must_use]
@@ -189,6 +197,10 @@ impl ShellCommand {
             Self::TerminalCopy => "terminal.copy",
             Self::TerminalPaste => "terminal.paste",
             Self::OpenSettings => "settings.open",
+            Self::LspHover => "lsp.hover",
+            Self::LspDefinition => "lsp.definition",
+            Self::LspSignature => "lsp.signatureHelp",
+            Self::LspDiagnostics => "lsp.diagnostics",
             Self::NewAgentSession => "agent.newSession",
             Self::AgentAsk => "agent.ask",
             Self::AgentInvestigate => "agent.investigate",
@@ -252,6 +264,10 @@ impl ShellCommand {
             Self::ShowContextMenu => "Show context menu",
             Self::TerminalPaste => "Paste clipboard",
             Self::OpenSettings => "Settings…",
+            Self::LspHover => "Show symbol documentation",
+            Self::LspDefinition => "Go to definition",
+            Self::LspSignature => "Show signature help",
+            Self::LspDiagnostics => "Show language diagnostics",
             Self::NewAgentSession => "New agent session",
             Self::AgentAsk => "Ask the agent about the selection…",
             Self::AgentInvestigate => "Investigate the last failed command with the agent",
@@ -379,6 +395,24 @@ impl Default for ShellKeymap {
                 binding("t", true, false, false, Window, NewTerminalTab),
                 binding("a", true, false, true, Window, NewAgentSession),
                 binding(",", true, false, false, Window, OpenSettings),
+                binding(
+                    "f12",
+                    false,
+                    false,
+                    false,
+                    Editor,
+                    ShellCommand::LspDefinition,
+                ),
+                binding("h", true, true, false, Editor, ShellCommand::LspHover),
+                binding(
+                    "space",
+                    true,
+                    false,
+                    true,
+                    Editor,
+                    ShellCommand::LspSignature,
+                ),
+                binding("m", true, true, false, Editor, ShellCommand::LspDiagnostics),
                 binding("k", true, false, false, Editor, AgentAsk),
                 binding("i", true, false, true, Terminal, AgentInvestigate),
                 // Editor chords follow VS Code; they only apply in editors so

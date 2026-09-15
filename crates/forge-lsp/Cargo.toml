@@ -12,6 +12,7 @@ lsp-types.workspace = true
 ropey.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+schemars = "1"
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

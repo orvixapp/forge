@@ -35,6 +35,8 @@ mod tests {
     use tokio::io::duplex;
 
     #[tokio::test]
+    // Keep the handshake-to-shutdown acceptance sequence in one test.
+    #[allow(clippy::too_many_lines)]
     async fn test_full_mock_server_interaction() {
         let (client_io, server_io) = duplex(4096);
         let (server_reader, server_writer) = tokio::io::split(server_io);
@@ -124,7 +126,10 @@ mod tests {
         assert_eq!(items[0].label, "test_fn");
 
         // 4. Completion resolve
-        let resolved = client.resolve_completion_item(items[0].clone()).await.unwrap();
+        let resolved = client
+            .resolve_completion_item(items[0].clone())
+            .await
+            .unwrap();
         assert!(resolved.documentation.is_some());
 
         // 5. Hover

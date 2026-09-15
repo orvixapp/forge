@@ -19,15 +19,21 @@ enum SettingsItem {
     WorkspaceConfig,
     AddProvider,
     AddAgent,
+    ImportMcp,
+    ManageMcp,
+    AddMcpHttp,
     ChooseTheme,
     ToggleLanguage,
 }
 
-const SETTINGS_ITEMS: [SettingsItem; 6] = [
+const SETTINGS_ITEMS: [SettingsItem; 9] = [
     SettingsItem::UserConfig,
     SettingsItem::WorkspaceConfig,
     SettingsItem::AddProvider,
     SettingsItem::AddAgent,
+    SettingsItem::ImportMcp,
+    SettingsItem::ManageMcp,
+    SettingsItem::AddMcpHttp,
     SettingsItem::ChooseTheme,
     SettingsItem::ToggleLanguage,
 ];
@@ -43,6 +49,11 @@ const PROVIDER_KINDS: [(ProviderKind, &str); 4] = [
 /// next question to ask.
 #[derive(Debug, Clone)]
 pub enum Wizard {
+    McpHttp {
+        step: usize,
+        name: String,
+        url: String,
+    },
     Provider {
         step: usize,
         name: String,
@@ -143,6 +154,9 @@ impl ForgeWindow {
                 }
                 SettingsItem::AddProvider => tr("Add provider…").to_owned(),
                 SettingsItem::AddAgent => tr("Add agent…").to_owned(),
+                SettingsItem::ImportMcp => tr("Import MCP servers…").to_owned(),
+                SettingsItem::ManageMcp => tr("Manage MCP servers…").to_owned(),
+                SettingsItem::AddMcpHttp => tr("Add HTTP MCP server…").to_owned(),
                 SettingsItem::ChooseTheme => tr("Choose theme…").to_owned(),
                 SettingsItem::ToggleLanguage => match self.config.ui.language {
                     Language::Spanish => tr("Switch to English").to_owned(),
@@ -188,6 +202,16 @@ impl ForgeWindow {
                     name: String::new(),
                     command: String::new(),
                     args: Vec::new(),
+                });
+                self.wizard_next(cx);
+            }
+            Some(SettingsItem::ImportMcp) => self.mcp_import_menu(cx),
+            Some(SettingsItem::ManageMcp) => self.mcp_manage_menu(cx),
+            Some(SettingsItem::AddMcpHttp) => {
+                self.wizard = Some(Wizard::McpHttp {
+                    step: 0,
+                    name: String::new(),
+                    url: String::new(),
                 });
                 self.wizard_next(cx);
             }
@@ -252,6 +276,18 @@ impl ForgeWindow {
     pub(crate) fn wizard_text(&mut self, answer: &str, cx: &mut Context<Self>) {
         let answer = answer.trim().to_owned();
         match &mut self.wizard {
+            Some(Wizard::McpHttp { step, name, url }) => {
+                if answer.is_empty() {
+                    self.wizard = None;
+                    return;
+                }
+                if *step == 0 {
+                    *name = answer;
+                } else {
+                    *url = answer;
+                }
+                *step += 1;
+            }
             Some(Wizard::Provider {
                 step,
                 name,
@@ -430,7 +466,20 @@ impl ForgeWindow {
 
     /// Shows the prompt or picker for the wizard's current step.
     fn wizard_next(&mut self, cx: &mut Context<Self>) {
+        if let Some(Wizard::McpHttp { step: 2, name, url }) = self.wizard.clone() {
+            self.wizard = None;
+            self.mcp_add_http(&name, &url, cx);
+            return;
+        }
         let (prompt, picker) = match &self.wizard {
+            Some(Wizard::McpHttp { step, .. }) => (
+                Some(tr(if *step == 0 {
+                    "MCP server name"
+                } else {
+                    "MCP HTTPS URL (OAuth is authorized separately in each agent)"
+                })),
+                None,
+            ),
             Some(Wizard::Provider { step, .. }) => match *step {
                 0 => (Some(tr("Provider name (e.g. gpt, local)")), None),
                 1 => (
@@ -501,7 +550,7 @@ impl ForgeWindow {
         cx.notify();
     }
 
-    fn user_config_path(&mut self) -> Option<PathBuf> {
+    pub(crate) fn user_config_path(&mut self) -> Option<PathBuf> {
         let path = self.factory.config_path.clone();
         if path.is_none() {
             self.notify_user(
@@ -533,14 +582,27 @@ impl ForgeWindow {
 
     /// Edits the user's `config.toml` in place (comments preserved) and
     /// returns its path.
-    fn edit_user_config(
+    pub(crate) fn edit_user_config(
         &mut self,
         edit: impl FnOnce(&mut DocumentMut) -> Result<(), String>,
     ) -> Result<PathBuf, String> {
         let path = self
             .user_config_path()
             .ok_or_else(|| tr("No user config path (benchmark mode)").to_owned())?;
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        // Never overwrite live, unsaved settings through a wizard.
+        if self
+            .tabs
+            .iter()
+            .filter_map(crate::window::Tab::editor)
+            .any(|editor| editor.path() == Some(path.as_path()) && editor.buffer.is_dirty())
+        {
+            return Err(tr("Save or discard unsaved settings before using a wizard").into());
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => return Err(tr("Cannot read user settings").into()),
+        };
         let mut doc: DocumentMut = text
             .parse()
             .map_err(|error| trf("Invalid configuration: {}", &[&error]))?;

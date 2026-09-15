@@ -4,14 +4,22 @@ use crate::process::{ServerInstance, ServerStatus};
 use crate::registry::{LanguageRegistry, ServerConfig};
 use crate::sync::path_to_uri;
 use forge_buffer::Edit;
-use lsp_types::*;
+use lsp_types::{
+    CodeActionContext, CodeActionOrCommand, CodeActionParams, CodeActionTriggerKind,
+    CompletionContext, CompletionItem, CompletionParams, CompletionResponse, CompletionTriggerKind,
+    DocumentFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
+    DocumentSymbolResponse, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, Location, MarkedString, MarkupContent, MarkupKind,
+    PartialResultParams, Position, ReferenceContext, ReferenceParams, SymbolInformation,
+    TextDocumentIdentifier, TextDocumentPositionParams, TextEdit, Uri, WorkDoneProgressParams,
+};
 use ropey::Rope;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Key identifying a unique server instance: `(server_name, workspace_root)`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -20,6 +28,26 @@ pub struct ServerKey {
     pub root_path: PathBuf,
 }
 
+struct ServerView {
+    status: ServerStatus,
+    client: Option<crate::client::LspClient>,
+    capabilities: serde_json::Value,
+}
+impl ServerView {
+    fn status(&self) -> ServerStatus {
+        self.status
+    }
+    fn client(&self) -> Option<&crate::client::LspClient> {
+        self.client.as_ref()
+    }
+    fn supports(&self, key: &str) -> bool {
+        self.capabilities
+            .get(key)
+            .is_some_and(|value| !value.is_null() && value != &serde_json::Value::Bool(false))
+    }
+}
+
+type FileServers = (Uri, String, Vec<(ServerConfig, PathBuf)>);
 pub struct LspManager {
     registry: LanguageRegistry,
     servers: Arc<RwLock<HashMap<ServerKey, ServerInstance>>>,
@@ -42,7 +70,7 @@ impl LspManager {
             servers: Arc::new(RwLock::new(HashMap::new())),
             diagnostics,
             debounce_delay: Duration::from_millis(500),
-            idle_timeout: Duration::from_secs(30 * 60), // 30 minutes
+            idle_timeout: Duration::from_mins(30), // 30 minutes
         }
     }
 
@@ -64,8 +92,29 @@ impl LspManager {
         self.idle_timeout = timeout;
     }
 
+    async fn server_views(&self) -> HashMap<ServerKey, ServerView> {
+        self.servers
+            .read()
+            .await
+            .iter()
+            .map(|(key, instance)| {
+                (
+                    key.clone(),
+                    ServerView {
+                        status: instance.status(),
+                        client: instance.client().cloned(),
+                        capabilities: instance
+                            .server_capabilities()
+                            .and_then(|caps| serde_json::to_value(caps).ok())
+                            .unwrap_or_default(),
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Resolves the URI and server configs for a file.
-    fn resolve_file_servers(&self, file_path: &Path) -> Option<(Uri, String, Vec<(ServerConfig, PathBuf)>)> {
+    fn resolve_file_servers(&self, file_path: &Path) -> Option<FileServers> {
         let lang = self.registry.detect_language(file_path)?;
         let uri = path_to_uri(file_path)?;
 
@@ -80,7 +129,25 @@ impl LspManager {
     }
 
     /// Opens a document: ensures required language server(s) are running and sends `didOpen`.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn open_document(&self, file_path: &Path, text: String) -> Result<(), LspError> {
+        self.open_document_versioned(file_path, text, 1).await
+    }
+
+    /// Opens the live editor snapshot at its real buffer revision.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
+    pub async fn open_document_versioned(
+        &self,
+        file_path: &Path,
+        text: String,
+        version: u64,
+    ) -> Result<(), LspError> {
+        let version = i32::try_from(version)
+            .map_err(|_| LspError::Channel("Buffer revision exceeds LSP integer range".into()))?;
         let Some((uri, lang_id, server_targets)) = self.resolve_file_servers(file_path) else {
             return Ok(());
         };
@@ -95,9 +162,7 @@ impl LspManager {
             if !servers.contains_key(&key) {
                 match ServerInstance::new(config, root_path, self.diagnostics.clone()) {
                     Ok(mut instance) => {
-                        if let Err(err) = instance.start().await {
-                            warn!("Failed to start LSP server '{}': {err}", key.server_name);
-                        }
+                        instance.start().await?;
                         servers.insert(key.clone(), instance);
                     }
                     Err(e) => {
@@ -109,10 +174,24 @@ impl LspManager {
 
             if let Some(instance) = servers.get_mut(&key) {
                 instance.record_activity();
+                if matches!(
+                    instance.status(),
+                    ServerStatus::Stopped | ServerStatus::Crashed
+                ) {
+                    instance.start().await?;
+                }
                 if instance.status() == ServerStatus::Running {
                     let tracker_arc = instance.tracker();
                     let mut tracker = tracker_arc.lock().await;
-                    let open_params = tracker.did_open(uri.clone(), lang_id.clone(), text.clone());
+                    if tracker.is_open(&uri) {
+                        continue;
+                    }
+                    let open_params = tracker.did_open_versioned(
+                        uri.clone(),
+                        lang_id.clone(),
+                        text.clone(),
+                        version,
+                    );
                     if let Some(client) = instance.client() {
                         let _ = client.did_open(open_params).await;
                     }
@@ -124,12 +203,114 @@ impl LspManager {
     }
 
     /// Sends incremental edits to all servers managing this document.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn change_document(
         &self,
         file_path: &Path,
         edits: &[Edit],
         old_rope: &Rope,
         new_text: String,
+    ) -> Result<(), LspError> {
+        let Some((uri, _, server_targets)) = self.resolve_file_servers(file_path) else {
+            return Ok(());
+        };
+        let mut servers = self.servers.write().await;
+        for (config, root_path) in server_targets {
+            let key = ServerKey {
+                server_name: config.name,
+                root_path,
+            };
+
+            if let Some(instance) = servers.get_mut(&key) {
+                instance.record_activity();
+                if instance.status() == ServerStatus::Running {
+                    let tracker_arc = instance.tracker();
+                    let mut tracker = tracker_arc.lock().await;
+                    if let Some(change_params) =
+                        tracker.did_change_incremental(&uri, edits, old_rope, new_text.clone())
+                        && let Some(client) = instance.client()
+                    {
+                        let _ = client.did_change(change_params).await;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Synchronizes a live snapshot using a precise buffer revision.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
+    pub async fn change_document_versioned(
+        &self,
+        file_path: &Path,
+        edits: &[Edit],
+        old_rope: &Rope,
+        new_text: String,
+        version: u64,
+    ) -> Result<(), LspError> {
+        let version = i32::try_from(version)
+            .map_err(|_| LspError::Channel("Buffer revision exceeds LSP integer range".into()))?;
+        let Some((uri, _, targets)) = self.resolve_file_servers(file_path) else {
+            return Ok(());
+        };
+        let mut servers = self.servers.write().await;
+        for (config, root_path) in targets {
+            let key = ServerKey {
+                server_name: config.name,
+                root_path,
+            };
+            if let Some(instance) = servers.get_mut(&key) {
+                instance.record_activity();
+                let tracker = instance.tracker();
+                let mut tracker = tracker.lock().await;
+                let Some(doc) = tracker.get(&uri) else {
+                    continue;
+                };
+                if doc.version >= version {
+                    continue;
+                }
+                let sync = instance
+                    .server_capabilities()
+                    .and_then(|caps| caps.text_document_sync.as_ref());
+                let kind = match sync {
+                    Some(lsp_types::TextDocumentSyncCapability::Kind(kind)) => *kind,
+                    Some(lsp_types::TextDocumentSyncCapability::Options(options)) => options
+                        .change
+                        .unwrap_or(lsp_types::TextDocumentSyncKind::NONE),
+                    None => lsp_types::TextDocumentSyncKind::NONE,
+                };
+                let params = if kind == lsp_types::TextDocumentSyncKind::INCREMENTAL {
+                    tracker.did_change_incremental(&uri, edits, old_rope, new_text.clone())
+                } else {
+                    tracker.did_change_full(&uri, new_text.clone())
+                };
+                if let Some(mut params) = params {
+                    params.text_document.version = version;
+                    tracker.set_version(&uri, version);
+                    if kind != lsp_types::TextDocumentSyncKind::NONE
+                        && let Some(client) = instance.client()
+                    {
+                        client.did_change(params).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Sends `didSave` to all servers managing this document.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
+    pub async fn save_document(
+        &self,
+        file_path: &Path,
+        text: Option<String>,
     ) -> Result<(), LspError> {
         let Some((uri, _, server_targets)) = self.resolve_file_servers(file_path) else {
             return Ok(());
@@ -146,46 +327,11 @@ impl LspManager {
                 instance.record_activity();
                 if instance.status() == ServerStatus::Running {
                     let tracker_arc = instance.tracker();
-                    let mut tracker = tracker_arc.lock().await;
-                    if let Some(change_params) = tracker.did_change_incremental(
-                        &uri,
-                        edits,
-                        old_rope,
-                        new_text.clone(),
-                    ) {
-                        if let Some(client) = instance.client() {
-                            let _ = client.did_change(change_params).await;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Sends `didSave` to all servers managing this document.
-    pub async fn save_document(&self, file_path: &Path, text: Option<String>) -> Result<(), LspError> {
-        let Some((uri, _, server_targets)) = self.resolve_file_servers(file_path) else {
-            return Ok(());
-        };
-
-        let mut servers = self.servers.write().await;
-        for (config, root_path) in server_targets {
-            let key = ServerKey {
-                server_name: config.name,
-                root_path,
-            };
-
-            if let Some(instance) = servers.get_mut(&key) {
-                instance.record_activity();
-                if instance.status() == ServerStatus::Running {
-                    let tracker_arc = instance.tracker();
                     let tracker = tracker_arc.lock().await;
-                    if let Some(save_params) = tracker.did_save(&uri, text.is_some()) {
-                        if let Some(client) = instance.client() {
-                            let _ = client.did_save(save_params).await;
-                        }
+                    if let Some(save_params) = tracker.did_save(&uri, text.is_some())
+                        && let Some(client) = instance.client()
+                    {
+                        let _ = client.did_save(save_params).await;
                     }
                 }
             }
@@ -195,6 +341,9 @@ impl LspManager {
     }
 
     /// Sends `didClose` to all servers managing this document.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn close_document(&self, file_path: &Path) -> Result<(), LspError> {
         let Some((uri, _, server_targets)) = self.resolve_file_servers(file_path) else {
             return Ok(());
@@ -212,10 +361,10 @@ impl LspManager {
                 if instance.status() == ServerStatus::Running {
                     let tracker_arc = instance.tracker();
                     let mut tracker = tracker_arc.lock().await;
-                    if let Some(close_params) = tracker.did_close(&uri) {
-                        if let Some(client) = instance.client() {
-                            let _ = client.did_close(close_params).await;
-                        }
+                    if let Some(close_params) = tracker.did_close(&uri)
+                        && let Some(client) = instance.client()
+                    {
+                        let _ = client.did_close(close_params).await;
                     }
                 }
             }
@@ -225,6 +374,9 @@ impl LspManager {
     }
 
     /// Requests code completion at a position in a file, merging completions across servers.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn completion(
         &self,
         file_path: &Path,
@@ -252,7 +404,7 @@ impl LspManager {
             }),
         };
 
-        let servers = self.servers.read().await;
+        let servers = self.server_views().await;
         let mut all_items = Vec::new();
 
         for (config, root_path) in server_targets {
@@ -261,16 +413,15 @@ impl LspManager {
                 root_path,
             };
 
-            if let Some(instance) = servers.get(&key) {
-                if instance.status() == ServerStatus::Running {
-                    if let Some(client) = instance.client() {
-                        if let Ok(Some(resp)) = client.completion(params.clone()).await {
-                            match resp {
-                                CompletionResponse::Array(items) => all_items.extend(items),
-                                CompletionResponse::List(list) => all_items.extend(list.items),
-                            }
-                        }
-                    }
+            if let Some(instance) = servers.get(&key)
+                && instance.status() == ServerStatus::Running
+                && instance.supports("completionProvider")
+                && let Some(client) = instance.client()
+                && let Ok(Some(resp)) = client.completion(params.clone()).await
+            {
+                match resp {
+                    CompletionResponse::Array(items) => all_items.extend(items),
+                    CompletionResponse::List(list) => all_items.extend(list.items),
                 }
             }
         }
@@ -290,6 +441,9 @@ impl LspManager {
     }
 
     /// Requests hover information at a position, stacking hover contents if multiple servers respond.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn hover(
         &self,
         file_path: &Path,
@@ -307,7 +461,7 @@ impl LspManager {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let servers = self.servers.read().await;
+        let servers = self.server_views().await;
         let mut contents = Vec::new();
         let mut range = None;
 
@@ -317,24 +471,23 @@ impl LspManager {
                 root_path,
             };
 
-            if let Some(instance) = servers.get(&key) {
-                if instance.status() == ServerStatus::Running {
-                    if let Some(client) = instance.client() {
-                        if let Ok(Some(hover)) = client.hover(params.clone()).await {
-                            if range.is_none() {
-                                range = hover.range;
-                            }
-                            match hover.contents {
-                                HoverContents::Scalar(marked) => contents.push(marked_string_to_string(marked)),
-                                HoverContents::Array(arr) => {
-                                    for item in arr {
-                                        contents.push(marked_string_to_string(item));
-                                    }
-                                }
-                                HoverContents::Markup(markup) => contents.push(markup.value),
-                            }
+            if let Some(instance) = servers.get(&key)
+                && instance.status() == ServerStatus::Running
+                && instance.supports("hoverProvider")
+                && let Some(client) = instance.client()
+                && let Ok(Some(hover)) = client.hover(params.clone()).await
+            {
+                if range.is_none() {
+                    range = hover.range;
+                }
+                match hover.contents {
+                    HoverContents::Scalar(marked) => contents.push(marked_string_to_string(marked)),
+                    HoverContents::Array(arr) => {
+                        for item in arr {
+                            contents.push(marked_string_to_string(item));
                         }
                     }
+                    HoverContents::Markup(markup) => contents.push(markup.value),
                 }
             }
         }
@@ -353,6 +506,9 @@ impl LspManager {
     }
 
     /// Requests goto definition for a position in a file.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn goto_definition(
         &self,
         file_path: &Path,
@@ -371,28 +527,62 @@ impl LspManager {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let servers = self.servers.read().await;
+        let servers = self.server_views().await;
         for (config, root_path) in server_targets {
             let key = ServerKey {
                 server_name: config.name,
                 root_path,
             };
 
-            if let Some(instance) = servers.get(&key) {
-                if instance.status() == ServerStatus::Running {
-                    if let Some(client) = instance.client() {
-                        if let Ok(Some(res)) = client.goto_definition(params.clone()).await {
-                            return Ok(Some(res));
-                        }
-                    }
-                }
+            if let Some(instance) = servers.get(&key)
+                && instance.status() == ServerStatus::Running
+                && instance.supports("definitionProvider")
+                && let Some(client) = instance.client()
+                && let Ok(Some(res)) = client.goto_definition(params.clone()).await
+            {
+                return Ok(Some(res));
             }
         }
 
         Ok(None)
     }
 
+    /// Requests signature help only from servers advertising that provider.
+    ///
+    /// # Errors
+    /// Returns transport or protocol errors.
+    pub async fn signature_help(
+        &self,
+        file_path: &Path,
+        position: Position,
+    ) -> Result<Option<lsp_types::SignatureHelp>, LspError> {
+        let Some((uri, _, targets)) = self.resolve_file_servers(file_path) else {
+            return Ok(None);
+        };
+        let servers = self.server_views().await;
+        for (config, root_path) in targets {
+            if let Some(instance) = servers.get(&ServerKey {
+                server_name: config.name,
+                root_path,
+            }) && instance.supports("signatureHelpProvider")
+                && instance.status() == ServerStatus::Running
+                && let Some(client) = instance.client()
+            {
+                return client
+                    .send_request(
+                        "textDocument/signatureHelp",
+                        serde_json::json!({"textDocument":{"uri":uri},"position":position}),
+                    )
+                    .await;
+            }
+        }
+        Ok(None)
+    }
+
     /// Requests references for a position in a file.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn references(
         &self,
         file_path: &Path,
@@ -415,7 +605,7 @@ impl LspManager {
             },
         };
 
-        let servers = self.servers.read().await;
+        let servers = self.server_views().await;
         let mut results = Vec::new();
 
         for (config, root_path) in server_targets {
@@ -424,14 +614,13 @@ impl LspManager {
                 root_path,
             };
 
-            if let Some(instance) = servers.get(&key) {
-                if instance.status() == ServerStatus::Running {
-                    if let Some(client) = instance.client() {
-                        if let Ok(Some(locs)) = client.references(params.clone()).await {
-                            results.extend(locs);
-                        }
-                    }
-                }
+            if let Some(instance) = servers.get(&key)
+                && instance.status() == ServerStatus::Running
+                && instance.supports("referencesProvider")
+                && let Some(client) = instance.client()
+                && let Ok(Some(locs)) = client.references(params.clone()).await
+            {
+                results.extend(locs);
             }
         }
 
@@ -439,6 +628,9 @@ impl LspManager {
     }
 
     /// Formats the whole document.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn formatting(&self, file_path: &Path) -> Result<Option<Vec<TextEdit>>, LspError> {
         let Some((uri, _, server_targets)) = self.resolve_file_servers(file_path) else {
             return Ok(None);
@@ -454,21 +646,20 @@ impl LspManager {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let servers = self.servers.read().await;
+        let servers = self.server_views().await;
         for (config, root_path) in server_targets {
             let key = ServerKey {
                 server_name: config.name,
                 root_path,
             };
 
-            if let Some(instance) = servers.get(&key) {
-                if instance.status() == ServerStatus::Running {
-                    if let Some(client) = instance.client() {
-                        if let Ok(Some(edits)) = client.formatting(params.clone()).await {
-                            return Ok(Some(edits));
-                        }
-                    }
-                }
+            if let Some(instance) = servers.get(&key)
+                && instance.status() == ServerStatus::Running
+                && instance.supports("documentFormattingProvider")
+                && let Some(client) = instance.client()
+                && let Ok(Some(edits)) = client.formatting(params.clone()).await
+            {
+                return Ok(Some(edits));
             }
         }
 
@@ -476,6 +667,9 @@ impl LspManager {
     }
 
     /// Formats a range in the document.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn range_formatting(
         &self,
         file_path: &Path,
@@ -496,21 +690,20 @@ impl LspManager {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let servers = self.servers.read().await;
+        let servers = self.server_views().await;
         for (config, root_path) in server_targets {
             let key = ServerKey {
                 server_name: config.name,
                 root_path,
             };
 
-            if let Some(instance) = servers.get(&key) {
-                if instance.status() == ServerStatus::Running {
-                    if let Some(client) = instance.client() {
-                        if let Ok(Some(edits)) = client.range_formatting(params.clone()).await {
-                            return Ok(Some(edits));
-                        }
-                    }
-                }
+            if let Some(instance) = servers.get(&key)
+                && instance.status() == ServerStatus::Running
+                && instance.supports("documentRangeFormattingProvider")
+                && let Some(client) = instance.client()
+                && let Ok(Some(edits)) = client.range_formatting(params.clone()).await
+            {
+                return Ok(Some(edits));
             }
         }
 
@@ -518,6 +711,9 @@ impl LspManager {
     }
 
     /// Requests code actions for a range in the document.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn code_actions(
         &self,
         file_path: &Path,
@@ -540,7 +736,7 @@ impl LspManager {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let servers = self.servers.read().await;
+        let servers = self.server_views().await;
         let mut results = Vec::new();
 
         for (config, root_path) in server_targets {
@@ -549,14 +745,13 @@ impl LspManager {
                 root_path,
             };
 
-            if let Some(instance) = servers.get(&key) {
-                if instance.status() == ServerStatus::Running {
-                    if let Some(client) = instance.client() {
-                        if let Ok(Some(res)) = client.code_action(params.clone()).await {
-                            results.extend(res);
-                        }
-                    }
-                }
+            if let Some(instance) = servers.get(&key)
+                && instance.status() == ServerStatus::Running
+                && instance.supports("codeActionProvider")
+                && let Some(client) = instance.client()
+                && let Ok(Some(res)) = client.code_action(params.clone()).await
+            {
+                results.extend(res);
             }
         }
 
@@ -564,6 +759,9 @@ impl LspManager {
     }
 
     /// Requests symbols in the document.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn document_symbols(
         &self,
         file_path: &Path,
@@ -578,21 +776,20 @@ impl LspManager {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let servers = self.servers.read().await;
+        let servers = self.server_views().await;
         for (config, root_path) in server_targets {
             let key = ServerKey {
                 server_name: config.name,
                 root_path,
             };
 
-            if let Some(instance) = servers.get(&key) {
-                if instance.status() == ServerStatus::Running {
-                    if let Some(client) = instance.client() {
-                        if let Ok(Some(res)) = client.document_symbol(params.clone()).await {
-                            return Ok(Some(res));
-                        }
-                    }
-                }
+            if let Some(instance) = servers.get(&key)
+                && instance.status() == ServerStatus::Running
+                && instance.supports("documentSymbolProvider")
+                && let Some(client) = instance.client()
+                && let Ok(Some(res)) = client.document_symbol(params.clone()).await
+            {
+                return Ok(Some(res));
             }
         }
 
@@ -600,17 +797,20 @@ impl LspManager {
     }
 
     /// Requests workspace symbols across all running language servers.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
     pub async fn workspace_symbols(&self, query: &str) -> Result<Vec<SymbolInformation>, LspError> {
-        let servers = self.servers.read().await;
+        let servers = self.server_views().await;
         let mut results = Vec::new();
 
         for instance in servers.values() {
-            if instance.status() == ServerStatus::Running {
-                if let Some(client) = instance.client() {
-                    if let Ok(Some(symbols)) = client.workspace_symbols(query).await {
-                        results.extend(symbols);
-                    }
-                }
+            if instance.status() == ServerStatus::Running
+                && instance.supports("workspaceSymbolProvider")
+                && let Some(client) = instance.client()
+                && let Ok(Some(symbols)) = client.workspace_symbols(query).await
+            {
+                results.extend(symbols);
             }
         }
 
@@ -624,7 +824,10 @@ impl LspManager {
             if instance.is_idle(self.idle_timeout) {
                 info!("Shutting down idle LSP server '{}'", key.server_name);
                 let _ = instance.stop().await;
-            } else if instance.status() == ServerStatus::Crashed {
+            } else if matches!(
+                instance.status(),
+                ServerStatus::Running | ServerStatus::Crashed
+            ) {
                 let _ = instance.check_and_recover().await;
             }
         }
@@ -633,7 +836,7 @@ impl LspManager {
     /// Shuts down all language servers cleanly.
     pub async fn shutdown_all(&self) {
         let mut servers = self.servers.write().await;
-        for (_, instance) in servers.iter_mut() {
+        for instance in servers.values_mut() {
             let _ = instance.stop().await;
         }
     }

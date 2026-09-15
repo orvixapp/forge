@@ -1,12 +1,14 @@
 //! Language registry, language definitions and workspace root discovery for LSP.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Configuration of a specific language server executable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub name: String,
     pub command: String,
@@ -40,7 +42,10 @@ impl ServerConfig {
     }
 
     #[must_use]
-    pub fn with_root_markers(mut self, markers: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    pub fn with_root_markers(
+        mut self,
+        markers: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
         self.root_markers = markers.into_iter().map(Into::into).collect();
         self
     }
@@ -53,7 +58,8 @@ impl ServerConfig {
 }
 
 /// Language definition mapping file extensions to LSP servers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LanguageDefinition {
     pub id: String,
     pub name: String,
@@ -146,8 +152,13 @@ impl LanguageRegistry {
             id: "rust".to_string(),
             name: "Rust".to_string(),
             extensions: vec!["rs".to_string()],
-            servers: vec![ServerConfig::new("rust-analyzer", "rust-analyzer")
-                .with_root_markers(vec!["Cargo.toml", "rust-toolchain.toml", ".git"])],
+            servers: vec![
+                ServerConfig::new("rust-analyzer", "rust-analyzer").with_root_markers(vec![
+                    "Cargo.toml",
+                    "rust-toolchain.toml",
+                    ".git",
+                ]),
+            ],
         });
 
         // Python
@@ -156,9 +167,14 @@ impl LanguageRegistry {
             name: "Python".to_string(),
             extensions: vec!["py".to_string(), "pyi".to_string()],
             servers: vec![
-                ServerConfig::new("pyright", "pyright-langserver")
+                ServerConfig::new("basedpyright", "basedpyright-langserver")
                     .with_args(["--stdio"])
-                    .with_root_markers(vec!["pyproject.toml", "setup.py", "requirements.txt", ".git"]),
+                    .with_root_markers(vec![
+                        "pyproject.toml",
+                        "setup.py",
+                        "requirements.txt",
+                        ".git",
+                    ]),
             ],
         });
 
@@ -178,7 +194,12 @@ impl LanguageRegistry {
         self.register(LanguageDefinition {
             id: "javascript".to_string(),
             name: "JavaScript".to_string(),
-            extensions: vec!["js".to_string(), "jsx".to_string(), "mjs".to_string(), "cjs".to_string()],
+            extensions: vec![
+                "js".to_string(),
+                "jsx".to_string(),
+                "mjs".to_string(),
+                "cjs".to_string(),
+            ],
             servers: vec![
                 ServerConfig::new("typescript-language-server", "typescript-language-server")
                     .with_args(["--stdio"])
@@ -191,8 +212,10 @@ impl LanguageRegistry {
             id: "go".to_string(),
             name: "Go".to_string(),
             extensions: vec!["go".to_string()],
-            servers: vec![ServerConfig::new("gopls", "gopls")
-                .with_root_markers(vec!["go.mod", "go.work", ".git"])],
+            servers: vec![
+                ServerConfig::new("gopls", "gopls")
+                    .with_root_markers(vec!["go.mod", "go.work", ".git"]),
+            ],
         });
 
         // C / C++
@@ -200,26 +223,48 @@ impl LanguageRegistry {
             id: "c".to_string(),
             name: "C".to_string(),
             extensions: vec!["c".to_string(), "h".to_string()],
-            servers: vec![ServerConfig::new("clangd", "clangd")
-                .with_root_markers(vec!["compile_commands.json", "CMakeLists.txt", ".git"])],
+            servers: vec![
+                ServerConfig::new("clangd", "clangd").with_root_markers(vec![
+                    "compile_commands.json",
+                    "CMakeLists.txt",
+                    ".git",
+                ]),
+            ],
         });
 
         self.register(LanguageDefinition {
             id: "cpp".to_string(),
             name: "C++".to_string(),
-            extensions: vec!["cpp".to_string(), "cc".to_string(), "cxx".to_string(), "hpp".to_string(), "hxx".to_string()],
-            servers: vec![ServerConfig::new("clangd", "clangd")
-                .with_root_markers(vec!["compile_commands.json", "CMakeLists.txt", ".git"])],
+            extensions: vec![
+                "cpp".to_string(),
+                "cc".to_string(),
+                "cxx".to_string(),
+                "hpp".to_string(),
+                "hxx".to_string(),
+            ],
+            servers: vec![
+                ServerConfig::new("clangd", "clangd").with_root_markers(vec![
+                    "compile_commands.json",
+                    "CMakeLists.txt",
+                    ".git",
+                ]),
+            ],
         });
 
+        self.register_data_languages();
+    }
+
+    fn register_data_languages(&mut self) {
         // TOML
         self.register(LanguageDefinition {
             id: "toml".to_string(),
             name: "TOML".to_string(),
             extensions: vec!["toml".to_string()],
-            servers: vec![ServerConfig::new("taplo", "taplo")
-                .with_args(["lsp", "stdio"])
-                .with_root_markers(vec![".taplo.toml", "Cargo.toml", ".git"])],
+            servers: vec![
+                ServerConfig::new("taplo", "taplo")
+                    .with_args(["lsp", "stdio"])
+                    .with_root_markers(vec![".taplo.toml", "Cargo.toml", ".git"]),
+            ],
         });
 
         // JSON
@@ -227,9 +272,11 @@ impl LanguageRegistry {
             id: "json".to_string(),
             name: "JSON".to_string(),
             extensions: vec!["json".to_string(), "jsonc".to_string()],
-            servers: vec![ServerConfig::new("vscode-json-language-server", "vscode-json-language-server")
-                .with_args(["--stdio"])
-                .with_root_markers(vec!["package.json", ".git"])],
+            servers: vec![
+                ServerConfig::new("vscode-json-language-server", "vscode-json-language-server")
+                    .with_args(["--stdio"])
+                    .with_root_markers(vec!["package.json", ".git"]),
+            ],
         });
     }
 }

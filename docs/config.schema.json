@@ -506,6 +506,9 @@
           "type": "string",
           "default": ""
         },
+        "transport": {
+          "$ref": "#/$defs/McpTransport"
+        },
         "command": {
           "type": "string",
           "default": ""
@@ -523,9 +526,41 @@
             "type": "string"
           },
           "default": {}
+        },
+        "url": {
+          "description": "Streamable HTTP endpoint (HTTPS, or HTTP on loopback only).",
+          "type": "string",
+          "default": ""
+        },
+        "headers": {
+          "description": "Header values expressed as `${ENV_VAR}` references, never tokens.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "agents": {
+          "description": "Empty means all agents; otherwise matches configured agent names.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       },
       "additionalProperties": false
+    },
+    "McpTransport": {
+      "type": "string",
+      "enum": [
+        "stdio",
+        "http"
+      ]
     }
   }
 }
