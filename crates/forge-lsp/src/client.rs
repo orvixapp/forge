@@ -39,6 +39,8 @@ pub enum LspError {
     Closed,
     #[error("Channel error: {0}")]
     Channel(String),
+    #[error("language server '{name}' not found: `{command}` is not in PATH")]
+    ServerNotFound { name: String, command: String },
 }
 
 type PendingRequests =

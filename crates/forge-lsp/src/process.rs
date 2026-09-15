@@ -17,6 +17,47 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, info, trace, warn};
 
+/// `PATH` plus the per-user tool directories a desktop session usually
+/// lacks (`~/.cargo/bin`, `~/.local/bin`, …), so servers installed with
+/// cargo, pip, npm or go are found when Forge starts from the menu.
+#[must_use]
+pub fn tool_search_path() -> std::ffi::OsString {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for dir in [
+            ".cargo/bin",
+            ".local/bin",
+            "go/bin",
+            ".npm-global/bin",
+            ".bun/bin",
+            ".deno/bin",
+        ] {
+            dirs.push(home.join(dir));
+        }
+    }
+    for dir in ["/usr/local/bin", "/opt/homebrew/bin", "/snap/bin"] {
+        dirs.push(PathBuf::from(dir));
+    }
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|dir| dir.is_dir() && seen.insert(dir.clone()));
+    std::env::join_paths(dirs).unwrap_or_default()
+}
+
+/// The executable `command` names: as given when it carries a directory,
+/// else the first match along `search_path`.
+#[must_use]
+pub fn resolve_command(command: &str, search_path: &std::ffi::OsStr) -> Option<PathBuf> {
+    let candidate = PathBuf::from(command);
+    if candidate.components().count() > 1 {
+        return candidate.is_file().then_some(candidate);
+    }
+    std::env::split_paths(search_path)
+        .map(|dir| dir.join(command))
+        .find(|path| path.is_file())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerStatus {
     Unstarted,
@@ -139,8 +180,19 @@ impl ServerInstance {
             self.config.name, self.root_path
         );
 
-        let mut cmd = Command::new(&self.config.command);
+        let search_path = tool_search_path();
+        let Some(program) = resolve_command(&self.config.command, &search_path) else {
+            self.status = ServerStatus::Crashed;
+            return Err(LspError::ServerNotFound {
+                name: self.config.name.clone(),
+                command: self.config.command.clone(),
+            });
+        };
+        let mut cmd = Command::new(program);
         cmd.args(&self.config.args)
+            // Servers spawn their own tools (rust-analyzer runs cargo), which
+            // live in the same user directories a desktop launch lacks.
+            .env("PATH", &search_path)
             .envs(&self.config.env)
             .current_dir(&self.root_path)
             .stdin(Stdio::piped())
@@ -150,7 +202,14 @@ impl ServerInstance {
 
         let mut child = cmd.spawn().map_err(|e| {
             self.status = ServerStatus::Crashed;
-            LspError::Transport(crate::transport::TransportError::Io(e))
+            if e.kind() == std::io::ErrorKind::NotFound {
+                LspError::ServerNotFound {
+                    name: self.config.name.clone(),
+                    command: self.config.command.clone(),
+                }
+            } else {
+                LspError::Transport(crate::transport::TransportError::Io(e))
+            }
         })?;
 
         let stdin = child.stdin.take().ok_or(LspError::Closed)?;

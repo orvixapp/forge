@@ -250,3 +250,61 @@ fn stale_diagnostics_do_not_replace_newer_results_and_huge_ranges_are_bounded() 
     assert_eq!(store.for_line(&uri, 500).len(), 1);
     assert_eq!(store.counts_for_document(&uri), (1, 0, 1));
 }
+
+#[tokio::test]
+async fn a_missing_server_binary_is_a_typed_error_not_an_io_error() {
+    let mut registry = forge_lsp::LanguageRegistry::new();
+    registry.register(forge_lsp::LanguageDefinition {
+        id: "nowhere".into(),
+        name: "Nowhere".into(),
+        extensions: vec!["nowhere".into()],
+        servers: vec![forge_lsp::ServerConfig::new(
+            "nowhere-ls",
+            "forge-test-no-such-language-server",
+        )],
+    });
+    let manager = forge_lsp::LspManager::new(registry, DiagnosticStore::new());
+    let dir = std::env::temp_dir();
+    let path = dir.join("forge-missing-server-test.nowhere");
+    let error = manager
+        .open_document_versioned(&path, String::new(), 1)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, LspError::ServerNotFound { name, command }
+            if name == "nowhere-ls" && command == "forge-test-no-such-language-server"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("not in PATH"));
+}
+
+#[test]
+fn commands_resolve_along_the_search_path_or_by_explicit_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = dir.path().join("my-ls");
+    std::fs::write(&tool, "").unwrap();
+    let search = std::env::join_paths([dir.path().to_path_buf()]).unwrap();
+    assert_eq!(
+        forge_lsp::process::resolve_command("my-ls", &search),
+        Some(tool.clone())
+    );
+    assert_eq!(
+        forge_lsp::process::resolve_command(tool.to_str().unwrap(), std::ffi::OsStr::new("")),
+        Some(tool)
+    );
+    assert_eq!(
+        forge_lsp::process::resolve_command("other-ls", &search),
+        None
+    );
+    let augmented = forge_lsp::process::tool_search_path();
+    let dirs: Vec<_> = std::env::split_paths(&augmented).collect();
+    for dir in &dirs {
+        assert!(dir.is_dir(), "{}", dir.display());
+    }
+    if let Some(cargo_bin) =
+        std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".cargo/bin"))
+        && cargo_bin.is_dir()
+    {
+        assert!(dirs.contains(&cargo_bin));
+    }
+}

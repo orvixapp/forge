@@ -292,3 +292,30 @@ fn worker_drives_rust_analyzer_like_the_editor() {
     drop(service);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn missing_servers_are_reported_once_and_other_errors_once_a_minute() {
+    let (tx, rx) = mpsc::sync_channel(16);
+    let mut reporter = Reporter::default();
+    let missing = forge_lsp::LspError::ServerNotFound {
+        name: "taplo".into(),
+        command: "taplo".into(),
+    };
+    reporter.report(&tx, &missing);
+    reporter.report(&tx, &missing);
+    reporter.report(&tx, &forge_lsp::LspError::Timeout);
+    reporter.report(&tx, &forge_lsp::LspError::Timeout);
+    reporter.report(&tx, &forge_lsp::LspError::Closed);
+    let messages: Vec<String> = rx
+        .try_iter()
+        .map(|update| match update {
+            Update::Status(message) => message,
+            _ => panic!("only status updates"),
+        })
+        .collect();
+    assert_eq!(messages.len(), 3);
+    assert!(messages[0].contains("taplo"));
+    assert!(messages[0].contains("[[languages]]"));
+    assert_eq!(messages[1], "LSP: Request timed out");
+    assert_eq!(messages[2], "LSP: Server connection closed");
+}

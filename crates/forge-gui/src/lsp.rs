@@ -403,6 +403,7 @@ async fn run(
     let mut ticker = tokio::time::interval(Duration::from_millis(25));
     let mut maintenance = Instant::now();
     let mut published = HashMap::new();
+    let mut reporter = Reporter::default();
     loop {
         ticker.tick().await;
         let (snapshots, requests, queries, watched, shutdown) = {
@@ -427,6 +428,7 @@ async fn run(
             &mut documents,
             &configuration.0,
             &results,
+            &mut reporter,
         )
         .await;
         cancel_stale_requests(&mut tasks, &snapshots);
@@ -457,11 +459,11 @@ async fn run(
                     )
                     .await
                 {
-                    let _ = results.try_send(Update::Status(format!("LSP: {error}")));
+                    reporter.report(&results, &error);
                     continue;
                 }
                 if let Err(error) = sync(&manager, old, &request.snapshot).await {
-                    let _ = results.try_send(Update::Status(format!("LSP: {error}")));
+                    reporter.report(&results, &error);
                     continue;
                 }
                 if let Some(doc) = documents.get_mut(&id) {
@@ -485,7 +487,7 @@ async fn run(
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        let _ = results.try_send(Update::Status(format!("LSP: {error}")));
+                        let _ = results.try_send(Update::Status(status_message(&error)));
                     }
                 }
             });
@@ -517,12 +519,51 @@ async fn run(
     manager.shutdown_all().await;
 }
 
+/// Turns worker errors into one notification each: a missing server is
+/// reported once with its command and file type; other errors repeat at
+/// most once a minute.
+#[derive(Default)]
+struct Reporter {
+    missing: std::collections::HashSet<String>,
+    recent: HashMap<String, Instant>,
+}
+
+impl Reporter {
+    fn report(&mut self, results: &mpsc::SyncSender<Update>, error: &forge_lsp::LspError) {
+        if let forge_lsp::LspError::ServerNotFound { command, .. } = error {
+            if !self.missing.insert(command.clone()) {
+                return;
+            }
+        } else {
+            let message = error.to_string();
+            let now = Instant::now();
+            self.recent
+                .retain(|_, sent| now.duration_since(*sent) < Duration::from_secs(60));
+            if self.recent.insert(message, now).is_some() {
+                return;
+            }
+        }
+        let _ = results.try_send(Update::Status(status_message(error)));
+    }
+}
+
+fn status_message(error: &forge_lsp::LspError) -> String {
+    match error {
+        forge_lsp::LspError::ServerNotFound { name, command } => trf(
+            "Language server {} is not installed (`{}` not found in PATH); the local completion stays. Install it or change [[languages]] in the user config.",
+            &[name, command],
+        ),
+        other => format!("LSP: {other}"),
+    }
+}
+
 async fn sync_documents(
     manager: &LspManager,
     snapshots: &HashMap<u64, Snapshot>,
     documents: &mut HashMap<u64, OpenDocument>,
     config: &forge_gui::config::LspConfig,
     results: &mpsc::SyncSender<Update>,
+    reporter: &mut Reporter,
 ) {
     let closed: Vec<_> = documents
         .keys()
@@ -571,8 +612,14 @@ async fn sync_documents(
                     doc.opened = true;
                 }
                 Err(error) => {
-                    doc.retry = Instant::now() + Duration::from_secs(5);
-                    let _ = results.try_send(Update::Status(format!("LSP: {error}")));
+                    // A missing binary is retried slowly (it may get installed).
+                    doc.retry = Instant::now()
+                        + if matches!(error, forge_lsp::LspError::ServerNotFound { .. }) {
+                            Duration::from_secs(60)
+                        } else {
+                            Duration::from_secs(5)
+                        };
+                    reporter.report(results, &error);
                 }
             }
         }

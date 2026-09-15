@@ -145,6 +145,9 @@ fn spanish(english: &str) -> Option<&'static str> {
         "No locations found" => "No se encontraron ubicaciones",
         "{} locations" => "{} ubicaciones",
         "No language server for this file" => "No hay servidor de lenguaje para este archivo",
+        "Language server {} is not installed (`{}` not found in PATH); the local completion stays. Install it or change [[languages]] in the user config." => {
+            "El servidor de lenguaje {} no está instalado (`{}` no está en el PATH); se mantiene el completado local. Instálalo o cambia [[languages]] en la configuración de usuario."
+        }
         "Nothing to change" => "Nada que cambiar",
         "Apply {} edits in {} files" => "Aplicar {} cambios en {} archivos",
         "{} · {} edits" => "{} · {} cambios",
