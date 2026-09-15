@@ -6,6 +6,29 @@ This repository is implementing the Phase 0 prototype described in
 The first vertical slice validates the internal IPC boundary and a persistent
 PTY daemon before adding the GPU renderer.
 
+## Install on Linux
+
+Every run of the `release` workflow (Actions tab → *release* → *Run
+workflow*, or a `v*` tag, which also publishes a GitHub Release) produces the
+`forge-linux-x86_64` artifact with two installers built on Ubuntu 24.04
+(glibc 2.39; Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch):
+
+```bash
+sudo apt install ./forge_<version>_amd64.deb          # Debian/Ubuntu → `forge`
+# any distribution, no root needed:
+tar -xzf forge-<version>-linux-x86_64.tar.gz
+./forge-<version>-linux-x86_64/install.sh             # ~/.local/bin/forge + menu entry
+./forge-<version>-linux-x86_64/install.sh --prefix /usr/local   # system-wide (sudo)
+```
+
+Both ship `forge-gui`, the terminal daemon, `libghostty-vt` and the shell
+integration together under `lib/forge/`; the binaries find each other there.
+Vulkan drivers are needed for the GPU renderer (`mesa-vulkan-drivers` on
+Debian/Ubuntu). The same packages are built locally with
+`./scripts/bootstrap-ghostty.sh`, `cargo build --release -p forge-gui -p proto-termd`
+and `./scripts/package-linux.sh` (output in `dist/`). Windows and macOS are
+not packaged yet.
+
 ## Run
 
 ```bash

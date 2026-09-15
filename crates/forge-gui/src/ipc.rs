@@ -160,6 +160,9 @@ pub fn spawn_ipc_worker(
     });
 }
 
+#[cfg(any(unix, windows))]
+pub use client::install_dir;
+
 /// The client side of the daemon transport: a Unix socket, or a named pipe
 /// on Windows. Both are plain `AsyncRead + AsyncWrite` streams from here.
 #[cfg(any(unix, windows))]
@@ -592,8 +595,17 @@ mod client {
             .to_path_buf()
     }
 
-    /// `libghostty-vt` built by `scripts/bootstrap-ghostty.sh`, unless
-    /// `FORGE_GHOSTTY_LIB` points elsewhere.
+    /// Directory of the running executable: a packaged install keeps the
+    /// daemon, `libghostty-vt` and the shell integration next to it.
+    pub fn install_dir() -> Option<PathBuf> {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    }
+
+    /// `libghostty-vt`: `FORGE_GHOSTTY_LIB`, else the copy next to the
+    /// executable (packaged install), else the one built by
+    /// `scripts/bootstrap-ghostty.sh` in the workspace.
     pub fn ghostty_library() -> PathBuf {
         let file = if cfg!(target_os = "macos") {
             "libghostty-vt.dylib"
@@ -602,25 +614,59 @@ mod client {
         } else {
             "libghostty-vt.so"
         };
-        std::env::var_os("FORGE_GHOSTTY_LIB").map_or_else(
-            || workspace_dir().join("target/ghostty/lib").join(file),
-            PathBuf::from,
-        )
+        if let Some(path) = std::env::var_os("FORGE_GHOSTTY_LIB") {
+            return PathBuf::from(path);
+        }
+        if let Some(installed) = install_dir().map(|dir| dir.join(file))
+            && installed.is_file()
+        {
+            return installed;
+        }
+        workspace_dir().join("target/ghostty/lib").join(file)
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
 
+        /// Both tests touch the file next to the test executable.
+        static SIBLING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
         #[test]
         fn workspace_and_default_ghostty_paths_are_stable() {
+            let _guard = SIBLING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(
                 workspace_dir().file_name().and_then(|name| name.to_str()),
                 Some("forge")
             );
-            if std::env::var_os("FORGE_GHOSTTY_LIB").is_none() {
+            if std::env::var_os("FORGE_GHOSTTY_LIB").is_none()
+                && !install_dir().is_some_and(|dir| dir.join("libghostty-vt.so").is_file())
+            {
                 assert!(ghostty_library().starts_with(workspace_dir().join("target/ghostty/lib")));
             }
+        }
+
+        /// A packaged install (`scripts/package-linux.sh`) keeps the library
+        /// next to the executable and must win over the workspace build.
+        #[test]
+        #[cfg(target_os = "linux")]
+        fn packaged_library_next_to_the_executable_is_preferred() {
+            let _guard = SIBLING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if std::env::var_os("FORGE_GHOSTTY_LIB").is_some() {
+                return;
+            }
+            let sibling = install_dir().unwrap().join("libghostty-vt.so");
+            if sibling.is_file() {
+                return;
+            }
+            std::fs::write(&sibling, b"").unwrap();
+            let resolved = ghostty_library();
+            let _ = std::fs::remove_file(&sibling);
+            assert_eq!(resolved, sibling);
         }
     }
 }

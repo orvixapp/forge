@@ -82,10 +82,17 @@ pub struct WindowFactory {
 }
 
 /// Where the shell integration scripts live: `$FORGE_SHELL_INTEGRATION`,
-/// else the repository's `assets/` during development.
+/// else `shell-integration/` next to the executable (a packaged install,
+/// see `scripts/package-linux.sh`), else the repository's `assets/` during
+/// development.
 pub fn shell_integration_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("FORGE_SHELL_INTEGRATION") {
         return Some(PathBuf::from(dir)).filter(|dir| dir.is_dir());
+    }
+    if let Some(installed) = crate::ipc::install_dir().map(|dir| dir.join("shell-integration"))
+        && installed.is_dir()
+    {
+        return Some(installed);
     }
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()?

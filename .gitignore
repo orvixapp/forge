@@ -6,3 +6,4 @@ graphify-out/
 # Local agent grants must never live in the repository; they are stored
 # under the user config dir. Ignore stray files from older builds.
 .forge/permissions.json
+/dist/
