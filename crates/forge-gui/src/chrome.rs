@@ -766,13 +766,15 @@ fn agent_panel(
                                     if turn_active {
                                         tr("The agent is working…").to_owned()
                                     } else {
+                                        // Same cursor glyph and spacing as the
+                                        // other text inputs (`"{value}▏"`).
                                         format!(
-                                            "{} ▏",
+                                            "{}▏",
                                             tr("Ask about the code or request a change…")
                                         )
                                     }
                                 } else {
-                                    format!("{} ▏", agent.prompt)
+                                    format!("{}▏", agent.prompt)
                                 }),
                         ),
                 )
