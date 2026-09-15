@@ -1,9 +1,11 @@
 name: release
 
 # Builds the Linux installers (.deb and .tar.gz with install.sh) from a
-# release build plus the pinned libghostty-vt. Run it by hand from the
-# Actions tab to get the files as a workflow artifact, or push a `v*` tag
-# to also publish them as a GitHub Release.
+# release build plus the pinned libghostty-vt and publishes them:
+#   - run by hand (Actions tab → release → Run workflow, or
+#     `gh workflow run release`): the rolling pre-release `dev`, replaced on
+#     every run, at <repo>/releases/tag/dev;
+#   - a `v*` tag: a proper release with generated notes.
 on:
   workflow_dispatch:
     inputs:
@@ -68,12 +70,29 @@ jobs:
             dist/*.tar.gz
             dist/SHA256SUMS-*.txt
           if-no-files-found: error
-      - name: GitHub Release
+      - name: Tagged release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/*.deb
-            dist/*.tar.gz
-            dist/SHA256SUMS-*.txt
-          generate_release_notes: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" --title "Forge $GITHUB_REF_NAME"
+          --generate-notes dist/*.deb dist/*.tar.gz dist/SHA256SUMS-*.txt
+      - name: Rolling dev pre-release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          # One `dev` pre-release that always carries the latest manual build.
+          gh release delete dev --yes --cleanup-tag || true
+          git tag -f dev "$GITHUB_SHA"
+          git push -f origin dev
+          short=$(git rev-parse --short "$GITHUB_SHA")
+          {
+            echo "Linux x86_64 installers built from $GITHUB_SHA on $(date -u +%Y-%m-%d)."
+            echo
+            echo 'Debian/Ubuntu: `sudo apt install ./forge_*_amd64.deb`.'
+            echo 'Any distribution: unpack the tarball and run `install.sh` (no root needed).'
+          } > notes.md
+          gh release create dev --prerelease --title "Forge dev build ($short)" \
+            --notes-file notes.md dist/*.deb dist/*.tar.gz dist/SHA256SUMS-*.txt
