@@ -225,7 +225,12 @@ impl ServerInstance {
                                 params.uri.as_str(),
                                 params.diagnostics.len()
                             );
-                            diag_store.update(params.uri, params.version, params.diagnostics);
+                            diag_store.update_from(
+                                &params.uri,
+                                &crate::manager::push_source(&server_name_diag),
+                                params.version,
+                                params.diagnostics,
+                            );
                         }
                         Err(e) => {
                             warn!("[{server_name_diag}] Malformed publishDiagnostics params: {e}");

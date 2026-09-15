@@ -237,7 +237,7 @@ fn stale_diagnostics_do_not_replace_newer_results_and_huge_ranges_are_bounded() 
     let uri = Uri::from_str("file:///workspace/main.rs").unwrap();
     let store = DiagnosticStore::new();
     store.update(
-        uri.clone(),
+        &uri,
         Some(57),
         vec![Diagnostic {
             range: Range::new(Position::new(0, 0), Position::new(u32::MAX, 1)),
@@ -245,7 +245,7 @@ fn stale_diagnostics_do_not_replace_newer_results_and_huge_ranges_are_bounded() 
             ..Default::default()
         }],
     );
-    store.update(uri.clone(), Some(42), Vec::new());
+    store.update(&uri, Some(42), Vec::new());
     assert_eq!(store.version_for_document(&uri), Some(57));
     assert_eq!(store.for_line(&uri, 500).len(), 1);
     assert_eq!(store.counts_for_document(&uri), (1, 0, 1));

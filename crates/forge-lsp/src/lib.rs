@@ -15,16 +15,20 @@ pub mod process;
 pub mod registry;
 pub mod sync;
 pub mod transport;
+pub mod workspace_edit;
 
 pub use capabilities::client_capabilities;
 pub use client::{LspClient, LspError};
 pub use diagnostics::{DiagnosticStore, DocumentDiagnostics};
 pub use jsonrpc::{Id, Message, Notification, Request, Response, ResponseError};
-pub use manager::{LspManager, ServerKey};
+pub use manager::{Indentation, LspManager, ServerKey};
 pub use mock::MockLspServer;
 pub use process::{ServerInstance, ServerStatus};
 pub use registry::{LanguageDefinition, LanguageRegistry, ServerConfig};
-pub use sync::{DocumentTracker, offset_to_position, path_to_uri, position_to_offset, uri_to_path};
+pub use sync::{
+    DocumentTracker, offset_to_position, path_to_uri, position_to_offset, snapshot_delta,
+    uri_to_path,
+};
 pub use transport::TransportError;
 
 #[cfg(test)]

@@ -119,6 +119,30 @@ pub fn transaction_to_changes(
         .collect()
 }
 
+/// Minimal single replacement turning `old` into `new`: the common prefix
+/// and suffix are kept, whatever lies between is replaced. Coalesces every
+/// mutation path (multi-cursor, undo/redo, proposals, reloads) into one
+/// `didChange` without the editor having to replay transactions.
+#[must_use]
+pub fn snapshot_delta(old: &Rope, new: &Rope) -> Vec<Edit> {
+    let prefix = old
+        .chars()
+        .zip(new.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let suffix = old
+        .chars()
+        .reversed()
+        .zip(new.chars().reversed())
+        .take(old.len_chars().min(new.len_chars()).saturating_sub(prefix))
+        .take_while(|(a, b)| a == b)
+        .count();
+    vec![Edit {
+        range: prefix..old.len_chars() - suffix,
+        text: new.slice(prefix..new.len_chars() - suffix).to_string(),
+    }]
+}
+
 /// State of an open document tracked by the LSP manager.
 #[derive(Debug, Clone)]
 pub struct TrackedDocument {
@@ -126,6 +150,8 @@ pub struct TrackedDocument {
     pub language_id: String,
     pub version: i32,
     pub text: String,
+    /// `resultId` of the last pull diagnostics report, for `unchanged` answers.
+    pub pull_result_id: Option<String>,
 }
 
 /// Tracks open documents, their versions, and generates sync params.
@@ -172,6 +198,7 @@ impl DocumentTracker {
                 language_id,
                 version,
                 text,
+                pull_result_id: None,
             },
         );
 
@@ -259,6 +286,13 @@ impl DocumentTracker {
     pub fn set_version(&mut self, uri: &Uri, version: i32) {
         if let Some(doc) = self.documents.get_mut(uri) {
             doc.version = version;
+        }
+    }
+
+    /// Remembers the `resultId` of the latest pull diagnostics report.
+    pub fn set_pull_result_id(&mut self, uri: &Uri, result_id: Option<String>) {
+        if let Some(doc) = self.documents.get_mut(uri) {
+            doc.pull_result_id = result_id;
         }
     }
 

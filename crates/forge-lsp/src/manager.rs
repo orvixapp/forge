@@ -5,13 +5,15 @@ use crate::registry::{LanguageRegistry, ServerConfig};
 use crate::sync::path_to_uri;
 use forge_buffer::Edit;
 use lsp_types::{
-    CodeActionContext, CodeActionOrCommand, CodeActionParams, CodeActionTriggerKind,
+    CodeAction, CodeActionContext, CodeActionOrCommand, CodeActionParams, CodeActionTriggerKind,
     CompletionContext, CompletionItem, CompletionParams, CompletionResponse, CompletionTriggerKind,
+    DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
     DocumentFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
     DocumentSymbolResponse, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse, Hover,
     HoverContents, HoverParams, Location, MarkedString, MarkupContent, MarkupKind,
-    PartialResultParams, Position, ReferenceContext, ReferenceParams, SymbolInformation,
-    TextDocumentIdentifier, TextDocumentPositionParams, TextEdit, Uri, WorkDoneProgressParams,
+    PartialResultParams, Position, PrepareRenameResponse, ReferenceContext, ReferenceParams,
+    RenameParams, SymbolInformation, TextDocumentIdentifier, TextDocumentPositionParams, TextEdit,
+    Uri, WorkDoneProgressParams, WorkspaceEdit,
 };
 use ropey::Rope;
 use std::collections::HashMap;
@@ -45,6 +47,64 @@ impl ServerView {
             .get(key)
             .is_some_and(|value| !value.is_null() && value != &serde_json::Value::Bool(false))
     }
+    /// Whether `key.field` is announced as `true` (`completionProvider.resolveProvider`).
+    fn flag(&self, key: &str, field: &str) -> bool {
+        self.capabilities
+            .get(key)
+            .and_then(|value| value.get(field))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+    fn triggers_completion(&self, character: char) -> bool {
+        self.capabilities
+            .get("completionProvider")
+            .and_then(|value| value.get("triggerCharacters"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|characters| {
+                characters
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .any(|trigger| trigger.chars().eq(std::iter::once(character)))
+            })
+    }
+}
+
+/// Indentation the server should format with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Indentation {
+    pub tab_size: u32,
+    pub insert_spaces: bool,
+}
+
+impl Default for Indentation {
+    fn default() -> Self {
+        Self {
+            tab_size: 4,
+            insert_spaces: true,
+        }
+    }
+}
+
+impl Indentation {
+    fn options(self) -> FormattingOptions {
+        FormattingOptions {
+            tab_size: self.tab_size,
+            insert_spaces: self.insert_spaces,
+            trim_trailing_whitespace: Some(true),
+            insert_final_newline: Some(true),
+            ..Default::default()
+        }
+    }
+}
+
+fn pull_source(server_name: &str) -> String {
+    format!("{server_name}/pull")
+}
+
+/// Source key of a server's `publishDiagnostics` in the [`DiagnosticStore`].
+#[must_use]
+pub fn push_source(server_name: &str) -> String {
+    format!("{server_name}/push")
 }
 
 type FileServers = (Uri, String, Vec<(ServerConfig, PathBuf)>);
@@ -419,16 +479,107 @@ impl LspManager {
                 instance.record_activity();
                 let tracker_arc = instance.tracker();
                 let mut tracker = tracker_arc.lock().await;
-                if let Some(close_params) = tracker.did_close(&uri)
-                    && instance.status() == ServerStatus::Running
-                    && let Some(client) = instance.client()
-                {
-                    let _ = client.did_close(close_params).await;
+                if let Some(close_params) = tracker.did_close(&uri) {
+                    // Pull reports only describe open documents; push ones
+                    // are the server's to clear (cargo check keeps finding
+                    // errors in files that are not open).
+                    self.diagnostics
+                        .clear_source(&uri, &pull_source(&key.server_name));
+                    if instance.status() == ServerStatus::Running
+                        && let Some(client) = instance.client()
+                    {
+                        let _ = client.did_close(close_params).await;
+                    }
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// `textDocument/diagnostic` (LSP 3.17) for every server advertising a
+    /// `diagnosticProvider`; the report is stored at `version` under the
+    /// server's pull source so it merges with published diagnostics.
+    /// Returns how many diagnostics the servers reported (an `unchanged`
+    /// answer counts as one), so callers can retry while a server is
+    /// still indexing and answers with nothing.
+    ///
+    /// # Errors
+    /// Returns transport or protocol errors.
+    pub async fn pull_diagnostics(
+        &self,
+        file_path: &Path,
+        version: u64,
+    ) -> Result<usize, LspError> {
+        let Some((uri, _, targets)) = self.resolve_file_servers(file_path) else {
+            return Ok(0);
+        };
+        let version = i32::try_from(version).ok();
+        let servers = self.server_views().await;
+        let mut reported = 0;
+        for (config, root_path) in targets {
+            let key = ServerKey {
+                server_name: config.name,
+                root_path,
+            };
+            let Some(view) = servers.get(&key) else {
+                continue;
+            };
+            if view.status() != ServerStatus::Running || !view.supports("diagnosticProvider") {
+                continue;
+            }
+            let Some(client) = view.client() else {
+                continue;
+            };
+            let tracker = {
+                let servers = self.servers.read().await;
+                servers.get(&key).map(ServerInstance::tracker)
+            };
+            let Some(tracker) = tracker else { continue };
+            let previous_result_id = tracker
+                .lock()
+                .await
+                .get(&uri)
+                .and_then(|doc| doc.pull_result_id.clone());
+            let params = DocumentDiagnosticParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                identifier: None,
+                previous_result_id,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            };
+            let report: DocumentDiagnosticReportResult = client
+                .send_request("textDocument/diagnostic", params)
+                .await?;
+            let source = pull_source(&key.server_name);
+            match report {
+                DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(full)) => {
+                    tracker
+                        .lock()
+                        .await
+                        .set_pull_result_id(&uri, full.full_document_diagnostic_report.result_id);
+                    reported += full.full_document_diagnostic_report.items.len();
+                    self.diagnostics.update_from(
+                        &uri,
+                        &source,
+                        version,
+                        full.full_document_diagnostic_report.items,
+                    );
+                    for (related, report) in full.related_documents.into_iter().flatten() {
+                        if let lsp_types::DocumentDiagnosticReportKind::Full(report) = report {
+                            reported += report.items.len();
+                            self.diagnostics
+                                .update_from(&related, &source, None, report.items);
+                        }
+                    }
+                }
+                DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Unchanged(_)) => {
+                    reported += 1;
+                }
+                DocumentDiagnosticReportResult::Partial(_) => {}
+            }
+        }
+        Ok(reported)
     }
 
     /// Requests code completion at a position in a file, merging completions across servers.
@@ -474,6 +625,7 @@ impl LspManager {
             if let Some(instance) = servers.get(&key)
                 && instance.status() == ServerStatus::Running
                 && instance.supports("completionProvider")
+                && trigger_char.is_none_or(|character| instance.triggers_completion(character))
                 && let Some(client) = instance.client()
                 && let Ok(Some(resp)) = client.completion(params.clone()).await
             {
@@ -496,6 +648,199 @@ impl LspManager {
         });
 
         Ok(all_items)
+    }
+
+    /// Whether any server of this file completes after `character`.
+    #[must_use]
+    pub async fn completion_trigger(&self, file_path: &Path, character: char) -> bool {
+        let Some((_, _, targets)) = self.resolve_file_servers(file_path) else {
+            return false;
+        };
+        let servers = self.server_views().await;
+        targets.into_iter().any(|(config, root_path)| {
+            servers
+                .get(&ServerKey {
+                    server_name: config.name,
+                    root_path,
+                })
+                .is_some_and(|view| view.triggers_completion(character))
+        })
+    }
+
+    /// `completionItem/resolve` when the server offers it; otherwise the
+    /// item is returned as is.
+    ///
+    /// # Errors
+    /// Returns transport or protocol errors.
+    pub async fn resolve_completion(
+        &self,
+        file_path: &Path,
+        item: CompletionItem,
+    ) -> Result<CompletionItem, LspError> {
+        let Some((_, _, targets)) = self.resolve_file_servers(file_path) else {
+            return Ok(item);
+        };
+        let servers = self.server_views().await;
+        for (config, root_path) in targets {
+            if let Some(view) = servers.get(&ServerKey {
+                server_name: config.name,
+                root_path,
+            }) && view.status() == ServerStatus::Running
+                && view.flag("completionProvider", "resolveProvider")
+                && let Some(client) = view.client()
+            {
+                return client.resolve_completion_item(item).await;
+            }
+        }
+        Ok(item)
+    }
+
+    /// Requests goto implementation for a position in a file.
+    ///
+    /// # Errors
+    /// Returns transport, serialization, protocol or lifecycle errors.
+    pub async fn goto_implementation(
+        &self,
+        file_path: &Path,
+        position: Position,
+    ) -> Result<Option<GotoDefinitionResponse>, LspError> {
+        let Some((uri, _, targets)) = self.resolve_file_servers(file_path) else {
+            return Ok(None);
+        };
+        let params = GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let servers = self.server_views().await;
+        for (config, root_path) in targets {
+            if let Some(view) = servers.get(&ServerKey {
+                server_name: config.name,
+                root_path,
+            }) && view.status() == ServerStatus::Running
+                && view.supports("implementationProvider")
+                && let Some(client) = view.client()
+                && let Ok(Some(response)) = client
+                    .send_request::<_, Option<GotoDefinitionResponse>>(
+                        "textDocument/implementation",
+                        params.clone(),
+                    )
+                    .await
+            {
+                return Ok(Some(response));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `textDocument/prepareRename`: the range and placeholder of the symbol
+    /// at `position`, `Ok(None)` when the server declines or lacks prepare.
+    ///
+    /// # Errors
+    /// Returns transport or protocol errors.
+    pub async fn prepare_rename(
+        &self,
+        file_path: &Path,
+        position: Position,
+    ) -> Result<Option<PrepareRenameResponse>, LspError> {
+        let Some((uri, _, targets)) = self.resolve_file_servers(file_path) else {
+            return Ok(None);
+        };
+        let servers = self.server_views().await;
+        for (config, root_path) in targets {
+            if let Some(view) = servers.get(&ServerKey {
+                server_name: config.name,
+                root_path,
+            }) && view.status() == ServerStatus::Running
+                && view.flag("renameProvider", "prepareProvider")
+                && let Some(client) = view.client()
+            {
+                return client
+                    .send_request(
+                        "textDocument/prepareRename",
+                        TextDocumentPositionParams {
+                            text_document: TextDocumentIdentifier { uri },
+                            position,
+                        },
+                    )
+                    .await;
+            }
+        }
+        Ok(None)
+    }
+
+    /// `textDocument/rename` from the first server that provides it.
+    ///
+    /// # Errors
+    /// Returns transport or protocol errors (including the server refusing
+    /// the new name).
+    pub async fn rename(
+        &self,
+        file_path: &Path,
+        position: Position,
+        new_name: String,
+    ) -> Result<Option<WorkspaceEdit>, LspError> {
+        let Some((uri, _, targets)) = self.resolve_file_servers(file_path) else {
+            return Ok(None);
+        };
+        let servers = self.server_views().await;
+        for (config, root_path) in targets {
+            if let Some(view) = servers.get(&ServerKey {
+                server_name: config.name,
+                root_path,
+            }) && view.status() == ServerStatus::Running
+                && view.supports("renameProvider")
+                && let Some(client) = view.client()
+            {
+                return client
+                    .send_request(
+                        "textDocument/rename",
+                        RenameParams {
+                            text_document_position: TextDocumentPositionParams {
+                                text_document: TextDocumentIdentifier { uri },
+                                position,
+                            },
+                            new_name,
+                            work_done_progress_params: WorkDoneProgressParams::default(),
+                        },
+                    )
+                    .await;
+            }
+        }
+        Ok(None)
+    }
+
+    /// `codeAction/resolve` for actions listed without their edit.
+    ///
+    /// # Errors
+    /// Returns transport or protocol errors.
+    pub async fn resolve_code_action(
+        &self,
+        file_path: &Path,
+        action: CodeAction,
+    ) -> Result<CodeAction, LspError> {
+        if action.edit.is_some() || action.data.is_none() {
+            return Ok(action);
+        }
+        let Some((_, _, targets)) = self.resolve_file_servers(file_path) else {
+            return Ok(action);
+        };
+        let servers = self.server_views().await;
+        for (config, root_path) in targets {
+            if let Some(view) = servers.get(&ServerKey {
+                server_name: config.name,
+                root_path,
+            }) && view.status() == ServerStatus::Running
+                && view.flag("codeActionProvider", "resolveProvider")
+                && let Some(client) = view.client()
+            {
+                return client.send_request("codeAction/resolve", action).await;
+            }
+        }
+        Ok(action)
     }
 
     /// Requests hover information at a position, stacking hover contents if multiple servers respond.
@@ -689,18 +1034,18 @@ impl LspManager {
     ///
     /// # Errors
     /// Returns transport, serialization, protocol or lifecycle errors.
-    pub async fn formatting(&self, file_path: &Path) -> Result<Option<Vec<TextEdit>>, LspError> {
+    pub async fn formatting(
+        &self,
+        file_path: &Path,
+        indentation: Indentation,
+    ) -> Result<Option<Vec<TextEdit>>, LspError> {
         let Some((uri, _, server_targets)) = self.resolve_file_servers(file_path) else {
             return Ok(None);
         };
 
         let params = DocumentFormattingParams {
             text_document: TextDocumentIdentifier { uri },
-            options: FormattingOptions {
-                tab_size: 4,
-                insert_spaces: true,
-                ..Default::default()
-            },
+            options: indentation.options(),
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
@@ -732,6 +1077,7 @@ impl LspManager {
         &self,
         file_path: &Path,
         range: lsp_types::Range,
+        indentation: Indentation,
     ) -> Result<Option<Vec<TextEdit>>, LspError> {
         let Some((uri, _, server_targets)) = self.resolve_file_servers(file_path) else {
             return Ok(None);
@@ -740,11 +1086,7 @@ impl LspManager {
         let params = DocumentRangeFormattingParams {
             text_document: TextDocumentIdentifier { uri },
             range,
-            options: FormattingOptions {
-                tab_size: 4,
-                insert_spaces: true,
-                ..Default::default()
-            },
+            options: indentation.options(),
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 

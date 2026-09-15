@@ -113,10 +113,48 @@ impl DocumentDiagnostics {
     }
 }
 
-/// Global diagnostic store indexed by document URI and lines.
+/// Diagnostics of one document as reported by one source (`server/push`,
+/// `server/pull`), so servers and transports never overwrite each other.
+#[derive(Debug, Clone)]
+struct SourceDiagnostics {
+    version: Option<i32>,
+    items: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Default)]
+struct StoreInner {
+    sources: HashMap<Uri, HashMap<String, SourceDiagnostics>>,
+    merged: HashMap<Uri, DocumentDiagnostics>,
+}
+
+impl StoreInner {
+    fn rebuild(&mut self, uri: &Uri) {
+        let Some(sources) = self.sources.get(uri) else {
+            self.merged.remove(uri);
+            return;
+        };
+        if sources.is_empty() {
+            self.sources.remove(uri);
+            self.merged.remove(uri);
+            return;
+        }
+        let version = sources.values().filter_map(|source| source.version).max();
+        let items: Vec<Diagnostic> = sources
+            .values()
+            .flat_map(|source| source.items.iter().cloned())
+            .collect();
+        self.merged.insert(
+            uri.clone(),
+            DocumentDiagnostics::new(uri.clone(), version, items),
+        );
+    }
+}
+
+/// Global diagnostic store indexed by document URI and lines, merged across
+/// sources (push and pull of every server).
 #[derive(Debug, Clone, Default)]
 pub struct DiagnosticStore {
-    inner: Arc<RwLock<HashMap<Uri, DocumentDiagnostics>>>,
+    inner: Arc<RwLock<StoreInner>>,
     generation: Arc<AtomicU64>,
 }
 
@@ -126,21 +164,56 @@ impl DiagnosticStore {
         Self::default()
     }
 
-    /// Updates diagnostics for a document from `textDocument/publishDiagnostics`.
-    pub fn update(&self, uri: Uri, version: Option<i32>, items: Vec<Diagnostic>) {
-        let doc_diag = DocumentDiagnostics::new(uri.clone(), version, items);
+    /// Updates diagnostics for a document from an anonymous source
+    /// (`textDocument/publishDiagnostics` of a single server).
+    pub fn update(&self, uri: &Uri, version: Option<i32>, items: Vec<Diagnostic>) {
+        self.update_from(uri, "push", version, items);
+    }
+
+    /// Updates the diagnostics one `source` reports for a document. A
+    /// report older than the source's current one is ignored.
+    pub fn update_from(
+        &self,
+        uri: &Uri,
+        source: &str,
+        version: Option<i32>,
+        items: Vec<Diagnostic>,
+    ) {
         let mut guard = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard
-            .get(&uri)
+            .sources
+            .get(uri)
+            .and_then(|sources| sources.get(source))
             .is_some_and(|old| old.version.zip(version).is_some_and(|(old, new)| new < old))
         {
             return;
         }
-        guard.insert(uri, doc_diag);
+        guard
+            .sources
+            .entry(uri.clone())
+            .or_default()
+            .insert(source.to_owned(), SourceDiagnostics { version, items });
+        guard.rebuild(uri);
         self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Drops what one source reported for a document (pull results on close).
+    pub fn clear_source(&self, uri: &Uri, source: &str) {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let removed = guard
+            .sources
+            .get_mut(uri)
+            .is_some_and(|sources| sources.remove(source).is_some());
+        if removed {
+            guard.rebuild(uri);
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Clears diagnostics for a document (e.g. on close or deletion).
@@ -149,7 +222,8 @@ impl DiagnosticStore {
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.remove(uri);
+        guard.sources.remove(uri);
+        guard.merged.remove(uri);
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -159,22 +233,24 @@ impl DiagnosticStore {
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.clear();
+        guard.sources.clear();
+        guard.merged.clear();
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Returns all diagnostics for a specific line in a document.
+    /// Bumps on every change; cheap way for pollers to skip unchanged state.
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
     }
 
-    /// Published document revision, if the server supplied one.
+    /// Newest published document revision across sources, if any supplied one.
     #[must_use]
     pub fn version_for_document(&self, uri: &Uri) -> Option<i32> {
         self.inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .merged
             .get(uri)
             .and_then(|document| document.version)
     }
@@ -187,6 +263,7 @@ impl DiagnosticStore {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard
+            .merged
             .get(uri)
             .map(|doc| doc.for_line(line).into_iter().cloned().collect())
             .unwrap_or_default()
@@ -200,6 +277,7 @@ impl DiagnosticStore {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard
+            .merged
             .get(uri)
             .map(|doc| doc.for_line_range(lines).into_iter().cloned().collect())
             .unwrap_or_default()
@@ -213,6 +291,7 @@ impl DiagnosticStore {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard
+            .merged
             .get(uri)
             .map(|doc| doc.items.clone())
             .unwrap_or_default()
@@ -225,7 +304,7 @@ impl DiagnosticStore {
             .inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.get(uri).map_or((0, 0, 0), |doc| {
+        guard.merged.get(uri).map_or((0, 0, 0), |doc| {
             (doc.error_count(), doc.warning_count(), doc.items.len())
         })
     }
@@ -240,7 +319,7 @@ impl DiagnosticStore {
         let mut errors = 0;
         let mut warnings = 0;
         let mut total = 0;
-        for doc in guard.values() {
+        for doc in guard.merged.values() {
             errors += doc.error_count();
             warnings += doc.warning_count();
             total += doc.items.len();
@@ -256,6 +335,7 @@ impl DiagnosticStore {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard
+            .merged
             .iter()
             .map(|(uri, doc)| (uri.clone(), doc.items.clone()))
             .collect()
@@ -305,7 +385,7 @@ mod tests {
             ..Default::default()
         };
 
-        store.update(uri.clone(), Some(1), vec![diag1, diag2]);
+        store.update(&uri, Some(1), vec![diag1, diag2]);
 
         // Line 5 should have 2 diagnostics
         let line5 = store.for_line(&uri, 5);
@@ -331,6 +411,32 @@ mod tests {
     }
 
     #[test]
+    fn sources_merge_without_overwriting_each_other() {
+        let store = DiagnosticStore::new();
+        let uri = Uri::from_str("file:///project/src/lib.rs").unwrap();
+        let diag = |message: &str| Diagnostic {
+            range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: message.to_string(),
+            ..Default::default()
+        };
+        store.update_from(&uri, "ra/push", Some(3), vec![diag("cargo check")]);
+        store.update_from(&uri, "ra/pull", Some(4), vec![diag("native")]);
+        assert_eq!(store.counts_for_document(&uri), (2, 0, 2));
+        assert_eq!(store.version_for_document(&uri), Some(4));
+        // A stale pull report for the same source is dropped.
+        store.update_from(&uri, "ra/pull", Some(2), Vec::new());
+        assert_eq!(store.counts_for_document(&uri), (2, 0, 2));
+        // Dropping one source keeps the other; dropping the last removes the document.
+        store.clear_source(&uri, "ra/pull");
+        assert_eq!(store.for_document(&uri)[0].message, "cargo check");
+        store.update_from(&uri, "ra/push", Some(5), Vec::new());
+        assert_eq!(store.counts_for_document(&uri), (0, 0, 0));
+        store.clear_source(&uri, "ra/push");
+        assert!(store.all_diagnostics().is_empty());
+    }
+
+    #[test]
     fn test_benchmark_50k_diagnostics_scale() {
         let store = DiagnosticStore::new();
         let uri = Uri::from_str("file:///big/file.rs").unwrap();
@@ -350,7 +456,7 @@ mod tests {
         }
 
         let start = std::time::Instant::now();
-        store.update(uri.clone(), Some(1), items);
+        store.update(&uri, Some(1), items);
         let update_elapsed = start.elapsed();
         // Should index 50k diagnostics in tens of milliseconds
         assert!(update_elapsed.as_millis() < 500);
