@@ -756,6 +756,7 @@ fn agent_panel(
                         .child(
                             div()
                                 .flex_1()
+                                .min_w(px(0.0))
                                 .text_color(color(if agent.prompt.is_empty() {
                                     theme.muted
                                 } else {
