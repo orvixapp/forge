@@ -1,0 +1,24 @@
+[package]
+name = "forge-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Language Server Protocol client for Forge: transport, protocol, lifecycle, document sync and capabilities"
+
+[dependencies]
+anyhow.workspace = true
+forge-buffer = { path = "../forge-buffer" }
+lsp-types.workspace = true
+ropey.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
