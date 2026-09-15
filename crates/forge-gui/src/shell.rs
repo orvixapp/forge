@@ -74,10 +74,15 @@ pub enum ShellCommand {
     LspDefinition,
     LspSignature,
     LspDiagnostics,
+    LspReferences,
+    LspImplementation,
+    LspRename,
+    LspCodeAction,
+    LspFormat,
 }
 
 impl ShellCommand {
-    pub const ALL: [Self; 62] = [
+    pub const ALL: [Self; 67] = [
         Self::NewTerminalTab,
         Self::NewTerminalTabInDirectory,
         Self::CloseWindow,
@@ -140,6 +145,11 @@ impl ShellCommand {
         Self::LspDefinition,
         Self::LspSignature,
         Self::LspDiagnostics,
+        Self::LspReferences,
+        Self::LspImplementation,
+        Self::LspRename,
+        Self::LspCodeAction,
+        Self::LspFormat,
     ];
 
     #[must_use]
@@ -201,6 +211,11 @@ impl ShellCommand {
             Self::LspDefinition => "lsp.definition",
             Self::LspSignature => "lsp.signatureHelp",
             Self::LspDiagnostics => "lsp.diagnostics",
+            Self::LspReferences => "lsp.references",
+            Self::LspImplementation => "lsp.implementation",
+            Self::LspRename => "lsp.rename",
+            Self::LspCodeAction => "lsp.codeAction",
+            Self::LspFormat => "lsp.format",
             Self::NewAgentSession => "agent.newSession",
             Self::AgentAsk => "agent.ask",
             Self::AgentInvestigate => "agent.investigate",
@@ -268,6 +283,11 @@ impl ShellCommand {
             Self::LspDefinition => "Go to definition",
             Self::LspSignature => "Show signature help",
             Self::LspDiagnostics => "Show language diagnostics",
+            Self::LspReferences => "Find references",
+            Self::LspImplementation => "Go to implementation",
+            Self::LspRename => "Rename symbol",
+            Self::LspCodeAction => "Code actions and quick fixes",
+            Self::LspFormat => "Format document",
             Self::NewAgentSession => "New agent session",
             Self::AgentAsk => "Ask the agent about the selection…",
             Self::AgentInvestigate => "Investigate the last failed command with the agent",
@@ -413,8 +433,28 @@ impl Default for ShellKeymap {
                     ShellCommand::LspSignature,
                 ),
                 binding("m", true, true, false, Editor, ShellCommand::LspDiagnostics),
+                binding(
+                    "f12",
+                    false,
+                    false,
+                    true,
+                    Editor,
+                    ShellCommand::LspReferences,
+                ),
+                binding(
+                    "f12",
+                    true,
+                    false,
+                    false,
+                    Editor,
+                    ShellCommand::LspImplementation,
+                ),
+                binding("f2", false, false, false, Editor, ShellCommand::LspRename),
+                binding(".", true, false, false, Editor, ShellCommand::LspCodeAction),
+                binding("f", false, true, true, Editor, ShellCommand::LspFormat),
                 binding("k", true, false, false, Editor, AgentAsk),
                 binding("i", true, false, true, Terminal, AgentInvestigate),
+                binding("i", true, false, true, Editor, AgentInvestigate),
                 // Editor chords follow VS Code; they only apply in editors so
                 // Ctrl+C/Ctrl+F keep their meaning inside terminals.
                 binding("o", true, false, false, Window, OpenFile),

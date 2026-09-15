@@ -597,6 +597,11 @@
           "format": "uint64",
           "minimum": 0,
           "default": 1800
+        },
+        "format_on_save": {
+          "description": "Ask the language server to format the file before each save.",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false

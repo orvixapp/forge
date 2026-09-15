@@ -70,7 +70,7 @@ pub fn from_lsp_diagnostic(d: &lsp_types::Diagnostic, rope: &Rope) -> Diagnostic
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompletionItem {
     pub label: String,
     /// Where it comes from: the section for a key, `value`, or `word`.
@@ -79,6 +79,11 @@ pub struct CompletionItem {
     pub documentation: Option<String>,
     /// Resolved char-range edits against the response's buffer revision.
     pub edits: Option<Vec<forge_buffer::Edit>>,
+    /// Tabstops of the first edit's text, when it came from a snippet.
+    pub snippet: Option<crate::snippet::Snippet>,
+    /// The server's item when it still needs `completionItem/resolve`
+    /// (auto-import edits arrive lazily).
+    pub lsp: Option<Box<lsp_types::CompletionItem>>,
 }
 
 impl CompletionItem {
@@ -90,6 +95,8 @@ impl CompletionItem {
             insert_text: None,
             documentation: None,
             edits: None,
+            snippet: None,
+            lsp: None,
         }
     }
 }
@@ -121,6 +128,8 @@ pub fn from_lsp_completion_item(item: &lsp_types::CompletionItem) -> CompletionI
         insert_text: item.insert_text.clone(),
         documentation,
         edits: None,
+        snippet: None,
+        lsp: None,
     }
 }
 

@@ -38,6 +38,7 @@ use proto_ipc::{
 };
 use std::{
     borrow::Cow,
+    collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
     sync::{
@@ -384,6 +385,8 @@ pub enum PromptKind {
     Wizard,
     McpImport(forge_gui::mcp::ImportSource),
     McpAgents(usize),
+    /// New name for `lsp.rename`.
+    LspRename,
 }
 
 /// List picker inside the window; `index` selects an item.
@@ -412,6 +415,10 @@ pub enum PickerKind {
     McpAction(usize),
     LspInfo,
     LspProblems,
+    LspLocations,
+    LspCodeActions,
+    /// Preview of a multi-file edit; Enter applies it.
+    LspWorkspaceEdit,
 }
 
 /// What a right click landed on; decides the context menu's items.
@@ -432,6 +439,9 @@ pub struct AgentLaunch {
     pub prompt: Option<String>,
 }
 
+/// Text edits per document flattened from a `WorkspaceEdit`.
+pub(crate) type LspTextEdits = forge_lsp::workspace_edit::DocumentEdits;
+
 pub struct ForgeWindow {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
@@ -441,6 +451,26 @@ pub struct ForgeWindow {
     pub(crate) lsp: Option<crate::lsp::LspService>,
     pub(crate) lsp_problems: Vec<crate::lsp::Problem>,
     pub(crate) lsp_navigation: Option<(PathBuf, lsp_types::Position)>,
+    /// Definitions/references waiting in the `LspLocations` picker.
+    pub(crate) lsp_locations: Vec<crate::lsp::Location>,
+    /// Code actions waiting in the `LspCodeActions` picker.
+    pub(crate) lsp_code_actions: Vec<lsp_types::CodeActionOrCommand>,
+    /// Workspace edit shown in the `LspWorkspaceEdit` preview.
+    pub(crate) lsp_workspace_edit: Option<(String, LspTextEdits)>,
+    /// Workspace edit to apply on the next poll (needs the window context).
+    pub(crate) lsp_apply_edit: Option<(String, LspTextEdits)>,
+    /// Editor tab to save once its format-on-save edits land.
+    pub(crate) lsp_save_after_format: Option<u64>,
+    /// `agent.investigate` context gathered by the language service.
+    pub(crate) lsp_investigation: Option<crate::lsp::Investigation>,
+    /// MCP requests waiting for a language service query, by query id.
+    lsp_queries: HashMap<
+        u64,
+        (
+            serde_json::Value,
+            oneshot::Sender<proto_acp::JsonRpcMessage>,
+        ),
+    >,
     pub theme: ThemeColors,
     pub theme_name: String,
     pub focus: FocusHandle,
@@ -504,6 +534,13 @@ impl ForgeWindow {
             lsp: None,
             lsp_problems: Vec::new(),
             lsp_navigation: None,
+            lsp_locations: Vec::new(),
+            lsp_code_actions: Vec::new(),
+            lsp_workspace_edit: None,
+            lsp_apply_edit: None,
+            lsp_save_after_format: None,
+            lsp_investigation: None,
+            lsp_queries: HashMap::new(),
             config: Arc::clone(&factory.config),
             theme,
             theme_name,
@@ -580,7 +617,7 @@ impl ForgeWindow {
                 match this.update(cx, |view, cx| {
                     view.refresh_git_diffs();
                     let changed = view.poll_project_search() | view.poll_syntax();
-                    view.lsp_finish_navigation(cx);
+                    view.lsp_finish_pending(cx);
                     changed
                 }) {
                     Ok(dirty) => changed |= dirty,
@@ -1171,11 +1208,41 @@ impl ForgeWindow {
 
     /// From a terminal: hands the last command, its output and the cwd to
     /// an agent. Command boundaries come from the OSC 133 prompt marks.
+    /// From an editor: the diagnostic under the cursor, with the symbol's
+    /// documentation and definition from the language server (§17.8).
     fn agent_investigate(&mut self, cx: &mut Context<Self>) {
+        if let Some(editor) = self.active_tab().editor() {
+            let head = editor.buffer.selections().primary().head;
+            let line = editor.buffer.position_of(head).line;
+            let on_line = editor.diagnostics().any(|diagnostic| {
+                let start = editor.buffer.position_of(diagnostic.range.start).line;
+                let end = editor.buffer.position_of(diagnostic.range.end).line;
+                (start..=end).contains(&line)
+            });
+            if !on_line {
+                self.notify_user(
+                    NotificationLevel::Info,
+                    tr("Place the cursor on a diagnostic to investigate it"),
+                );
+                return;
+            }
+            if editor.lsp_handle.is_some() {
+                self.lsp_feature(crate::lsp::Feature::Investigate, cx);
+            } else {
+                self.agent_investigate_diagnostic(
+                    crate::lsp::Investigation {
+                        hover: None,
+                        definition: None,
+                    },
+                    cx,
+                );
+            }
+            return;
+        }
         let Some(terminal) = self.active_terminal() else {
             self.notify_user(
                 NotificationLevel::Info,
-                tr("agent.investigate works from a terminal"),
+                tr("agent.investigate works from a terminal or a diagnostic"),
             );
             return;
         };
@@ -1218,6 +1285,97 @@ impl ForgeWindow {
             label: format!("terminal://{session_label}"),
             content: output,
         }];
+        self.create_agent_tab_with(
+            AgentLaunch {
+                class: forge_gui::config::TaskClass::Normal,
+                provider: None,
+                context,
+                prompt: Some(prompt),
+            },
+            cx,
+        );
+    }
+
+    /// Builds the `agent.investigate` prompt for the diagnostics on the
+    /// cursor line: file and line, the messages, the symbol's hover and
+    /// definition when the server knew them, and the file's `git diff`.
+    pub(crate) fn agent_investigate_diagnostic(
+        &mut self,
+        investigation: crate::lsp::Investigation,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.active_tab().editor() else {
+            return;
+        };
+        let Some(path) = editor.path().map(Path::to_path_buf) else {
+            return;
+        };
+        let head = editor.buffer.selections().primary().head;
+        let line = editor.buffer.position_of(head).line;
+        let messages: Vec<String> = editor
+            .diagnostics()
+            .filter(|diagnostic| {
+                let start = editor.buffer.position_of(diagnostic.range.start).line;
+                let end = editor.buffer.position_of(diagnostic.range.end).line;
+                (start..=end).contains(&line)
+            })
+            .map(|diagnostic| match &diagnostic.source {
+                Some(source) => format!("[{source}] {}", diagnostic.message),
+                None => diagnostic.message.clone(),
+            })
+            .collect();
+        let dirty = editor.buffer.is_dirty();
+        let rope = editor.buffer.rope();
+        let from = line.saturating_sub(15);
+        let to = (line + 16).min(rope.len_lines());
+        let excerpt = rope
+            .slice(rope.line_to_char(from)..rope.line_to_char(to))
+            .to_string();
+        let mut context = vec![PromptContext {
+            label: format!("{}:{}-{}", path.display(), from + 1, to),
+            content: excerpt,
+        }];
+        if let Some(hover) = investigation.hover {
+            context.push(PromptContext {
+                label: tr("Symbol documentation (LSP hover)").into(),
+                content: hover,
+            });
+        }
+        if let Some((definition, first_line, text)) = investigation.definition {
+            context.push(PromptContext {
+                label: format!("{}:{}", definition.display(), first_line + 1),
+                content: text,
+            });
+        }
+        let diff = std::process::Command::new("git")
+            .args(["diff", "--no-color", "--"])
+            .arg(&path)
+            .current_dir(path.parent().unwrap_or(Path::new(".")))
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .filter(|diff| !diff.trim().is_empty());
+        if let Some(diff) = diff {
+            context.push(PromptContext {
+                label: format!("git diff -- {}", path.display()),
+                content: diff.chars().take(64 * 1024).collect(),
+            });
+        }
+        let mut prompt = trf(
+            "The language server reports a problem at {}:{}. Investigate the cause and propose a fix.\n\n",
+            &[&path.display(), &(line + 1)],
+        );
+        for message in &messages {
+            prompt.push_str("- ");
+            prompt.push_str(message);
+            prompt.push('\n');
+        }
+        if dirty {
+            prompt.push('\n');
+            prompt.push_str(tr("The excerpt comes from the unsaved buffer; the git diff only covers what is on disk."));
+            prompt.push('\n');
+        }
         self.create_agent_tab_with(
             AgentLaunch {
                 class: forge_gui::config::TaskClass::Normal,
@@ -1329,6 +1487,21 @@ impl ForgeWindow {
                 workspace.to_string_lossy().into_owned(),
             ),
         ]
+    }
+
+    /// Answers an MCP request that waited for the language service.
+    pub(crate) fn mcp_answer_lsp_query(
+        &mut self,
+        query: u64,
+        result: Result<serde_json::Value, String>,
+    ) {
+        if let Some((id, response)) = self.lsp_queries.remove(&query) {
+            let reply = match result {
+                Ok(value) => proto_acp::JsonRpcMessage::response(id, value),
+                Err(error) => proto_acp::JsonRpcMessage::error(Some(id), -32603, error),
+            };
+            let _ = response.send(reply);
+        }
     }
 
     /// `forge/list_open_files` for the MCP server.
@@ -1848,6 +2021,7 @@ impl ForgeWindow {
                     PromptKind::Wizard => self.wizard_text(&value, cx),
                     PromptKind::McpImport(source) => self.mcp_import_file(source, &value, cx),
                     PromptKind::McpAgents(index) => self.mcp_set_agents(index, &value, cx),
+                    PromptKind::LspRename => self.lsp_rename_submit(&value, cx),
                 }
             }
             "backspace" => {
@@ -1912,6 +2086,9 @@ impl ForgeWindow {
                     PickerKind::McpAction(server) => self.mcp_server_action(server, index, cx),
                     PickerKind::LspInfo => {}
                     PickerKind::LspProblems => self.lsp_problem_pick(index, cx),
+                    PickerKind::LspLocations => self.lsp_location_pick(index, cx),
+                    PickerKind::LspCodeActions => self.lsp_code_action_pick(index, cx),
+                    PickerKind::LspWorkspaceEdit => self.lsp_workspace_edit_confirm(cx),
                     PickerKind::Provider => {
                         if let (Some(provider), Some((prompt, context))) = (
                             self.config.providers.get(index).cloned(),
@@ -2112,6 +2289,26 @@ impl ForgeWindow {
         };
         let result = match message.method.as_deref() {
             Some("forge/list_open_files") => Ok(self.mcp_list_open_files()),
+            Some("forge/diagnostics") => Ok(self.mcp_diagnostics(params)),
+            Some("forge/workspace_symbols") => {
+                let query = params
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                self.poll_lsp();
+                match self.lsp.as_mut() {
+                    Some(service) => {
+                        let query = service.query(crate::lsp::Query::WorkspaceSymbols(query));
+                        self.lsp_queries.insert(query, (id, response));
+                        return;
+                    }
+                    None => Ok(serde_json::json!({
+                        "symbols": [],
+                        "note": "no language server running",
+                    })),
+                }
+            }
             Some("session/request_permission") => {
                 self.acp_request_permission(agent_id, id, params, response, cx);
                 return;
@@ -3305,6 +3502,13 @@ impl ForgeWindow {
             ShellCommand::LspDefinition => self.lsp_feature(crate::lsp::Feature::Definition, cx),
             ShellCommand::LspSignature => self.lsp_feature(crate::lsp::Feature::Signature, cx),
             ShellCommand::LspDiagnostics => self.lsp_feature(crate::lsp::Feature::Problems, cx),
+            ShellCommand::LspReferences => self.lsp_feature(crate::lsp::Feature::References, cx),
+            ShellCommand::LspImplementation => {
+                self.lsp_feature(crate::lsp::Feature::Implementation, cx);
+            }
+            ShellCommand::LspRename => self.lsp_feature(crate::lsp::Feature::PrepareRename, cx),
+            ShellCommand::LspCodeAction => self.lsp_feature(crate::lsp::Feature::CodeActions, cx),
+            ShellCommand::LspFormat => self.lsp_feature(crate::lsp::Feature::Format, cx),
             ShellCommand::NewAgentSession
             | ShellCommand::AgentAcceptAllHunks
             | ShellCommand::AgentRejectAllHunks
@@ -3521,7 +3725,13 @@ impl ForgeWindow {
                 ShellCommand::EditorSelectAll,
                 ShellCommand::EditorFind,
                 ShellCommand::EditorReplace,
+                ShellCommand::LspDefinition,
+                ShellCommand::LspReferences,
+                ShellCommand::LspRename,
+                ShellCommand::LspCodeAction,
+                ShellCommand::LspFormat,
                 ShellCommand::AgentAsk,
+                ShellCommand::AgentInvestigate,
                 ShellCommand::ToggleWordWrap,
                 ShellCommand::ToggleMinimap,
                 ShellCommand::SaveFile,

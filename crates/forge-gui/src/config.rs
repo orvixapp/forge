@@ -77,6 +77,8 @@ pub struct LspConfig {
     pub debounce_ms: u64,
     pub startup_ms: u64,
     pub idle_shutdown_secs: u64,
+    /// Ask the language server to format the file before each save.
+    pub format_on_save: bool,
 }
 
 impl Default for LspConfig {
@@ -86,6 +88,7 @@ impl Default for LspConfig {
             debounce_ms: 75,
             startup_ms: 500,
             idle_shutdown_secs: 1800,
+            format_on_save: false,
         }
     }
 }

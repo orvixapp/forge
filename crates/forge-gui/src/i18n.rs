@@ -131,6 +131,42 @@ fn spanish(english: &str) -> Option<&'static str> {
         "Show language diagnostics" => "Mostrar diagnósticos del lenguaje",
         "Language server" => "Servidor de lenguaje",
         "Diagnostics (up to 1000)" => "Diagnósticos (hasta 1000)",
+        "Format on save: on (turn off)" => "Formatear al guardar: activado (desactivar)",
+        "Format on save: off (turn on)" => "Formatear al guardar: desactivado (activar)",
+        "Format on save enabled" => "Formatear al guardar activado",
+        "Format on save disabled" => "Formatear al guardar desactivado",
+        "Find references" => "Buscar referencias",
+        "Go to implementation" => "Ir a la implementación",
+        "Rename symbol" => "Renombrar símbolo",
+        "Code actions and quick fixes" => "Acciones de código y correcciones rápidas",
+        "Format document" => "Formatear documento",
+        "Code actions" => "Acciones de código",
+        "No code actions here" => "No hay acciones de código aquí",
+        "No locations found" => "No se encontraron ubicaciones",
+        "{} locations" => "{} ubicaciones",
+        "No language server for this file" => "No hay servidor de lenguaje para este archivo",
+        "Nothing to change" => "Nada que cambiar",
+        "Apply {} edits in {} files" => "Aplicar {} cambios en {} archivos",
+        "{} · {} edits" => "{} · {} cambios",
+        "{}: {} edits in {} files" => "{}: {} cambios en {} archivos",
+        "{}: could not edit {}" => "{}: no se pudo editar {}",
+        "Rename to {}" => "Renombrar a {}",
+        "{} needs a server command, which Forge does not run" => {
+            "{} requiere un comando del servidor, que Forge no ejecuta"
+        }
+        "Place the cursor on a diagnostic to investigate it" => {
+            "Coloca el cursor sobre un diagnóstico para investigarlo"
+        }
+        "agent.investigate works from a terminal or a diagnostic" => {
+            "agent.investigate se usa desde una terminal o un diagnóstico"
+        }
+        "Symbol documentation (LSP hover)" => "Documentación del símbolo (hover LSP)",
+        "The language server reports a problem at {}:{}. Investigate the cause and propose a fix.\n\n" => {
+            "El servidor de lenguaje informa de un problema en {}:{}. Investiga la causa y propón una corrección.\n\n"
+        }
+        "The excerpt comes from the unsaved buffer; the git diff only covers what is on disk." => {
+            "El fragmento procede del buffer sin guardar; el git diff solo cubre lo que hay en disco."
+        }
         "Esc closes" => "Esc cierra",
         "Open user settings (config.toml)" => "Abrir ajustes de usuario (config.toml)",
         "Open workspace settings (.forge/config.toml)" => {

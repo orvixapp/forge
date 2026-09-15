@@ -24,9 +24,10 @@ enum SettingsItem {
     AddMcpHttp,
     ChooseTheme,
     ToggleLanguage,
+    ToggleFormatOnSave,
 }
 
-const SETTINGS_ITEMS: [SettingsItem; 9] = [
+const SETTINGS_ITEMS: [SettingsItem; 10] = [
     SettingsItem::UserConfig,
     SettingsItem::WorkspaceConfig,
     SettingsItem::AddProvider,
@@ -36,6 +37,7 @@ const SETTINGS_ITEMS: [SettingsItem; 9] = [
     SettingsItem::AddMcpHttp,
     SettingsItem::ChooseTheme,
     SettingsItem::ToggleLanguage,
+    SettingsItem::ToggleFormatOnSave,
 ];
 
 const PROVIDER_KINDS: [(ProviderKind, &str); 4] = [
@@ -162,6 +164,13 @@ impl ForgeWindow {
                     Language::Spanish => tr("Switch to English").to_owned(),
                     Language::English => tr("Switch to Español").to_owned(),
                 },
+                SettingsItem::ToggleFormatOnSave => {
+                    if self.config.lsp.format_on_save {
+                        tr("Format on save: on (turn off)").to_owned()
+                    } else {
+                        tr("Format on save: off (turn on)").to_owned()
+                    }
+                }
             })
             .collect();
         self.wizard = None;
@@ -244,6 +253,27 @@ impl ForgeWindow {
                         self.notify_user(
                             NotificationLevel::Info,
                             trf("Language: {}", &[&format!("{next} · {}", path.display())]),
+                        );
+                    }
+                    Err(error) => self.notify_user(NotificationLevel::Error, error),
+                }
+            }
+            Some(SettingsItem::ToggleFormatOnSave) => {
+                let next = !self.config.lsp.format_on_save;
+                let result = self.edit_user_config(|doc| {
+                    table_mut(doc, "lsp")?["format_on_save"] = value(next);
+                    Ok(())
+                });
+                match result {
+                    Ok(_) => {
+                        self.reload_config_if_changed(cx);
+                        self.notify_user(
+                            NotificationLevel::Info,
+                            if next {
+                                tr("Format on save enabled")
+                            } else {
+                                tr("Format on save disabled")
+                            },
                         );
                     }
                     Err(error) => self.notify_user(NotificationLevel::Error, error),

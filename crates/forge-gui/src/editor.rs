@@ -100,7 +100,85 @@ pub struct EditorTab {
     pub completion: Option<Completion>,
     pub(crate) lsp_handle: Option<crate::lsp::LspHandle>,
     pub(crate) lsp_diagnostics: Vec<Diagnostic>,
+    /// Buffer version `lsp_diagnostics` ranges refer to; they follow one
+    /// edit at a time until the server answers for the new revision.
+    pub(crate) lsp_diagnostics_version: u64,
     pub(crate) lsp_counts: (usize, usize, usize),
+    /// Tabstops left to visit after inserting a snippet.
+    pub(crate) snippet: Option<SnippetSession>,
+}
+
+/// Tabstops of an inserted snippet, kept in step with later edits so Tab
+/// visits them in order; ends with Escape, the last stop or a cursor move.
+#[derive(Debug, Clone)]
+pub struct SnippetSession {
+    /// Groups in visiting order; a group has one range per occurrence.
+    stops: Vec<Vec<Range<usize>>>,
+    current: usize,
+    /// Buffer version the ranges refer to.
+    version: u64,
+}
+
+impl SnippetSession {
+    fn selections(&self) -> Option<Selections> {
+        let group = self.stops.get(self.current)?;
+        let selections: Vec<Selection> = group
+            .iter()
+            .map(|range| Selection::new(range.start, range.end))
+            .collect();
+        (!selections.is_empty()).then(|| Selections::new(selections, 0))
+    }
+}
+
+/// Where `position` ends up after `changes` (the edits of one transaction,
+/// in text order, positions in the new text). A position inside replaced
+/// text collapses to the start of the replacement.
+fn shift_position(position: usize, changes: &[forge_buffer::AppliedEdit]) -> usize {
+    let mut drift: isize = 0;
+    for change in changes {
+        let inserted = change.inserted.chars().count();
+        let removed = change.removed.chars().count();
+        let old_start = change.new_start_char.saturating_add_signed(-drift);
+        let old_end = old_start + removed;
+        if position >= old_end {
+            drift += isize::try_from(inserted).unwrap_or(0) - isize::try_from(removed).unwrap_or(0);
+        } else if position <= old_start {
+            break;
+        } else {
+            return old_start.saturating_add_signed(drift);
+        }
+    }
+    position.saturating_add_signed(drift)
+}
+
+fn shift_range(range: &Range<usize>, changes: &[forge_buffer::AppliedEdit]) -> Range<usize> {
+    let start = shift_position(range.start, changes);
+    let end = shift_position(range.end, changes).max(start);
+    start..end
+}
+
+/// `range` (in the text before `transactions`) after them, or `None` when
+/// an edit overlapped it.
+fn map_range_through(range: &Range<usize>, transactions: &[&Transaction]) -> Option<Range<usize>> {
+    let mut range = range.clone();
+    for transaction in transactions {
+        let mut shift: isize = 0;
+        for edit in &transaction.edits {
+            let touches = if edit.range.is_empty() {
+                edit.range.start > range.start && edit.range.start < range.end
+            } else {
+                edit.range.start < range.end && edit.range.end > range.start
+            };
+            if touches {
+                return None;
+            }
+            if edit.range.end <= range.start {
+                shift += edit.delta();
+            }
+        }
+        range = range.start.saturating_add_signed(shift)..range.end.saturating_add_signed(shift);
+    }
+    Some(range)
 }
 
 /// Edits settle this long before a Forge config file is re-validated.
@@ -207,7 +285,9 @@ impl EditorTab {
             completion: None,
             lsp_handle: None,
             lsp_diagnostics: Vec::new(),
+            lsp_diagnostics_version: 0,
             lsp_counts: (0, 0, 0),
+            snippet: None,
         }
     }
 
@@ -546,41 +626,157 @@ impl EditorTab {
         }
     }
 
-    /// Inserts the rest of the selected item and closes the popup.
+    /// Asks the server for completions after a trigger character (`.`,
+    /// `::`); the worker drops the request when the character is not one.
+    pub fn request_completion_trigger(&mut self, character: char) {
+        if self.large.is_some() || self.buffer.selections().len() != 1 {
+            return;
+        }
+        if let Some(handle) = &self.lsp_handle {
+            handle.request_with(
+                crate::lsp::Feature::Completion,
+                crate::lsp::Payload::Trigger(character),
+                self.buffer.version(),
+                self.buffer.selections().primary().head,
+                self.buffer.rope(),
+            );
+        }
+    }
+
+    /// Inserts the rest of the selected item and closes the popup. Snippets
+    /// leave their first tabstop selected; items the server can still
+    /// enrich are resolved in the background for their extra edits.
     pub fn accept_completion(&mut self) -> bool {
         let Some(completion) = self.completion.take() else {
             return false;
         };
-        let Some(item) = completion.selected() else {
+        let Some(item) = completion.selected().cloned() else {
             return false;
         };
-        if let Some(edits) = &item.edits {
-            let changed = self.buffer.edit(edits.clone(), false).is_ok();
-            if changed {
-                self.sync_syntax();
+        let Some(edits) = &item.edits else {
+            let suffix = item
+                .label
+                .get(completion.prefix.len()..)
+                .unwrap_or_default();
+            if suffix.is_empty() {
+                return false;
             }
-            return changed;
-        }
-        let suffix = item
-            .label
-            .get(completion.prefix.len()..)
-            .unwrap_or_default();
-        if suffix.is_empty() {
+            if self.buffer.insert(suffix, false).is_ok() {
+                self.sync_syntax();
+                return true;
+            }
+            return false;
+        };
+        let before = (
+            self.buffer.version(),
+            self.buffer.selections().primary().head,
+            self.buffer.rope(),
+        );
+        if self.buffer.edit(edits.clone(), false).is_err() {
             return false;
         }
-        if self.buffer.insert(suffix, false).is_ok() {
-            self.sync_syntax();
-            return true;
+        self.sync_syntax();
+        if let (Some(snippet), Some(main)) = (&item.snippet, edits.first()) {
+            // Where the snippet text starts once earlier edits shifted it.
+            let drift: isize = edits
+                .iter()
+                .filter(|edit| edit.range.start < main.range.start)
+                .map(Edit::delta)
+                .sum();
+            let base = main.range.start.saturating_add_signed(drift);
+            let stops: Vec<Vec<Range<usize>>> = snippet
+                .tabstops
+                .iter()
+                .map(|stop| {
+                    stop.ranges
+                        .iter()
+                        .map(|range| base + range.start..base + range.end)
+                        .collect()
+                })
+                .collect();
+            let session = SnippetSession {
+                stops,
+                current: 0,
+                version: self.buffer.version(),
+            };
+            if let Some(selections) = session.selections() {
+                self.buffer.set_selections(selections);
+            }
+            self.snippet = (session.stops.len() > 1).then_some(session);
         }
-        false
+        if let (Some(lsp), Some(handle)) = (item.lsp, &self.lsp_handle) {
+            handle.request_with(
+                crate::lsp::Feature::Resolve,
+                crate::lsp::Payload::Resolve(lsp),
+                before.0,
+                before.1,
+                before.2,
+            );
+        }
+        true
+    }
+
+    /// Applies the extra edits a resolve produced for the revision before
+    /// the insertion, mapped through everything typed since; dropped when
+    /// an edit overlaps them or the history no longer reaches back.
+    pub(crate) fn apply_resolved_completion(&mut self, edits: &[Edit], version: u64) {
+        let Some(transactions) = self.buffer.transactions_since(version) else {
+            return;
+        };
+        let mapped: Option<Vec<Edit>> = edits
+            .iter()
+            .map(|edit| {
+                map_range_through(&edit.range, &transactions).map(|range| Edit {
+                    range,
+                    text: edit.text.clone(),
+                })
+            })
+            .collect();
+        if let Some(edits) = mapped
+            && !edits.is_empty()
+            && self.buffer.edit(edits, false).is_ok()
+        {
+            self.sync_syntax();
+        }
+    }
+
+    /// Tab inside a snippet: selects the next tabstop group (`shift` the
+    /// previous one). False when no snippet is active.
+    pub fn snippet_step(&mut self, backwards: bool) -> bool {
+        let Some(session) = &mut self.snippet else {
+            return false;
+        };
+        if session.version != self.buffer.version() {
+            self.snippet = None;
+            return false;
+        }
+        let next = if backwards {
+            session.current.checked_sub(1)
+        } else {
+            Some(session.current + 1)
+        };
+        let Some(next) = next.filter(|next| *next < session.stops.len()) else {
+            if !backwards {
+                self.snippet = None;
+            }
+            return !backwards;
+        };
+        session.current = next;
+        let last = next + 1 == session.stops.len();
+        if let Some(selections) = session.selections() {
+            self.buffer.set_selections(selections);
+        }
+        if last {
+            self.snippet = None;
+        }
+        true
     }
 
     /// Tells the syntax worker about the last change and marks the edit
     /// time for autosave; every mutation ends up here. The UI tree shifts
     /// immediately, the reparse arrives through [`Self::poll_syntax`].
     pub fn sync_syntax(&mut self) {
-        self.lsp_diagnostics.clear();
-        self.lsp_counts = (0, 0, 0);
+        self.follow_edit();
         self.last_edit = Instant::now();
         let Some(state) = &mut self.syntax else {
             return;
@@ -606,6 +802,36 @@ impl EditorTab {
             state.invalidate();
         }
         state.parse(&rope, version, None);
+    }
+
+    /// Keeps LSP diagnostics and snippet tabstops aligned with the last
+    /// transaction instead of dropping them on every keystroke; anything
+    /// that cannot be mapped is discarded.
+    fn follow_edit(&mut self) {
+        let version = self.buffer.version();
+        let changes = self.buffer.last_change();
+        if self.lsp_diagnostics_version + 1 == version {
+            for diagnostic in &mut self.lsp_diagnostics {
+                diagnostic.range = shift_range(&diagnostic.range, changes);
+            }
+            self.lsp_diagnostics_version = version;
+        } else if self.lsp_diagnostics_version != version {
+            self.lsp_diagnostics.clear();
+            self.lsp_counts = (0, 0, 0);
+            self.lsp_diagnostics_version = version;
+        }
+        if let Some(session) = &mut self.snippet {
+            if session.version + 1 == version {
+                for group in &mut session.stops {
+                    for range in group {
+                        *range = shift_range(range, changes);
+                    }
+                }
+                session.version = version;
+            } else if session.version != version {
+                self.snippet = None;
+            }
+        }
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -2177,7 +2403,25 @@ impl ForgeWindow {
     }
 
     /// Saves the active editor; an untitled buffer asks for a path.
+    /// Saves the active editor; with `lsp.format_on_save` the server
+    /// formats first and the write happens when its edits arrive.
     pub fn save_active(&mut self, cx: &mut Context<Self>) {
+        let format = self.config.lsp.format_on_save
+            && self.active_tab().editor().is_some_and(|editor| {
+                editor.lsp_handle.is_some() && editor.file.is_some() && !editor.is_large()
+            });
+        if format {
+            self.lsp_feature_with(
+                crate::lsp::Feature::Format,
+                crate::lsp::Payload::FormatAndSave,
+                cx,
+            );
+            return;
+        }
+        self.save_active_now(cx);
+    }
+
+    pub(crate) fn save_active_now(&mut self, cx: &mut Context<Self>) {
         let Some(editor) = self.active_tab_mut().editor_mut() else {
             return;
         };
@@ -2333,6 +2577,22 @@ impl ForgeWindow {
             cx.notify();
             return;
         }
+        if editor.snippet.is_some() {
+            match key {
+                "tab" if !modifiers.control && !modifiers.alt => {
+                    editor.snippet_step(modifiers.shift);
+                    editor.follow_cursor();
+                    cx.notify();
+                    return;
+                }
+                "escape" => {
+                    editor.snippet = None;
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
+        }
         // Whether this key extends the word under the cursor (keeps the
         // popup following) or should close it.
         let typing_word = match key {
@@ -2344,6 +2604,16 @@ impl ForgeWindow {
                         .is_some_and(|text| text.chars().all(|c| c.is_alphanumeric() || c == '_'))
             }
         };
+        // A single punctuation character may be a completion trigger (`.`).
+        let trigger = (!typing_word && !modifiers.control && !modifiers.alt)
+            .then(|| {
+                key_char.and_then(|text| {
+                    let mut chars = text.chars();
+                    let first = chars.next()?;
+                    (chars.next().is_none() && !first.is_whitespace()).then_some(first)
+                })
+            })
+            .flatten();
         let extend = modifiers.shift;
         let word = modifiers.control;
         let rows = editor.visible_rows.saturating_sub(1).max(1);
@@ -2544,6 +2814,9 @@ impl ForgeWindow {
                             editor.refresh_completion(false);
                         } else {
                             editor.completion = None;
+                            if let Some(character) = trigger {
+                                editor.request_completion_trigger(character);
+                            }
                         }
                     } else {
                         editor.completion = None;
@@ -3174,6 +3447,113 @@ mod tests {
             .buffer
             .set_selections(Selections::single(Selection::point(at)));
         editor
+    }
+
+    #[test]
+    fn lsp_diagnostics_follow_edits_until_the_server_answers() {
+        let mut tab = editor("let a = 1;\nlet b = x;\n", 0);
+        tab.lsp_diagnostics = vec![Diagnostic::error(19..20, "cannot find x")];
+        tab.lsp_diagnostics_version = tab.buffer.version();
+        // Typing before the diagnostic shifts it; typing after leaves it.
+        type_text(&mut tab, "/").unwrap();
+        tab.sync_syntax();
+        assert_eq!(tab.lsp_diagnostics[0].range, 20..21);
+        tab.buffer
+            .set_selections(Selections::single(Selection::point(23)));
+        type_text(&mut tab, "z").unwrap();
+        tab.sync_syntax();
+        assert_eq!(tab.lsp_diagnostics[0].range, 20..21);
+        // Replacing the diagnosed text collapses the range at its start.
+        tab.buffer
+            .edit(
+                vec![Edit {
+                    range: 19..22,
+                    text: "long_name".into(),
+                }],
+                false,
+            )
+            .unwrap();
+        tab.sync_syntax();
+        assert_eq!(tab.lsp_diagnostics[0].range, 19..19);
+        // A version jump the editor cannot follow drops them.
+        tab.lsp_diagnostics_version = 0;
+        type_text(&mut tab, "q").unwrap();
+        tab.sync_syntax();
+        assert!(tab.lsp_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn snippet_completion_selects_tabstops_and_tab_walks_them() {
+        let mut tab = editor("fn main() {\n    gre\n}\n", 19);
+        let snippet = crate::snippet::parse("greet(${1:name}, ${2:times})$0");
+        let item = crate::assist::CompletionItem {
+            edits: Some(vec![Edit {
+                range: 16..19,
+                text: snippet.text.clone(),
+            }]),
+            snippet: Some(snippet),
+            ..crate::assist::CompletionItem::new("greet(…)", "fn")
+        };
+        tab.completion = Some(Completion {
+            items: vec![item],
+            index: 0,
+            start: 16,
+            prefix: "gre".into(),
+        });
+        assert!(tab.accept_completion());
+        assert_eq!(
+            tab.buffer.text(),
+            "fn main() {\n    greet(name, times)\n}\n"
+        );
+        let selection = tab.buffer.selections().primary();
+        assert_eq!(selection.range(), 22..26, "first placeholder selected");
+        // Typing replaces the placeholder and keeps the next stop in step.
+        type_text(&mut tab, "n").unwrap();
+        tab.sync_syntax();
+        assert_eq!(tab.buffer.text(), "fn main() {\n    greet(n, times)\n}\n");
+        assert!(tab.snippet_step(false));
+        assert_eq!(tab.buffer.selections().primary().range(), 25..30);
+        assert!(tab.snippet_step(false), "last stop: the final cursor");
+        assert_eq!(tab.buffer.selections().primary().range(), 31..31);
+        assert!(tab.snippet.is_none());
+        assert!(!tab.snippet_step(false));
+    }
+
+    #[test]
+    fn resolved_completion_edits_are_mapped_through_later_typing() {
+        let mut tab = editor("fn main() {\n    Hash\n}\n", 20);
+        let version = tab.buffer.version();
+        tab.buffer
+            .edit(
+                vec![Edit {
+                    range: 16..20,
+                    text: "HashMap".into(),
+                }],
+                false,
+            )
+            .unwrap();
+        tab.sync_syntax();
+        type_text(&mut tab, ":").unwrap();
+        tab.sync_syntax();
+        // The import lands at the top, before everything typed since.
+        tab.apply_resolved_completion(
+            &[Edit::insert(0, "use std::collections::HashMap;\n\n")],
+            version,
+        );
+        assert_eq!(
+            tab.buffer.text(),
+            "use std::collections::HashMap;\n\nfn main() {\n    HashMap:\n}\n"
+        );
+        // An edit overlapping what was typed is dropped, not misapplied.
+        let before = tab.buffer.text();
+        tab.apply_resolved_completion(
+            &[Edit {
+                range: 17..19,
+                text: "x".into(),
+            }],
+            version,
+        );
+        assert_eq!(tab.buffer.text(), before);
     }
 
     #[test]

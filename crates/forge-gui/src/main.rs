@@ -10,6 +10,7 @@ mod mcp_settings;
 mod project;
 mod search;
 mod settings;
+mod snippet;
 mod window;
 
 use crate::{
