@@ -280,7 +280,7 @@ impl ServerInstance {
             let shutdown_res =
                 tokio::time::timeout(Duration::from_secs(2), client.shutdown()).await;
             if matches!(shutdown_res, Ok(Ok(()))) {
-                let _ = client.exit().await;
+                let _ = tokio::time::timeout(Duration::from_millis(250), client.exit()).await;
             }
         }
 

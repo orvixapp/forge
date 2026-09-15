@@ -1376,9 +1376,9 @@ fn paint_editor(
                     let x1 = x_of(to).max(x0 + px(paint.metrics.width));
                     let color = match severity {
                         crate::assist::DiagnosticSeverity::Error => paint.diagnostic,
-                        crate::assist::DiagnosticSeverity::Warning => gpui::rgb(0xd7ad65).into(),
+                        crate::assist::DiagnosticSeverity::Warning => gpui::rgb(0x00d7_ad65).into(),
                         crate::assist::DiagnosticSeverity::Information
-                        | crate::assist::DiagnosticSeverity::Hint => paint.gutter,
+                        | crate::assist::DiagnosticSeverity::Hint => paint.muted,
                     };
                     window.paint_quad(fill(
                         Bounds::new(

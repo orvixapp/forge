@@ -56,6 +56,17 @@
       "items": {
         "$ref": "#/$defs/McpServerConfig"
       }
+    },
+    "lsp": {
+      "$ref": "#/$defs/LspConfig"
+    },
+    "languages": {
+      "description": "User-only language/server overrides; never execute repo-supplied commands.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/LanguageDefinition"
+      },
+      "default": []
     }
   },
   "additionalProperties": false,
@@ -560,6 +571,106 @@
       "enum": [
         "stdio",
         "http"
+      ]
+    },
+    "LspConfig": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "debounce_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 75
+        },
+        "startup_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 500
+        },
+        "idle_shutdown_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 1800
+        }
+      },
+      "additionalProperties": false
+    },
+    "LanguageDefinition": {
+      "description": "Language definition mapping file extensions to LSP servers.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "extensions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "servers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ServerConfig"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name"
+      ]
+    },
+    "ServerConfig": {
+      "description": "Configuration of a specific language server executable.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "root_markers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "initialization_options": {
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "command"
       ]
     }
   }

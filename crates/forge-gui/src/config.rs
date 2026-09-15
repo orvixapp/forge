@@ -906,7 +906,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             workspace.join(".forge/config.toml"),
-            "[font]\nfamily = \"Hack\"\n[terminal]\nshell = \"/tmp/evil\"\nargs = [\"-c\", \"rm\"]\npadding = 2\n",
+            "[font]\nfamily = \"Hack\"\n[terminal]\nshell = \"/tmp/evil\"\nargs = [\"-c\", \"rm\"]\npadding = 2\n[[languages]]\nid = \"rust\"\nname = \"Untrusted Rust\"\n[[languages.servers]]\nname = \"evil\"\ncommand = \"/tmp/evil\"\n[[mcp_servers]]\nname = \"evil\"\ncommand = \"/tmp/evil\"\n",
         )
         .unwrap();
         let (config, sources) = Config::load_layers(Some(&user), Some(&workspace)).unwrap();
@@ -914,6 +914,8 @@ mod tests {
         assert!((config.font.size - 12.0).abs() < f32::EPSILON);
         assert_eq!(config.shell(), "/bin/zsh");
         assert!(config.terminal.args.is_empty());
+        assert!(config.languages.is_empty());
+        assert!(config.mcp_servers.is_empty());
         assert!((config.terminal.padding - 2.0).abs() < f32::EPSILON);
         assert_eq!(sources.user.as_deref(), Some(user.as_path()));
         assert!(sources.workspace.is_some());

@@ -1,6 +1,10 @@
 //! One asynchronous language service per window. GPUI only exchanges Rope
 //! snapshots and bounded results; no process, RPC or diagnostic indexing on UI.
 
+#[cfg(test)]
+#[path = "lsp_tests.rs"]
+mod tests;
+
 use crate::assist::{Completion, CompletionItem, Diagnostic};
 use crate::window::{ForgeWindow, NotificationLevel, Picker, PickerKind};
 use forge_buffer::Edit;
@@ -46,6 +50,7 @@ struct Request {
 struct State {
     documents: HashMap<u64, Snapshot>,
     requests: HashMap<(u64, Feature), Request>,
+    watched: HashMap<PathBuf, bool>,
     shutdown: bool,
 }
 
@@ -125,6 +130,16 @@ enum Update {
 }
 
 impl LspService {
+    pub(crate) fn file_changed(&self, path: PathBuf, removed: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.watched.len() < 1024 {
+            state.watched.insert(path, removed);
+        }
+    }
+
     fn new(config: &Config) -> Self {
         let configuration = (config.lsp.clone(), config.languages.clone());
         let state = Arc::new(Mutex::new(State::default()));
@@ -165,6 +180,22 @@ struct ActiveRequest {
 
 fn same_position(a: &Snapshot, b: &Snapshot) -> bool {
     a.path == b.path && a.version == b.version && a.cursor == b.cursor
+}
+
+fn cancel_stale_requests(
+    tasks: &mut HashMap<(u64, Feature), ActiveRequest>,
+    snapshots: &HashMap<u64, Snapshot>,
+) {
+    tasks.retain(|(id, _), request| {
+        if !snapshots
+            .get(id)
+            .is_some_and(|snapshot| same_position(snapshot, &request.snapshot))
+        {
+            request.task.abort();
+            return false;
+        }
+        !request.task.is_finished()
+    });
 }
 
 async fn sync(
@@ -219,6 +250,19 @@ fn snapshot_delta(old: &Rope, new: &Rope) -> Vec<Edit> {
     }]
 }
 
+fn language_manager(
+    config: &forge_gui::config::LspConfig,
+    languages: &[forge_lsp::LanguageDefinition],
+) -> Arc<LspManager> {
+    let mut registry = LanguageRegistry::new();
+    for language in languages {
+        registry.register(language.clone());
+    }
+    let mut manager = LspManager::new(registry, forge_lsp::DiagnosticStore::new());
+    manager.set_idle_timeout(Duration::from_secs(config.idle_shutdown_secs.max(1)));
+    Arc::new(manager)
+}
+
 async fn run(
     state: Arc<Mutex<State>>,
     results: mpsc::SyncSender<Update>,
@@ -227,15 +271,7 @@ async fn run(
         Vec<forge_lsp::LanguageDefinition>,
     ),
 ) {
-    let mut registry = LanguageRegistry::new();
-    for language in configuration.1 {
-        registry.register(language);
-    }
-    let mut manager = LspManager::new(registry, forge_lsp::DiagnosticStore::new());
-    manager.set_idle_timeout(Duration::from_secs(
-        configuration.0.idle_shutdown_secs.max(1),
-    ));
-    let manager = Arc::new(manager);
+    let manager = language_manager(&configuration.0, &configuration.1);
     let mut documents: HashMap<u64, OpenDocument> = HashMap::new();
     let mut tasks: HashMap<(u64, Feature), ActiveRequest> = HashMap::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(25));
@@ -243,19 +279,21 @@ async fn run(
     let mut published = HashMap::new();
     loop {
         ticker.tick().await;
-        let (snapshots, requests, shutdown) = {
+        let (snapshots, requests, watched, shutdown) = {
             let mut state = state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             (
                 state.documents.clone(),
                 std::mem::take(&mut state.requests),
+                std::mem::take(&mut state.watched),
                 state.shutdown,
             )
         };
         if shutdown {
             break;
         }
+        manager.watched_files(watched).await;
         sync_documents(
             &manager,
             &snapshots,
@@ -264,16 +302,7 @@ async fn run(
             &results,
         )
         .await;
-        tasks.retain(|(id, _), request| {
-            if !snapshots
-                .get(id)
-                .is_some_and(|snapshot| same_position(snapshot, &request.snapshot))
-            {
-                request.task.abort();
-                return false;
-            }
-            !request.task.is_finished()
-        });
+        cancel_stale_requests(&mut tasks, &snapshots);
         for ((id, feature), request) in requests {
             if !snapshots
                 .get(&id)
@@ -288,6 +317,17 @@ async fn run(
                 .get(&id)
                 .filter(|doc| doc.opened)
                 .map(|doc| &doc.snapshot);
+            if let Err(error) = manager
+                .open_document_versioned(
+                    &request.snapshot.path,
+                    request.snapshot.rope.to_string(),
+                    request.snapshot.version,
+                )
+                .await
+            {
+                let _ = results.try_send(Update::Status(format!("LSP: {error}")));
+                continue;
+            }
             if let Err(error) = sync(&manager, old, &request.snapshot).await {
                 let _ = results.try_send(Update::Status(format!("LSP: {error}")));
                 continue;
@@ -682,7 +722,7 @@ impl ForgeWindow {
                             });
                         }
                         Response::Definition(definition) if self.active_tab().id == tab => {
-                            self.lsp_open_definition(definition)
+                            self.lsp_open_definition(definition);
                         }
                         Response::Problems(problems) if self.active_tab().id == tab => {
                             self.lsp_problems = problems;
@@ -763,7 +803,9 @@ impl ForgeWindow {
     pub(crate) fn lsp_finish_navigation(&mut self, cx: &mut Context<Self>) {
         if let Some((path, position)) = self.lsp_navigation.take() {
             self.open_file(&path, None, None, cx);
-            if let Some(editor) = self.active_tab_mut().editor_mut() {
+            if let Some(editor) = self.active_tab_mut().editor_mut()
+                && editor.path() == Some(path.as_path())
+            {
                 let offset = position_to_offset(&editor.buffer.rope(), position);
                 editor
                     .buffer

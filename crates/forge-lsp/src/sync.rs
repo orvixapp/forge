@@ -189,7 +189,7 @@ impl DocumentTracker {
         new_text: String,
     ) -> Option<DidChangeTextDocumentParams> {
         let doc = self.documents.get_mut(uri)?;
-        doc.version += 1;
+        doc.version = doc.version.checked_add(1)?;
         let version = doc.version;
         doc.text = new_text;
 
@@ -211,7 +211,7 @@ impl DocumentTracker {
         new_text: String,
     ) -> Option<DidChangeTextDocumentParams> {
         let doc = self.documents.get_mut(uri)?;
-        doc.version += 1;
+        doc.version = doc.version.checked_add(1)?;
         let version = doc.version;
         doc.text.clone_from(&new_text);
 

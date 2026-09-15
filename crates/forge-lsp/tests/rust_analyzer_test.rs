@@ -5,7 +5,10 @@ use forge_lsp::diagnostics::DiagnosticStore;
 use forge_lsp::process::ServerInstance;
 use forge_lsp::registry::ServerConfig;
 use forge_lsp::sync::path_to_uri;
-use lsp_types::*;
+use lsp_types::{
+    DocumentFormattingParams, FormattingOptions, HoverParams, Position, TextDocumentIdentifier,
+    TextDocumentPositionParams, WorkDoneProgressParams,
+};
 use ropey::Rope;
 use std::time::Duration;
 
@@ -91,22 +94,13 @@ async fn test_real_rust_analyzer_lifecycle_and_sync() {
         .expect("did_change failed");
 
     // 4. Test hover on "calculate" (line 0, character 4)
-    let hover_res = client
-        .hover(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: file_uri.clone(),
-                },
-                position: Position {
-                    line: 0,
-                    character: 4,
-                },
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-        })
-        .await;
-
-    assert!(hover_res.is_ok());
+    let hover = wait_for_hover(client, &file_uri).await;
+    assert!(serde_json::to_string(&hover).unwrap().contains("calculate"));
+    assert_eq!(
+        std::fs::read_to_string(&main_rs).unwrap(),
+        initial_code,
+        "LSP must see the unsaved buffer, not stale disk content"
+    );
 
     // 5. Test formatting request
     let fmt_res = client
@@ -127,4 +121,40 @@ async fn test_real_rust_analyzer_lifecycle_and_sync() {
 
     // 6. Graceful shutdown
     instance.stop().await.expect("Shutdown failed");
+    // Reopening an idle/crashed server must replay the unsaved tracked snapshot.
+    instance.start().await.expect("Restart failed");
+    let hover = wait_for_hover(instance.client().unwrap(), &file_uri).await;
+    assert!(serde_json::to_string(&hover).unwrap().contains("calculate"));
+    instance.stop().await.expect("Second shutdown failed");
+}
+
+async fn wait_for_hover(
+    client: &forge_lsp::LspClient,
+    file_uri: &lsp_types::Uri,
+) -> lsp_types::Hover {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let hover_res = client
+                .hover(HoverParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier {
+                            uri: file_uri.clone(),
+                        },
+                        position: Position {
+                            line: 0,
+                            character: 4,
+                        },
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                })
+                .await;
+
+            if let Ok(Some(hover)) = hover_res {
+                return hover;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("rust-analyzer never returned hover for the unsaved calculate function")
 }

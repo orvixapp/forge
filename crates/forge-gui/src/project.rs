@@ -620,6 +620,9 @@ impl ForgeWindow {
                 FileChange::Modified(path) => (path, false),
                 FileChange::Removed(path) => (path, true),
             };
+            if let Some(service) = &self.lsp {
+                service.file_changed(path.clone(), removed);
+            }
             let Some(index) = self.tabs.iter().position(|tab| {
                 tab.editor()
                     .is_some_and(|editor| editor.path() == Some(path.as_path()))

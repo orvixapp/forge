@@ -19,6 +19,46 @@ fn utf16_never_splits_surrogates_or_crosses_crlf() {
     assert_eq!(forge_lsp::position_to_offset(&rope, Position::new(1, 0)), 5);
 }
 
+#[test]
+fn overriding_language_removes_old_extensions() {
+    let mut registry = forge_lsp::LanguageRegistry::new();
+    let mut rust = registry.get_language_by_id("rust").unwrap().clone();
+    rust.extensions = vec!["custom".into()];
+    registry.register(rust);
+    assert!(
+        registry
+            .detect_language(std::path::Path::new("main.rs"))
+            .is_none()
+    );
+    assert_eq!(
+        registry
+            .detect_language(std::path::Path::new("main.custom"))
+            .unwrap()
+            .id,
+        "rust"
+    );
+}
+
+#[test]
+fn exhausted_document_versions_do_not_wrap_or_mutate_text() {
+    let uri = Uri::from_str("file:///workspace/main.rs").unwrap();
+    let mut tracker = DocumentTracker::new();
+    tracker.did_open_versioned(uri.clone(), "rust".into(), "original".into(), i32::MAX);
+    assert!(tracker.did_change_full(&uri, "changed".into()).is_none());
+    assert!(
+        tracker
+            .did_change_incremental(
+                &uri,
+                &[Edit::insert(0, "x")],
+                &Rope::from_str("original"),
+                "xoriginal".into()
+            )
+            .is_none()
+    );
+    assert_eq!(tracker.get(&uri).unwrap().text, "original");
+    assert_eq!(tracker.version(&uri), Some(i32::MAX));
+}
+
 #[tokio::test]
 async fn incremental_mock_uses_utf16_and_real_buffer_revisions() {
     let (client_io, server_io) = duplex(4096);
@@ -84,10 +124,21 @@ async fn aborting_a_request_sends_cancellation() {
     };
     task.abort();
     let _ = task.await;
-    let payload = tokio::time::timeout(Duration::from_secs(1), forge_lsp::transport::read_message(&mut server_reader)).await.unwrap().unwrap();
-    let Message::Notification(cancel) = Message::parse(&payload).unwrap() else { panic!("expected cancellation") };
+    let payload = tokio::time::timeout(
+        Duration::from_secs(1),
+        forge_lsp::transport::read_message(&mut server_reader),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let Message::Notification(cancel) = Message::parse(&payload).unwrap() else {
+        panic!("expected cancellation")
+    };
     assert_eq!(cancel.method, "$/cancelRequest");
-    assert_eq!(cancel.params.unwrap()["id"], serde_json::to_value(request.id).unwrap());
+    assert_eq!(
+        cancel.params.unwrap()["id"],
+        serde_json::to_value(request.id).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -120,6 +171,65 @@ async fn oversized_or_duplicate_headers_are_rejected_before_payload() {
             Err(forge_lsp::TransportError::HeaderFormat(_))
         ));
     }
+}
+
+#[tokio::test]
+async fn publishing_diagnostics_does_not_discard_a_partial_request_frame() {
+    let (client_io, server_io) = duplex(4096);
+    let (reader, mut writer) = tokio::io::split(client_io);
+    let (server_reader, server_writer) = tokio::io::split(server_io);
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let task = tokio::spawn(MockLspServer::new().run(server_reader, server_writer, Some(rx)));
+    let payload = br#"{"jsonrpc":"2.0","id":77,"method":"unknown"}"#;
+    writer
+        .write_all(format!("Content-Length: {}\r\n\r\n", payload.len()).as_bytes())
+        .await
+        .unwrap();
+    writer.write_all(&payload[..10]).await.unwrap();
+    tx.send(lsp_types::PublishDiagnosticsParams {
+        uri: Uri::from_str("file:///workspace/main.rs").unwrap(),
+        diagnostics: Vec::new(),
+        version: Some(1),
+    })
+    .await
+    .unwrap();
+    let mut reader = BufReader::new(reader);
+    let notification = forge_lsp::transport::read_message(&mut reader)
+        .await
+        .unwrap();
+    assert!(matches!(
+        Message::parse(&notification).unwrap(),
+        Message::Notification(_)
+    ));
+    writer.write_all(&payload[10..]).await.unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        forge_lsp::transport::read_message(&mut reader),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let Message::Response(response) = Message::parse(&response).unwrap() else {
+        panic!("expected response")
+    };
+    assert_eq!(response.id, Some(forge_lsp::Id::Number(77)));
+    task.abort();
+}
+
+#[tokio::test]
+async fn workspace_configuration_response_matches_requested_items() {
+    let (client_io, server_io) = duplex(4096);
+    let (reader, writer) = tokio::io::split(client_io);
+    let (server_reader, mut server_writer) = tokio::io::split(server_io);
+    let _client = LspClient::new(reader, writer);
+    forge_lsp::transport::write_message(&mut server_writer, br#"{"jsonrpc":"2.0","id":"cfg","method":"workspace/configuration","params":{"items":[{"section":"a"},{"section":"b"}]}}"#).await.unwrap();
+    let response = forge_lsp::transport::read_message(&mut BufReader::new(server_reader))
+        .await
+        .unwrap();
+    let Message::Response(response) = Message::parse(&response).unwrap() else {
+        panic!("expected response")
+    };
+    assert_eq!(response.result.unwrap(), serde_json::json!([null, null]));
 }
 
 #[test]

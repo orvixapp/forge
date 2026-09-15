@@ -94,6 +94,7 @@ impl LanguageRegistry {
     }
 
     pub fn register(&mut self, lang: LanguageDefinition) {
+        self.extension_map.retain(|_, id| id != &lang.id);
         for ext in &lang.extensions {
             let normalized = ext.trim_start_matches('.').to_ascii_lowercase();
             self.extension_map.insert(normalized, lang.id.clone());

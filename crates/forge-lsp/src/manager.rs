@@ -92,6 +92,43 @@ impl LspManager {
         self.idle_timeout = timeout;
     }
 
+    /// Forwards the editor's deduplicated file watcher events to matching roots.
+    pub async fn watched_files(&self, changes: HashMap<PathBuf, bool>) {
+        if changes.is_empty() {
+            return;
+        }
+        for (key, server) in self.server_views().await {
+            let events: Vec<_> = changes
+                .iter()
+                .filter(|(path, _)| path.starts_with(&key.root_path))
+                .filter_map(|(path, removed)| {
+                    Some(lsp_types::FileEvent {
+                        uri: path_to_uri(path)?,
+                        typ: if *removed {
+                            lsp_types::FileChangeType::DELETED
+                        } else {
+                            lsp_types::FileChangeType::CHANGED
+                        },
+                    })
+                })
+                .collect();
+            if !events.is_empty()
+                && server.status == ServerStatus::Running
+                && let Some(client) = server.client()
+            {
+                let _ = client
+                    .send_notification(
+                        "workspace/didChangeWatchedFiles",
+                        serde_json::to_value(lsp_types::DidChangeWatchedFilesParams {
+                            changes: events,
+                        })
+                        .ok(),
+                    )
+                    .await;
+            }
+        }
+    }
+
     async fn server_views(&self) -> HashMap<ServerKey, ServerView> {
         self.servers
             .read()
@@ -266,6 +303,9 @@ impl LspManager {
             };
             if let Some(instance) = servers.get_mut(&key) {
                 instance.record_activity();
+                if instance.status() == ServerStatus::Stopped {
+                    instance.start().await?;
+                }
                 let tracker = instance.tracker();
                 let mut tracker = tracker.lock().await;
                 let Some(doc) = tracker.get(&uri) else {
@@ -328,7 +368,26 @@ impl LspManager {
                 if instance.status() == ServerStatus::Running {
                     let tracker_arc = instance.tracker();
                     let tracker = tracker_arc.lock().await;
-                    if let Some(save_params) = tracker.did_save(&uri, text.is_some())
+                    let save = instance
+                        .server_capabilities()
+                        .and_then(|caps| caps.text_document_sync.as_ref())
+                        .and_then(|sync| match sync {
+                            lsp_types::TextDocumentSyncCapability::Options(options) => {
+                                options.save.as_ref()
+                            }
+                            lsp_types::TextDocumentSyncCapability::Kind(_) => None,
+                        });
+                    let Some(include_text) = save.and_then(|save| match save {
+                        lsp_types::TextDocumentSyncSaveOptions::Supported(true) => Some(false),
+                        lsp_types::TextDocumentSyncSaveOptions::SaveOptions(options) => {
+                            Some(options.include_text.unwrap_or(false))
+                        }
+                        lsp_types::TextDocumentSyncSaveOptions::Supported(false) => None,
+                    }) else {
+                        continue;
+                    };
+                    if let Some(save_params) =
+                        tracker.did_save(&uri, include_text && text.is_some())
                         && let Some(client) = instance.client()
                     {
                         let _ = client.did_save(save_params).await;
@@ -358,14 +417,13 @@ impl LspManager {
 
             if let Some(instance) = servers.get_mut(&key) {
                 instance.record_activity();
-                if instance.status() == ServerStatus::Running {
-                    let tracker_arc = instance.tracker();
-                    let mut tracker = tracker_arc.lock().await;
-                    if let Some(close_params) = tracker.did_close(&uri)
-                        && let Some(client) = instance.client()
-                    {
-                        let _ = client.did_close(close_params).await;
-                    }
+                let tracker_arc = instance.tracker();
+                let mut tracker = tracker_arc.lock().await;
+                if let Some(close_params) = tracker.did_close(&uri)
+                    && instance.status() == ServerStatus::Running
+                    && let Some(client) = instance.client()
+                {
+                    let _ = client.did_close(close_params).await;
                 }
             }
         }
