@@ -128,6 +128,8 @@ impl Server {
             "forge_list_open_files" => self.list_open_files(),
             "forge_read_buffer" => self.read_buffer(&arguments),
             "forge_git_status" => self.git_status(),
+            "forge_diagnostics" => self.diagnostics(&arguments),
+            "forge_workspace_symbols" => self.workspace_symbols(&arguments),
             "forge_run_in_terminal" => self.run_in_terminal(&arguments),
             "forge_propose_edit" => self.propose_edit(&arguments),
             _ => return Err((-32602, format!("herramienta desconocida: {name}"))),
@@ -180,6 +182,82 @@ impl Server {
                 .ok_or_else(|| "respuesta sin content".to_owned());
         }
         std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))
+    }
+
+    /// Language-server diagnostics as the editor sees them (§18): every
+    /// file any server reported on, or one file when `path` is given.
+    fn diagnostics(&mut self, arguments: &Value) -> Result<String, String> {
+        let mut params = json!({});
+        if arguments.get("path").is_some() {
+            params["path"] = json!(self.absolute(arguments)?);
+        }
+        let result = self.gui("forge/diagnostics", params)?;
+        let items = result
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if items.is_empty() {
+            return Ok(result
+                .get("note")
+                .and_then(Value::as_str)
+                .map_or_else(|| "no diagnostics".to_owned(), str::to_owned));
+        }
+        let mut report = String::new();
+        for item in &items {
+            let _ = writeln!(
+                report,
+                "{}:{}:{}: {}{}: {}",
+                item["path"].as_str().unwrap_or("?"),
+                item["line"],
+                item["column"],
+                item["severity"].as_str().unwrap_or("error"),
+                item["code"]
+                    .as_str()
+                    .map(|code| format!("[{code}]"))
+                    .unwrap_or_default(),
+                item["message"].as_str().unwrap_or(""),
+            );
+        }
+        Ok(report)
+    }
+
+    /// `workspace/symbol` across the running language servers.
+    fn workspace_symbols(&mut self, arguments: &Value) -> Result<String, String> {
+        let query = arguments
+            .get("query")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "se requiere query".to_owned())?;
+        let result = self.gui("forge/workspace_symbols", json!({"query": query}))?;
+        let symbols = result
+            .get("symbols")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if symbols.is_empty() {
+            return Ok(result
+                .get("note")
+                .and_then(Value::as_str)
+                .map_or_else(|| "no symbols".to_owned(), str::to_owned));
+        }
+        let mut report = String::new();
+        for symbol in &symbols {
+            let container = symbol["container"]
+                .as_str()
+                .map(|container| format!(" (in {container})"))
+                .unwrap_or_default();
+            let _ = writeln!(
+                report,
+                "{} {}{} — {}:{}:{}",
+                symbol["kind"].as_str().unwrap_or(""),
+                symbol["name"].as_str().unwrap_or(""),
+                container,
+                symbol["path"].as_str().unwrap_or("?"),
+                symbol["line"],
+                symbol["column"],
+            );
+        }
+        Ok(report)
     }
 
     fn git_status(&self) -> Result<String, String> {
@@ -392,6 +470,20 @@ pub fn tool_definitions() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
         }),
         json!({
+            "name": "forge_diagnostics",
+            "description": "Language-server diagnostics (errors, warnings) as the Forge editor sees them, including unsaved buffers. Optional path filters to one file.",
+            "inputSchema": {"type": "object", "properties": {
+                "path": {"type": "string", "description": "Absolute path or relative to the workspace"}
+            }},
+        }),
+        json!({
+            "name": "forge_workspace_symbols",
+            "description": "Symbols (functions, types, …) matching a query across the workspace, from the language servers running in Forge.",
+            "inputSchema": {"type": "object", "required": ["query"], "properties": {
+                "query": {"type": "string"}
+            }},
+        }),
+        json!({
             "name": "forge_run_in_terminal",
             "description": "Runs a shell command in the workspace after the user approves it in Forge; returns exit code, stdout and stderr (120 s limit).",
             "inputSchema": {"type": "object", "required": ["command"], "properties": {
@@ -456,6 +548,8 @@ mod tests {
                 "forge_list_open_files",
                 "forge_read_buffer",
                 "forge_git_status",
+                "forge_diagnostics",
+                "forge_workspace_symbols",
                 "forge_run_in_terminal",
                 "forge_propose_edit"
             ]
@@ -482,6 +576,28 @@ mod tests {
                 "params": {"name": "forge_list_open_files"}}))
             .unwrap();
         assert_eq!(reply["result"]["isError"], true);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lsp_tools_need_the_gui() {
+        let dir = scratch("lsp");
+        let mut server = offline_server(&dir);
+        for (name, arguments) in [
+            ("forge_diagnostics", json!({})),
+            ("forge_workspace_symbols", json!({"query": "main"})),
+        ] {
+            let reply = server
+                .handle(&json!({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments}}))
+                .unwrap();
+            assert_eq!(reply["result"]["isError"], true, "{name}");
+        }
+        let reply = server
+            .handle(&json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                "params": {"name": "forge_workspace_symbols", "arguments": {}}}))
+            .unwrap();
+        assert_eq!(reply["result"]["content"][0]["text"], "se requiere query");
         let _ = std::fs::remove_dir_all(dir);
     }
 

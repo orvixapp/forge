@@ -23,7 +23,58 @@ diagnósticos visibles (200) y contadores precalculados. No espera procesos ni R
 - [x] Primera UI: completion con textEdit/additionalTextEdits transaccionales,
   fallback local, hover Markdown, F12 definición, signature help, lista navegable
   de diagnósticos, subrayado/gutter por severidad y contadores en estado.
-- [ ] Aceptación interactiva de rust-analyzer sobre Forge y medición de fluidez.
+- [x] Aceptación automatizada de rust-analyzer real por la misma ruta que usa la
+  GUI (`LspManager` y el worker `LspService`): escribir, diagnósticos sin guardar
+  por pull, hover, completion, F12, referencias, undo, rename, code actions,
+  formateo y símbolos, con el disco intacto. Ver "Segunda vertical".
+- [ ] Aceptación interactiva de rust-analyzer sobre el repositorio Forge y medición
+  de fluidez (FPS) con la aplicación abierta.
+
+## Segunda vertical: base cómoda y fiable
+
+Hallazgos de la validación con rust-analyzer real y lo que se corrigió:
+
+- rust-analyzer **no filtra** las sugerencias por prefijo: el worker filtra y
+  ordena en cliente (prefijo exacto > prefijo sin mayúsculas > subsecuencia desde
+  límite de palabra; desempate por `sortText`), acotado a 200 elementos.
+- Los trigger characters (`.`, `:`, `(`…) se negocian con `completionProvider`
+  del servidor: la GUI pide completion tras cualquier signo y el worker descarta
+  la petición si el servidor no lo declara como trigger.
+- Si el cliente anuncia diagnósticos pull, **rust-analyzer deja de hacer push**
+  de los nativos (solo cargo check llega por push). El almacén indexa por
+  fuente (`servidor/push`, `servidor/pull`) y fusiona; el worker hace pull en
+  cada revisión sincronizada y reintenta con retroceso (0,5 s … 16 s) mientras
+  un servidor recién arrancado responde vacío.
+- El editor ya no borra los diagnósticos en cada tecla: los desplaza por la
+  transacción (`Buffer::last_change`) hasta que llega la respuesta de la nueva
+  revisión; un salto de versión que no puede seguir los descarta.
+- Snippets LSP (`${1:x}`, `$0`, `${1|a,b|}`, variables, escapes): se expanden
+  con sus valores por defecto, el primer tabstop queda seleccionado (multi-cursor
+  si se repite) y Tab/Shift+Tab recorren el resto; Escape o un salto de
+  versión terminan la sesión.
+- `completionItem/resolve` en segundo plano al aceptar: la inserción es
+  inmediata y los `additionalTextEdits` (auto-import) se aplican mapeados a
+  través de lo escrito desde entonces; si solapan, se descartan.
+- Referencias (Shift+F12), implementación (Ctrl+F12) y definiciones múltiples
+  se listan con vista previa de línea; una sola ubicación salta directamente.
+- Rename con preview (F2): `prepareRename` rellena el nombre, el `WorkspaceEdit`
+  se resume por archivo y Enter lo aplica como transacciones (archivos no
+  abiertos se abren; nada se escribe a disco). Operaciones de recursos
+  (crear/renombrar/borrar archivos) se rechazan.
+- Code actions (Ctrl+.): listado perezoso y `codeAction/resolve` al elegir;
+  las acciones que son comandos del servidor se anuncian como no soportadas.
+- Formateo (Shift+Alt+F) y `[lsp] format_on_save` (también en el menú de
+  ajustes): un fallo del formateador nunca pierde el guardado.
+- Agentes: herramientas MCP `forge_diagnostics` (opcionalmente por archivo) y
+  `forge_workspace_symbols`; `agent.investigate` (Ctrl+Shift+I) desde el editor
+  adjunta el fragmento, los diagnósticos de la línea, el hover y la definición
+  del símbolo y `git diff` del archivo.
+
+Pruebas: `forge-lsp/tests/rust_analyzer_manager_test.rs` (toda la vertical por
+`LspManager`), `forge-gui/src/lsp_tests.rs::worker_drives_rust_analyzer_like_the_editor`
+(el worker de la ventana con `LspService` real), `forge-gui/src/snippet.rs`,
+pruebas del editor para desplazamiento de diagnósticos, sesiones de snippet y
+mapeo de ediciones resueltas, y `forge-lsp/src/workspace_edit.rs`.
 
 Correcciones de auditoría: el cliente ya no anuncia UTF-8 ni snippets que no sabe
 aplicar; los servidores sólo reciben solicitudes de capacidades negociadas;
@@ -46,9 +97,14 @@ modo archivo grande). Rust usa `rust-analyzer` automáticamente; TypeScript usa
 `typescript-language-server --stdio`, Python `basedpyright-langserver --stdio`,
 Go `gopls` y C/C++ `clangd`. No hay instalación automática.
 
-- Escribir o Ctrl+Space: completion; Enter/Tab acepta mediante el buffer.
-- Ctrl+Alt+H: hover; F12: definición; Ctrl+Shift+Space: signature help.
+- Escribir, un trigger (`.`, `::`) o Ctrl+Space: completion; Enter/Tab acepta
+  mediante el buffer; en un snippet, Tab/Shift+Tab recorren los tabstops.
+- Ctrl+Alt+H: hover; F12: definición; Shift+F12: referencias; Ctrl+F12:
+  implementación; Ctrl+Shift+Space: signature help.
 - Ctrl+Alt+M: lista de diagnósticos; ↑/↓ y Enter navegan, Esc cierra.
+- F2: renombrar (con vista previa); Ctrl+.: acciones de código; Shift+Alt+F:
+  formatear; Ctrl+Shift+I sobre un diagnóstico: `agent.investigate`.
+- Todo lo anterior está también en el menú contextual del editor.
 
 Ejemplo en el archivo **de usuario**, no `.forge/config.toml` del repositorio:
 
@@ -58,6 +114,7 @@ enabled = true
 debounce_ms = 75
 startup_ms = 500
 idle_shutdown_secs = 1800
+format_on_save = false
 
 [[languages]]
 id = "rust"
@@ -72,9 +129,11 @@ root_markers = ["Cargo.toml", "rust-project.json", ".git"]
 
 Desactivar `[lsp].enabled` mantiene el completado local. Los servidores ausentes
 generan un aviso y se reintentan en segundo plano, sin impedir editar.
-No se da por terminada toda la Fase 5: las casillas combinadas de abajo siguen
-abiertas cuando falta alguna subfunción (pull, snippets, references visibles,
-MCP, tokens semánticos, etc.). Los presupuestos de FPS no se infieren de tests.
+No se da por terminada toda la Fase 5: siguen abiertas la aceptación interactiva
+sobre Forge y los presupuestos de FPS (no se infieren de tests), symbols de
+documento en UI, `executeCommand`, registro dinámico de watchers, multi-servidor
+real, tokens semánticos, inlay hints, folding, call hierarchy, process explorer
+y la aceptación en TypeScript/Python/Go/C++.
 
 ## Estado heredado de las fases 1–4 (lo que ya existe y hay que reutilizar)
 
@@ -119,28 +178,34 @@ MCP, tokens semánticos, etc.). Los presupuestos de FPS no se infieren de tests.
 - [x] Pruebas de integración de sincronización con servidor mock y validación contra `rust-analyzer`.
 
 ## 5.3 — Diagnósticos y navegación en la interfaz
-- [ ] Diagnósticos (`textDocument/publishDiagnostics` y soporte pull):
-  - Almacén de diagnósticos indexado por archivo y línea para consulta O(1).
-  - Capacidad para procesar hasta 50.000 diagnósticos sin bloquear el hilo de UI ni perder frames.
+- [x] Diagnósticos (`textDocument/publishDiagnostics` y soporte pull):
+  - Almacén indexado por archivo, fuente y línea para consulta O(1); fusión de
+    push y pull de varios servidores.
+  - 50.000 diagnósticos indexados sin bloquear la UI (prueba de escala; la
+    medición de FPS con la aplicación abierta sigue pendiente).
   - Renderizado en el editor: gutters, subrayado por severidad (Error, Warning, Info, Hint) y
-    muestra en la barra de estado.
-- [ ] Autocompletado LSP:
-  - Petición `textDocument/completion` con soporte para trigger characters.
-  - Resolución perezosa (`completionItem/resolve`).
-  - Integración en el popup de `forge-gui` con snippets/insertText y ranking.
+    muestra en la barra de estado; los diagnósticos siguen a las ediciones.
+- [x] Autocompletado LSP:
+  - Petición `textDocument/completion` con trigger characters negociados.
+  - Resolución perezosa (`completionItem/resolve`) tras aceptar.
+  - Popup de `forge-gui` con snippets/insertText y ranking en cliente.
   - Fallback automático a `assist.rs` (palabras + tree-sitter + schema) si no hay servidor activo.
-- [ ] Hover (`textDocument/hover`): contenido Markdown formateado en popup contextual sobre el cursor.
-- [ ] Navegación: `textDocument/definition` y `textDocument/references` abriendo el archivo/posición
-  correspondiente en el editor.
+- [x] Hover (`textDocument/hover`): contenido Markdown en el overlay `LspInfo` (Ctrl+Alt+H).
+  Pendiente: mostrarlo sobre el cursor y al pasar el ratón.
+- [x] Navegación: `textDocument/definition`, `textDocument/references` e
+  `implementation` abriendo el archivo/posición en el editor, con lista cuando hay varias.
 
 ## 5.4 — Formateo, acciones de código y símbolos
-- [ ] Formateo: `textDocument/formatting`, `textDocument/rangeFormatting` y opción `format_on_save`.
-- [ ] Acciones de código (`textDocument/codeAction`): quick fixes y refactors aplicados mediante
-  transacciones (`WorkspaceEdit`).
-- [ ] Símbolos: `textDocument/documentSymbol` para navegación rápida en archivo y `workspace/symbol`
-  para búsqueda difusa de símbolos en todo el proyecto.
-- [ ] Prioridades y cancelación: cola priorizada por servidor (completion > hover/def > symbols) y
-  cancelación automática al mover el cursor o cambiar de buffer.
+- [x] Formateo: `textDocument/formatting` y opción `format_on_save` (con la
+  indentación por defecto del servidor). Pendiente: `rangeFormatting` en UI y
+  tomar `tab_size`/`insert_spaces` del editor.
+- [x] Acciones de código (`textDocument/codeAction`): quick fixes y refactors
+  aplicados mediante transacciones (`WorkspaceEdit`), con `codeAction/resolve`.
+  Pendiente: `workspace/executeCommand` para acciones que son comandos.
+- [ ] Símbolos: `workspace/symbol` disponible para agentes (`forge_workspace_symbols`);
+  pendiente `textDocument/documentSymbol` y un picker de símbolos en la UI.
+- [ ] Prioridades y cancelación: cola priorizada por servidor (completion > hover/def > symbols).
+  La cancelación al mover el cursor o cambiar de buffer ya existe.
 
 ## 5.5 — Multi-servidor, resiliencia y conexión MCP/Agente
 - [x] Registro de lenguajes (`[[languages]]` en configuración de Forge):
@@ -151,11 +216,12 @@ MCP, tokens semánticos, etc.). Los presupuestos de FPS no se infieren de tests.
   - Apagado por inactividad tras tiempo configurable (`lsp.idle_shutdown_secs = 1800`).
   - Reinicio automático con retroceso exponencial ante caídas del servidor.
   - Reenvío automático de `didOpen` para todos los buffers abiertos tras el reinicio.
-- [ ] Integración MCP y Agente (§17.8, §18):
+- [x] Integración MCP y Agente (§17.8, §18):
   - Herramienta MCP `forge_diagnostics` (filtrable por archivo o global en el workspace).
   - Herramienta MCP `forge_workspace_symbols`.
-  - Acción contextual `agent.investigate` (`Ctrl+Shift+I`) desde un diagnóstico LSP en el editor
-    o gutter, inyectando archivo, línea, diagnóstico, definición del símbolo y git diff.
+  - Acción contextual `agent.investigate` (`Ctrl+Shift+I`) desde un diagnóstico LSP en el editor,
+    inyectando archivo, línea, diagnóstico, hover y definición del símbolo y git diff.
+    Pendiente: lanzarla desde el gutter con el ratón.
 - [ ] Benchmarks y validación final:
   - Benchmark `lsp_completion_overhead` ≤ 1 ms.
   - Verificación de 50k diagnósticos sin caída de FPS.
@@ -163,8 +229,9 @@ MCP, tokens semánticos, etc.). Los presupuestos de FPS no se infieren de tests.
 
 ## Extensión posterior de Fase 5 (sin empezar Fase 6)
 
-- [ ] References/implementation en UI y selección entre múltiples definiciones.
-- [ ] Rename con preview y aplicación versionada de WorkspaceEdit.
+- [x] References/implementation en UI y selección entre múltiples definiciones.
+- [x] Rename con preview y aplicación de WorkspaceEdit mediante transacciones
+  (la comprobación de versión por documento de `documentChanges` no se exige aún).
 - [ ] Folding LSP, semantic tokens, inlay hints y call hierarchy.
 - [ ] Process explorer de servidores LSP.
 - [ ] Aceptación real: Rust/rust-analyzer, TypeScript/typescript-language-server,
